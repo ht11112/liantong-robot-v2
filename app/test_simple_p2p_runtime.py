@@ -1,5 +1,6 @@
 """Offline original-scan and body-clearance checks; no ROS/device imports."""
 import math
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace as NS
@@ -83,7 +84,39 @@ class ScanGateTests(unittest.TestCase):
     def test_cli_default_configuration_exists_in_repo_and_standalone_package(self):
         controller, obstacle = load_config(DEFAULT_CONFIG)
         self.assertEqual(controller.max_linear_m_s, .03)
-        self.assertEqual(obstacle['stop_clearance_m'], .2)
+        self.assertEqual(obstacle['stop_clearance_m'], 0.)
+
+    def test_zero_extra_margin_allows_outside_rectangle_but_rejects_inside_and_boundary(self):
+        gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
+        for stamp,distance,allowed in ((100,.2501,True),(101,.2499,False),(102,.25,False)):
+            sample=scan(stamp=stamp)
+            sample.ranges[180]=distance  # +90deg, x=.13; body side is y=.25.
+            gate.accept(sample,stamp*1000000000+100000000,float(stamp))
+            self.assertEqual(gate(float(stamp),'drive')['ok'],allowed)
+
+    def test_zero_extra_margin_uses_uninflated_turn_sweep(self):
+        gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
+        gate.accept(scan(obstacle=.1),100100000000,10.)  # x=.23: outside body, inside turn radius.
+        self.assertTrue(gate(10.,'drive')['ok'])
+        self.assertFalse(gate(10.,'turn')['ok'])
+        gate.accept(scan(stamp=101,obstacle=.21),101100000000,11.)  # x=.34 > radius .32016.
+        self.assertTrue(gate(11.,'turn')['ok'])
+        radius=math.hypot(SETTINGS['body_front_m'],SETTINGS['body_half_width_m'])
+        gate.accept(scan(stamp=102,obstacle=radius-SETTINGS['laser_x_m']),102100000000,12.)
+        self.assertFalse(gate(12.,'turn')['ok'])  # Exact uninflated sweep boundary remains blocked.
+
+    def test_config_accepts_zero_margin_rejects_negative_and_keeps_geometry_source_positive(self):
+        original=json.loads(DEFAULT_CONFIG.read_text(encoding='utf-8'))
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'config.json'
+            path.write_text(json.dumps(original),encoding='utf-8')
+            self.assertEqual(load_config(path)[1]['stop_clearance_m'],0.)
+            for key,value in (('stop_clearance_m',-.001),('body_front_m',0.),
+                              ('body_rear_m',0.),('body_half_width_m',0.),('scan_timeout_s',0.)):
+                changed=json.loads(json.dumps(original))
+                changed['obstacle'][key]=value
+                path.write_text(json.dumps(changed),encoding='utf-8')
+                with self.subTest(key=key),self.assertRaises(ValueError):load_config(path)
 
     def test_live_ram_submit_does_no_io_and_phase_does_not_refresh_source(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -181,7 +181,7 @@ class Broker:
                         odometry_age_s=(None if self.odometry_reference_mono is None else
                                         self.odometry_age_at_receipt+self.clock()-self.odometry_reference_mono),
                         limits=dict(linear_m_s=.03, angular_deg_s=6.9, arrival_m=.1,
-                                    clearance_m=.2, timeout_s=200, feedback_timeout_ms=750))
+                                    clearance_m=0., timeout_s=200, feedback_timeout_ms=750))
 
     def invalidate(self, reason):
         self.reference.update(valid=False, reason=reason, version=self.reference["version"]+1)

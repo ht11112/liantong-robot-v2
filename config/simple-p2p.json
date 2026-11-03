@@ -14,7 +14,7 @@
     "wheel_separation_m": 0.3
   },
   "obstacle": {
-    "stop_clearance_m": 0.2,
+    "stop_clearance_m": 0.0,
     "body_front_m": 0.2,
     "body_rear_m": 0.2,
     "body_half_width_m": 0.25,

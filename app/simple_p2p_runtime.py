@@ -103,15 +103,21 @@ def load_config(path):
                 'laser_x_m', 'laser_y_m', 'laser_yaw_rad', 'scan_timeout_s'}
     if set(data['obstacle']) != expected:
         raise ValueError('Obstacle configuration fields do not match')
-    obstacle = {name: finite(name, value, positive=name not in ('laser_x_m', 'laser_y_m', 'laser_yaw_rad'))
+    obstacle = {name: finite(name, value, positive=name not in ('laser_x_m', 'laser_y_m', 'laser_yaw_rad','stop_clearance_m'))
                 for name, value in data['obstacle'].items()}
+    if obstacle['stop_clearance_m'] < 0:
+        raise ValueError('Extra stop clearance must be nonnegative; zero disables the extra margin')
     if obstacle['scan_timeout_s'] > .75:
         raise ValueError('Scan source timeout cannot exceed 750ms')
     return controller, obstacle
 
 
 class ScanGate:
-    """Measured front180 only. Never assert rear/whole-turn clearance from this scan."""
+    """Measured front180 body intersection; an optional extra margin may be zero.
+
+    Zero margin retains the body rectangle and uninflated turn sweep boundary.
+    Never assert rear/whole-turn clearance from this scan alone.
+    """
     def __init__(self, settings, *, turn_area_clear=False):
         self.settings = dict(settings)
         self.turn_area_clear = bool(turn_area_clear)
