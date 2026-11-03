@@ -1,6 +1,6 @@
 # 开发、版本与回退
 
-首次导入：`v0.1.0-baseline-20261103`。这是“重新设计点到点导航”对话的最新开发快照；手推 r5 与未完成验收的导航试验具有不同验证范围，详见 BASELINE.md。
+当前手推专用基线：`v0.1.1-manual-mapping-20261103`。保留手推建图、只读网页和对应测试，验证范围见BASELINE.md。此前完整导入仍在历史标签`v0.1.0-baseline-20261103`；main已按用户要求移除导航及阶段联调内容。
 
 ## 新增功能
 
@@ -30,8 +30,8 @@ git push -u origin feature/功能名称
 ```text
 git switch main
 git pull --ff-only
-git tag -a v0.1.1 -m "说明验证范围和剩余限制"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "说明验证范围和剩余限制"
+git push origin v0.1.2
 ```
 
 标签指向固定代码。保留原标签，后续修复使用新标签。需要管理地图、配置或 RK 系统依赖时，在发布记录中写明各自的版本或 SHA256。
@@ -40,8 +40,8 @@ git push origin v0.1.1
 
 ```text
 git fetch origin --tags
-git diff v0.1.0-baseline-20261103..main --stat
-git worktree add ../liantong-robot-v2-baseline v0.1.0-baseline-20261103
+git diff v0.1.1-manual-mapping-20261103..main --stat
+git worktree add ../liantong-robot-v2-baseline v0.1.1-manual-mapping-20261103
 ```
 
 最后一个命令在另一个目录检出基线，便于比较、测试和离线构建；当前开发目录的改动保留。
@@ -65,4 +65,4 @@ git push -u origin fix/revert-feature
 
 源码回退与 RK 运行版本分别管理。从目标标签检出代码，离线测试并重新构建软件包，记录包 SHA256、Python／ROS 依赖和现场配置；再按当次实际运行状态进行部署。现场地图、odom 原点、boot ID 和会话记录保存在仓库外，不能拿旧记录当作下一次当前状态。
 
-首次基线仅提供手推建图的独立构建。历史导航程序依赖旧地图及历史实验条件，不应直接用本标签启动运动验收。
+当前基线提供手推建图的独立构建；历史标签保持原内容，回退前先核对目标标签的范围和说明。

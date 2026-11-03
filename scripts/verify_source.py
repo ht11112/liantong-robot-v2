@@ -1,4 +1,4 @@
-"""Compare the initial import and/or the historical r5 source baseline.
+"""Compare the retained manual-mapping sources and/or historical r5 baseline.
 
 This is an on-demand provenance check, not a rule that future commits must
 retain the initial source hashes. No original workspace or device is needed.
@@ -29,18 +29,18 @@ def inside(root, relative):
     return resolved
 
 
-def verify_initial_import(root=ROOT):
+def verify_manual_import(root=ROOT):
     document = json.loads((root / "provenance/source_manifest.json").read_text(encoding="utf-8"))
-    if document.get("schema") != "host-source-import-manifest-v1":
-        raise ValueError("Unexpected initial import manifest")
+    if document.get("schema") != "manual-mapping-source-manifest-v1":
+        raise ValueError("Unexpected manual-mapping source manifest")
     failures = []
     for relative, entry in document["files"].items():
         path = inside(root, relative)
         if not path.is_file():
             failures.append(relative + ": missing")
         elif digest(path) != entry["sha256"] or path.stat().st_size != entry["bytes"]:
-            failures.append(relative + ": differs from initial import")
-    return {"kind": "initial_import", "checked": len(document["files"]), "failures": failures}
+            failures.append(relative + ": differs from manual-mapping import")
+    return {"kind": "manual_mapping_import", "checked": len(document["files"]), "failures": failures}
 
 
 def verify_r5_baseline(root=ROOT):
@@ -59,14 +59,15 @@ def verify_r5_baseline(root=ROOT):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--verify-initial-import", action="store_true",
-                        help="Compare the 56 original-byte files with the first import")
+    parser.add_argument("--verify-manual-import", "--verify-initial-import",
+                        dest="verify_manual_import", action="store_true",
+                        help="Compare the retained hand-pushed mapping source files")
     parser.add_argument("--verify-r5-baseline", action="store_true",
                         help="Compare the nine manual-mapping sources with actual r5")
     args = parser.parse_args(argv)
     checks = []
-    if args.verify_initial_import or not args.verify_r5_baseline:
-        checks.append(verify_initial_import())
+    if args.verify_manual_import or not args.verify_r5_baseline:
+        checks.append(verify_manual_import())
     if args.verify_r5_baseline:
         checks.append(verify_r5_baseline())
     okay = all(not item["failures"] for item in checks)

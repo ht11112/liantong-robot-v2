@@ -1,5 +1,2 @@
-# PC Python 3.10 validation / read-only viewer. Do not install over RK ROS.
-numpy==2.2.6
-PyYAML==6.0.3
+# PC read-only viewer. Offline mapping tests use only the standard library.
 paramiko==3.5.1
-pyserial==3.5

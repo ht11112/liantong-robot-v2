@@ -1,57 +1,50 @@
-# 联通机器人 RK 上位机
+# 联通机器人手推建图上位机
 
-本仓库独立保存“重新设计点到点导航”对话截至 **2026年11月3日最后一次手推建图 r5 保存完成**的最新上位机源码，便于后续开发、对比与回退。
+当前版本只保存已实现的**手推创建新地图、PC只读查看及其测试**，来源于“重新设计点到点导航”对话最后完成的手推建图 r5。
 
-包含 RK 上的 Python／ROS 程序、底盘主机通信依赖、PC 只读建图网页和离线测试。STM32 固件、刷写工具、旧导航工程、现场地图、采集日志及登录凭据不在本仓库。
+RK运行程序、主机通信依赖和网页保持原始字节。当前main已移除点到点导航、定位/路径预览/运动联调入口、无关配置和对应测试；不携带STM32固件、现场地图、日志或凭据。
 
-## 当前状态
+## 当前功能
 
-- 最新实际完成的功能是手推创建新地图和只读查看：r5 记录约641秒，0次里程计缺段，正常结束并保存。地图几何精度尚未验证。
-- 新点到点导航的配置、状态机、定位、路径预览和一次性运动试验源码一并保存；半米行驶到点尚未通过验收。
-- 当前停车反馈过滤修复比最后一次 r6 运动试验包更新，尚无对应的新 RK 实机验证。
-- r5 新地图尚未接入导航。历史导航运行入口仍引用旧地图身份；仓库不携带旧地图，也不提供自动启动这些试验的部署入口。
+- RK读取真实轮速和前180°雷达，建立软件odom原点，使用GMAPPING创建新地图并保存记录。
+- PC通过SFTP只读显示地图、odom、原点和采集状态，网页断开不改变RK采集。
+- 手推r5实际记录约641秒、0次里程计缺段，正常结束并保存。几何精度和轮径/轮距/安装外参仍未完成标定。
 
-来源、源文件 SHA256 和准确验证边界见 [基线记录](docs/BASELINE.md) 与 [来源清单](provenance/source_manifest.json)。`docs/original/` 保留原对话的说明文件；其中旧工作区路径和历史运行状态按历史记录理解。
+## 程序清单
 
-## 目录
-
-| 路径 | 内容 |
+| 文件 | 作用 |
 |---|---|
-| `app/` | 当前新上位机程序、配置、网页和现有测试，保持原始字节 |
-| `app/deps/` | 从冻结包提取的6个必要主机 Python 依赖 |
-| `scripts/` | 新增的独立离线打包、来源核对及可配置网页启动工具 |
-| `baselines/` | 已运行的手推建图软件身份 |
-| `docs/` | 当前状态、使用范围与版本回退说明 |
-| `provenance/` | 首次导入的源文件来源与 SHA256 |
+| `app/manual_mapping_runtime.py` | RK手推建图主入口，组织扫描、odom、GMAPPING和地图保存 |
+| `app/manual_mapping_query.py` | 只查询底盘状态/轮速，计算真实手推里程计 |
+| `app/manual_mapping_viewer.py` | PC只读网页缓存和HTTP后端 |
+| `app/manual_mapping_viewer.html` | 配套地图查看页面 |
+| `app/base_static_adapter.py` | 手推查询必需的串口围栏、来源追踪和CRC基础类，无独立启动入口 |
+| `app/deps/` | 4个必要主机Python依赖：control_client、core、rk_link、transport |
+| `app/test_manual_mapping_runtime.py` | 建图运行逻辑测试 |
+| `app/test_manual_mapping_query.py` | 手推查询与里程计测试 |
+| `app/test_mapping_viewer.py` | 只读网页数据处理测试 |
 
-## 离线检查
+`app`总共12个文件：8个程序Python文件、3个测试Python文件、1个HTML文件。手推程序只发STATUS/FEEDBACK，不发STOP、ARM或轮速给定。基础依赖文件包含共用辅助代码，保留完整文件便于核验已实测源文件身份。
 
-PC 使用 Python 3.10。建议在独立环境安装本次验证的依赖版本：
+## 离线检查与构建
+
+在仓库根目录使用PC Python 3.10：
 
 ```text
-python -m venv .venv
-```
-
-Windows 后续使用 `.venv\Scripts\python.exe`，Linux 使用 `.venv/bin/python`。以下 `python` 指该环境的解释器：
-
-```text
-python -m pip install -r requirements-pc.txt
 python -B -m unittest discover -s app -p "test_*.py"
-python -B app/p2p_cli.py validate
-python -B app/p2p_cli.py demo
-python -B scripts/verify_source.py
-python -B scripts/build_package.py --help
-python -B scripts/run_viewer.py --help
+python -B scripts/verify_source.py --verify-manual-import --verify-r5-baseline
+python -B scripts/build_package.py --name manual-mapping --verify-r5-baseline
+python -B -m unittest discover -s dist/manual-mapping/package -p "test_manual_mapping*.py"
 ```
 
-普通 `validate` 会列出尚未填写的现场参数；`validate --complete` 有待定项时返回2，不能据离线校验推断已经可以行驶。测试不连接机器人。首次导入来源检查会比较固定导入清单；未来主动修改源码后，应通过 Git 比较和测试验证变更，原清单保留作来源记录。
+现有测试只用标准库，不连接设备。构建输出在`dist/`，已存在的构建目录拒绝覆盖；需要再次构建时换一个`--name`。未来修改代码后正常构建可省略历史身份检查参数。
 
-RK 继续使用 ROS1 Noetic 和系统 Python 3.8；ROS、消息、TF、gmapping 等由原系统提供。本次 PC 依赖文件不用于覆盖 RK 的系统 NumPy／ROS 环境。
+PC查看网页需要Paramiko，可在独立虚拟环境执行`python -m pip install -r requirements-pc.txt`，通过`python -B scripts/run_viewer.py --help`查看参数。RK仍使用ROS1 Noetic、系统Python3.8、gmapping和原有pyserial；PC依赖文件不用于覆盖RK系统环境。
 
-## 使用与版本管理
+## 来源与回退
 
-手推包和只读网页的独立使用方式见 [使用说明](docs/USAGE.md)。源码中的 `trial_config.json` 现场确认属于历史试验记录，不是下一次执行许可。
+当前手推专用版本标签：`v0.1.1-manual-mapping-20261103`。保留的12个文件及原路径/SHA见[来源清单](provenance/source_manifest.json)，实际r5九源身份见[基线](baselines/manual-mapping-r5.json)。
 
-首次导入标签为 `v0.1.0-baseline-20261103`，表示可追溯的开发基线。后续新功能用 `feature/功能名` 分支，测试后合并，实测记录与软件提交分别标明。具体命令见 [开发与回退](docs/VERSIONING.md)。
+此前完整导入已保存在历史标签`v0.1.0-baseline-20261103`；本次通过普通提交精简main，保留Git历史供回退。新功能通过分支开发，验证后提交和打新标签。
 
-上传代码不会改变 RK 正在运行的程序；RK 回退需要重新部署对应版本，并匹配其配置、依赖和外部地图。
+[实际验证范围](docs/BASELINE.md) · [独立使用](docs/USAGE.md) · [本次软件验证](docs/VALIDATION.md) · [开发与回退](docs/VERSIONING.md)
