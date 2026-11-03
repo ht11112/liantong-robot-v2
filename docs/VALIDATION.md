@@ -1,6 +1,37 @@
-# 手推专用版本软件验证
+# 离线与历史实测验证
 
-## feature/simple-point-to-point新增功能验证
+## 本地网页与RK任务入口
+
+本轮在 `feature/simple-point-to-point` 增加PC本地网页服务和RK `local_p2p_remote.py`。独立运动包包含remote及它的离线测试，PC服务/UI不进入RK包。CI继续运行全app测试、原手推构建与包内回归，并分别运行简版和remote包内测试。
+
+本轮冻结实现的离线检查如下。网页离线测试不等于运动验收；不能把下方网页开发前的包SHA、35项结果或只读置零观察当作新增网页代码的实车证明。原手推12项来源与其中历史9源身份核验仍通过。
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| PC全app离线回归 | 97项通过、0skip：原手推33、简版39、remote9、PC网页16 |
+| 独立RK包内回归 | 简版39项与remote9项通过、0skip；二者均是全app测试的子集 |
+| 包内完整性 | 13个Python源/测试与1份配置共14项SHA绑定，另加manifest，共15个tar成员逐字节核对通过 |
+| Python3.8语法 | 包内13个Python文件及PCserver/测试、launcher、打包器，共17个文件解析通过 |
+| 默认配置与PC入口 | 包内默认配置可读取；`python -S -B scripts/run_local_p2p.py --help`正常退出，不连接设备 |
+| 原手推来源 | 原12项来源与r5九源核验通过，原手推包构建流程不变 |
+| RK实际软件检查 | 系统Python在新目录分别运行简版39项与remote9项通过，0skip；没有据此执行网页任务 |
+| 实际网页操作范围 | 静止置零与0.5米目标预览通过；没有启动实车运动 |
+
+本轮包为 `dist/local-web-p2p-20261103-r1/simple-p2p.tar.gz`，SHA256为 `e998142f5d9581aaa8915fd6da90c9519247f9120655e31d8dc55707e50a8263`。RK软件检查目录为 `/home/cat/p2p_navigation_20261103_local_web_200000_a9401d7c`。纯PC源龄修复后已重启最终网页服务，并再次完成静止置零与半米目标预览，未启动实车运动。先前CLI零点观察、离线测试及网页预览均不作为行驶验收通过证明。
+
+```text
+python -S -B -m unittest discover -s app -p "test_*.py"
+python -S -B scripts/verify_source.py --verify-manual-import --verify-r5-baseline
+python -B scripts/build_simple_p2p_package.py --name local-web-p2p-20261103-r1
+python -S -B -m unittest discover -s dist/local-web-p2p-20261103-r1/package -p "test_simple*.py"
+python -S -B -m unittest discover -s dist/local-web-p2p-20261103-r1/package -p "test_local_p2p_remote.py"
+```
+
+上面记录本轮输出名称；该目录已存在时构建会拒绝覆盖，重建需换一个名称并同步测试路径。
+
+离线回归覆盖设软件原点/预览不ARM、空闲编码器变化后拒用旧参考、执行目标与预览绑定、取消仅作用当前任务、PC重启/失联恢复及原CRC/来源龄/速度量化/停车位姿语义。独审发现跨RK boot旧任务结果可能被短时标为有效坐标，已补boot校验和历史状态回归：旧boot结果不更新当前pose或encoder anchor。恢复核对中的SSH等待已移到状态锁外，另有阻塞SSH时页面仍可读缓存的回归。原odom年龄使用独立单调时间参考，inventory或无新源的响应不再刷新该年龄，包含`.05→10.05→inventory后仍10.05秒`的回归。地图仅只读展示，不纳入控制器或作为局部坐标定位证明。实际现场仍须按当次状态验收。
+
+## 网页开发前的简版CLI基线
 
 2026-11-03在手推基线分支外新增简版odom控制，没有合入main。原12项手推来源和9源r5身份核验保持通过。
 
@@ -19,7 +50,7 @@
 
 随后独审发现“无ARM已在容差内”分支缺少最终位置证明，已补齐并新增两项测试。最终包只改变owner和对应测试，RK软件35项通过；未再次置零或运行运动任务。实际首次置零证据与最终软件证明分别保存，未把首次包当作最终运动代码实测通过。
 
-没有进行原地转向、直行、到点误差或停障的实车运动验收，没有刷固件、改变系统服务、导入地图或启动AMCL。GitHub CI会保留原手推独立包检查并新增简版构建/包内回归，结果以本分支Actions为准。
+在上述CLI基线交付检查点，尚未进行原地转向、直行、到点误差或停障的实车运动验收，没有刷固件、改变系统服务、导入地图或启动AMCL。该历史结果不作为后续网页任务的运行状态。GitHub CI保留原手推独立包检查，分支结果以对应Actions为准。
 
 ## 以下为手推v0.1.1历史验证
 

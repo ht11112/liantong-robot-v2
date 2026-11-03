@@ -1,9 +1,11 @@
 """Offline original-scan and body-clearance checks; no ROS/device imports."""
 import math
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace as NS
 import unittest
 
-from simple_p2p_runtime import DEFAULT_CONFIG, ScanGate, load_config
+from simple_p2p_runtime import DEFAULT_CONFIG, ScanGate, load_config, LiveStatusWriter
 
 
 SETTINGS = dict(stop_clearance_m=.2, body_front_m=.2, body_rear_m=.2, body_half_width_m=.25,
@@ -82,6 +84,31 @@ class ScanGateTests(unittest.TestCase):
         controller, obstacle = load_config(DEFAULT_CONFIG)
         self.assertEqual(controller.max_linear_m_s, .03)
         self.assertEqual(obstacle['stop_clearance_m'], .2)
+
+    def test_live_ram_submit_does_no_io_and_phase_does_not_refresh_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'live.json'
+            writer=LiveStatusWriter(path,'boot',clock=lambda:20.)
+            writer.submit(dict(event='odometry',phase='drive',event_monotonic_s=10.,
+                source_monotonic_s=9.9,raw_packet=dict(position_left_raw=2,position_right_raw=3),
+                pose=dict(x=.1,y=0.,yaw=0.)))
+            writer.submit(dict(event='phase',phase='final_stop',event_monotonic_s=19.,
+                source_monotonic_s=None,raw_packet=None,pose=None))
+            self.assertFalse(path.exists())
+            writer._write()
+            import json
+            status=json.loads(path.read_text())
+            self.assertEqual(status['source_monotonic_s'],9.9)
+            self.assertEqual(status['written_monotonic_s'],20.)
+            self.assertEqual(status['event_monotonic_s'],19.)
+            self.assertEqual(status['pose']['x'],.1)
+
+    def test_live_writer_cleanup_failure_cannot_claim_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer=LiveStatusWriter(Path(directory)/'missing'/'live.json','boot')
+            writer.start()
+            self.assertFalse(writer.close(dict(session_complete=False)))
+            self.assertIsNotNone(writer.error)
 
 
 if __name__ == '__main__':

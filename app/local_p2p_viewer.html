@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>局部点到点 · 联通机器人</title>
+  <style>
+    [hidden]{display:none!important}
+    :root{--bg:#f4f6fa;--paper:#fff;--ink:#1f293d;--muted:#6c778c;--line:#e3e8f0;--blue:#3367e8;--blue-soft:#edf3ff;--green:#16856c;--green-soft:#eaf7f2;--amber:#a36a0c;--amber-soft:#fff6df;--red:#c84450;--red-soft:#fff0f1;--shadow:0 4px 24px #25385506}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--ink)}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.45}button:focus-visible,input:focus-visible,canvas:focus-visible{outline:3px solid #a8c3ff;outline-offset:3px}button{border:1px solid var(--line);border-radius:9px;background:white;color:var(--ink);font-weight:600;padding:10px 16px;transition:background .15s}button:hover:enabled{background:#f7f9fe}.primary{background:var(--blue);border-color:var(--blue);color:white}.primary:hover:enabled{background:#2456d5}.danger{background:var(--red-soft);border-color:#f2ccd1;color:var(--red)}.danger:hover:enabled{background:#ffe3e6}.secondary{color:var(--blue);background:var(--blue-soft);border-color:#d9e5ff}
+    .topbar{height:76px;background:white;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 32px;gap:18px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{width:38px;height:38px;background:var(--blue);color:white;border-radius:11px;display:grid;place-items:center;font-weight:800;font-size:22px}.brand strong{font-size:16px;letter-spacing:.4px}.brand small{display:block;color:var(--muted);font-size:11px;letter-spacing:1px}.top-meta{text-align:right;font-size:11px;color:var(--muted)}.pill{display:inline-flex;align-items:center;gap:7px;border-radius:30px;padding:5px 11px;font-size:12px;font-weight:600;background:#eef1f6;color:var(--muted)}.pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}.pill.good{color:var(--green);background:var(--green-soft)}.pill.bad{color:var(--red);background:var(--red-soft)}.pill.warn{color:var(--amber);background:var(--amber-soft)}
+    main{max-width:1540px;margin:auto;padding:28px 32px 36px}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px}h1{font-size:25px;line-height:1.3;margin:0 0 7px;font-weight:700;letter-spacing:.3px}h2{font-size:15px;line-height:1.4;margin:0;font-weight:700}h3{font-size:13px;margin:0 0 10px}.subtitle{color:var(--muted);margin:0;font-size:13px}.mode-note{font-size:12px;white-space:nowrap;color:var(--blue);background:var(--blue-soft);padding:8px 12px;border:1px solid #dce7ff;border-radius:9px}.snapshot{background:var(--amber-soft);border:1px solid #eed8a3;color:#805715;padding:11px 15px;border-radius:10px;margin:0 0 18px;font-size:13px}.snapshot[hidden]{display:none}.layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:22px}.main-column,.side-column{display:flex;flex-direction:column;gap:18px}.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}.card-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.card-head p{margin:3px 0 0;color:var(--muted);font-size:12px}.card-body{padding:18px 20px}.tiny{font-size:11px;color:var(--muted)}.muted{color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums}.reference-summary{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px}.stat{background:#f7f9fc;border:1px solid #edf0f5;border-radius:9px;padding:11px 13px}.stat label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}.stat strong{font-size:18px;line-height:1.3;font-weight:650}.stat span{color:var(--muted);font-size:11px;margin-left:3px}.plot-wrap{position:relative;background:#fcfdff;height:470px;border-top:1px solid #eef2f7;border-bottom:1px solid var(--line)}canvas{display:block;width:100%;height:100%;touch-action:manipulation;cursor:crosshair}.plot-tools{position:absolute;right:14px;top:14px;display:flex;gap:5px}.plot-tools button{width:32px;height:31px;padding:0;border-radius:7px;background:#fffffff2;box-shadow:0 2px 8px #22334408}.plot-caption{position:absolute;left:16px;top:14px;font-size:11px;color:#70809b;background:#ffffffdf;border:1px solid #e8edf6;padding:5px 9px;border-radius:7px;pointer-events:none}.plot-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 20px;font-size:11px;color:var(--muted)}.legend{display:flex;gap:15px;flex-wrap:wrap}.legend span{display:inline-flex;align-items:center;gap:5px}.legend i{width:8px;height:8px;border-radius:50%;background:var(--blue);display:inline-block}.legend .goal-dot{background:#e5a333}.legend .origin-dot{background:#78859c}.instruction{border-left:3px solid #bcd0fb;padding:0 0 0 11px;color:var(--muted);font-size:12px;margin:0 0 16px}
+    .input-row{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:6px}.field .input-wrap{position:relative}.field input{width:100%;min-width:0;padding:10px 35px 10px 12px;color:var(--ink);border:1px solid #d8dfeb;border-radius:8px;background:white;font-variant-numeric:tabular-nums}.field input:disabled{background:#f5f6f9}.unit{position:absolute;right:13px;top:10px;color:var(--muted);font-size:12px}.input-row button{height:44px}.preview-box{background:#f8faff;border:1px solid #e2eafb;padding:13px 14px;border-radius:9px;margin:15px 0;min-height:67px}.preview-box strong{font-size:12px;color:var(--blue)}.preview-metrics{display:flex;gap:22px;flex-wrap:wrap;margin-top:4px;font-size:12px}.preview-empty{color:var(--muted);font-size:12px}.check-row{display:flex;gap:10px;align-items:flex-start;padding:13px 0 16px;font-size:12px;color:#4c586e;cursor:pointer}.check-row input{width:17px;height:17px;flex:none;margin:2px 0 0;accent-color:var(--blue)}.action-row{display:flex;gap:10px;flex-wrap:wrap}.action-row button{flex:1;min-width:130px}.message{font-size:12px;color:var(--muted);min-height:20px;margin:12px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}.message.error{color:var(--red)}.message.success{color:var(--green)}.section-step{width:22px;height:22px;border-radius:7px;background:var(--blue-soft);color:var(--blue);font-size:12px;display:inline-grid;place-items:center;margin-right:7px}.reset-note{font-size:12px;color:var(--muted);margin:0 0 13px}.reset-button{width:100%}.kv{display:flex;justify-content:space-between;gap:16px;padding:8px 0;font-size:12px;border-bottom:1px solid #f0f3f7}.kv:last-child{border-bottom:0}.kv dt{color:var(--muted)}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere;max-width:230px}.status-good{color:var(--green)}.status-warn{color:var(--amber)}.status-error{color:var(--red)}.task-note{padding:10px 12px;background:#f7f9fc;border-radius:8px;font-size:12px;color:var(--muted);margin-top:10px;white-space:pre-wrap;overflow-wrap:anywhere}.reference-warning{background:#fff7e8;border-bottom:1px solid #f2e2c6;padding:10px 16px;font-size:12px;color:#936720}.map-image-box{background:#e9ecf0;min-height:260px;max-height:390px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:14px}.map-image-box img{display:block;max-width:100%;max-height:360px;object-fit:contain;image-rendering:pixelated;pointer-events:none;user-select:none}.map-empty{padding:55px 20px;text-align:center;color:#8b95a6;font-size:12px}.map-details{padding:12px 16px;font-size:11px;color:var(--muted)}.limits{display:flex;flex-wrap:wrap;gap:7px}.limits span{background:#f3f6fb;border-radius:6px;padding:5px 8px;font-size:11px;color:#66738b}.footnote{margin:20px 0 0;color:#8993a4;font-size:11px;text-align:center}dl{margin:0}hr{border:0;border-top:1px solid var(--line);margin:17px 0}.busy-note{font-size:11px;color:var(--amber)}
+    @media(min-width:1400px){.plot-wrap{height:510px}}@media(max-width:1080px){.layout{grid-template-columns:minmax(0,1fr) 310px}.topbar{padding:0 22px}main{padding:24px 22px}.card-head,.card-body{padding:16px}.input-row{grid-template-columns:1fr 1fr}.input-row button{grid-column:1/-1}.plot-wrap{height:420px}.mode-note{display:none}}@media(max-width:790px){.layout{grid-template-columns:1fr}.side-column{display:grid;grid-template-columns:1fr 1fr;align-items:start}.map-card{grid-column:1/-1}.topbar{padding:0 16px;height:68px}.top-meta small{display:none}main{padding:22px 14px}.page-heading{margin-bottom:16px}h1{font-size:22px}.plot-wrap{height:400px}.map-image-box{max-height:350px}.reference-summary{gap:7px}.stat{padding:10px}.stat strong{font-size:16px}}@media(max-width:480px){.side-column{display:flex}.brand small{display:none}.brand strong{font-size:14px}.top-meta{font-size:10px}.pill{font-size:11px}.plot-wrap{height:360px}.plot-caption{max-width:70%;font-size:10px}.plot-footer{align-items:flex-start;flex-direction:column;gap:5px}.preview-metrics{gap:10px}.action-row button{min-width:110px}}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><div class="brand-mark" aria-hidden="true">↗</div><div><strong>联通机器人 · 局部导航</strong><small>LOCAL POINT TO POINT</small></div></div>
+    <div class="top-meta"><div id="connection-status" class="pill warn" role="status"><span class="dot"></span><span id="connection-label">正在连接</span></div><div><small>本地控制台 · 127.0.0.1:8766</small> <span id="last-updated">尚无响应</span></div></div>
+  </header>
+  <main>
+    <div class="page-heading"><div><h1>从当前位置，走向局部目标</h1><p class="subtitle">先将当前车身位置和车头方向设为零点，再选目标。先转向，后直行。</p></div><span class="mode-note">局部坐标 · 不依赖地图定位</span></div>
+    <div id="snapshot-banner" class="snapshot" hidden role="status">连接已中断。当前显示最近一次快照，不能代表机器人此刻状态；执行已禁用。</div>
+    <div class="layout">
+      <section class="main-column" aria-label="局部目标控制">
+        <article class="card">
+          <div class="card-head"><div><h2>局部坐标视图</h2><p>屏幕右侧为 +X（置零时车头前方），上方为 +Y（左侧）</p></div><span id="reference-status" class="pill warn">尚未置零</span></div>
+          <div class="card-body" style="padding-bottom:14px">
+            <div class="reference-summary"><div class="stat"><label>当前位置 X</label><strong id="pose-x">—</strong><span>m</span></div><div class="stat"><label>当前位置 Y</label><strong id="pose-y">—</strong><span>m</span></div><div class="stat"><label>车头角度</label><strong id="pose-yaw">—</strong><span>°</span></div></div>
+            <div class="tiny">参考会话 <span id="reference-epoch" class="mono">—</span> · <span id="reference-reason">当前位置及车头方向尚未建立局部零点</span></div>
+            <div class="tiny" style="margin-top:9px">原始轮速 / odom 源龄 <span id="odom-source-age" class="pill warn">待来源</span><span style="margin-left:7px">按原始采样时间计龄，页面刷新不续鲜</span></div>
+          </div>
+          <div class="plot-wrap"><canvas id="local-canvas" tabindex="0" aria-label="局部坐标：右为X前方，上为Y左方；点击只选择目标，不执行"></canvas><div class="plot-caption" id="canvas-hint">先完成局部置零，再点击选择目标</div><div class="plot-tools"><button type="button" id="zoom-out" aria-label="缩小坐标视图">−</button><button type="button" id="zoom-in" aria-label="放大坐标视图">＋</button><button type="button" id="fit-view" aria-label="适配局部轨迹">⌖</button></div></div>
+          <div class="plot-footer"><div class="legend"><span><i></i>当前车头 / 轮询轨迹</span><span><i class="goal-dot"></i>局部目标</span><span><i class="origin-dot"></i>本次零点</span></div><span id="plot-scale">网格 0.5 m</span></div>
+        </article>
+        <article class="card">
+          <div class="card-head"><h2><span class="section-step">2</span>选择目标并预览</h2><span id="busy-note" class="busy-note" hidden>正在处理请求</span></div>
+          <div class="card-body">
+            <p class="instruction">坐标相对于本次零点。点击视图或填写数值只改变目标；预览不会启动机器人。</p>
+            <div class="input-row"><div class="field"><label for="goal-x">目标 X · 前方为正</label><div class="input-wrap"><input id="goal-x" type="number" step="0.05" inputmode="decimal" placeholder="例如 0.50" autocomplete="off"><span class="unit">m</span></div></div><div class="field"><label for="goal-y">目标 Y · 左侧为正</label><div class="input-wrap"><input id="goal-y" type="number" step="0.05" inputmode="decimal" placeholder="例如 0.00" autocomplete="off"><span class="unit">m</span></div></div><button type="button" id="preview-button" class="secondary" disabled>预览目标</button></div>
+            <div id="preview-box" class="preview-box" aria-live="polite"><span class="preview-empty">尚未预览 · 先选择局部目标</span></div>
+            <label class="check-row" for="area-clear"><input id="area-clear" type="checkbox" disabled><span>本次执行已确认：车上无人，现场可随时人工停车，四周及后方转向扫掠区域均已检查。<br><span class="tiny">前 180° 雷达无法代替后方人工检查；每次执行需要重新确认。</span></span></label>
+            <div class="action-row"><button type="button" id="execute-button" class="primary" disabled>明确执行此目标</button><button type="button" id="cancel-button" class="danger" disabled>取消并停车</button></div>
+            <p id="action-message" class="message" role="status" aria-live="polite">初始状态禁止执行。请先建立本次局部零点。</p>
+          </div>
+        </article>
+      </section>
+      <aside class="side-column" aria-label="参考状态与保存地图">
+        <article class="card"><div class="card-head"><h2><span class="section-step">1</span>建立局部零点</h2></div><div class="card-body"><p class="reset-note">小车停稳后，将当前位置和当前车头设为 <strong>(0, 0, 0)</strong>。可在任意位置建立新零点；旧目标和预览会清除。</p><button id="reset-button" type="button" class="reset-button" disabled>将当前位置 / 车头置零</button><p class="tiny" style="margin:10px 0 0">这是本次会话的软件参考，不重置 MCU 编码器，也不会启动移动。当前车头为局部 +X，并非原地图建图方向。</p></div></article>
+        <article class="card"><div class="card-head"><h2>任务与停车状态</h2><span id="task-phase" class="pill">待命</span></div><div class="card-body"><dl><div class="kv"><dt>任务编号</dt><dd id="task-id" class="mono">—</dd></div><div class="kv"><dt>到点结果</dt><dd id="task-complete">尚无任务</dd></div><div class="kv"><dt>实测停车确认</dt><dd id="stop-confirmed">尚无证据</dd></div><div class="kv"><dt>最终位置验证</dt><dd id="position-verified">尚无证据</dd></div></dl><div id="task-failure" class="task-note">取消请求和零速度命令不等于已经停稳；以实测停车确认结果为准。</div><hr><div class="limits"><span>速度 ≤ 0.03 m/s</span><span>转向 ≤ 6.9 °/s</span><span>到点误差 ≤ 0.10 m</span><span>车体净距 0.20 m</span><span>单次 ≤ 200 s</span><span>原始反馈 750 ms</span></div></div></article>
+        <article class="card map-card"><div class="card-head"><h2>已保存地图</h2><span class="pill warn">只读参考</span></div><div class="reference-warning"><strong>仅供查看 / 不是定位</strong><br>不能在此图选目标，也不叠加当前 odom。</div><div class="map-image-box"><img id="saved-map-image" alt="已保存的 r5 地图，仅供查看，不表示当前定位" draggable="false" hidden><div id="saved-map-empty" class="map-empty">等待已保存地图</div></div><div class="map-details"><div id="saved-map-metadata">地图尺寸与分辨率尚未提供</div><div id="saved-map-sha" class="mono" style="margin-top:4px">SHA —</div><p style="margin:8px 0 0">局部零点与这张地图没有已知坐标变换。图中方向不代表此刻车头方向。</p></div></article>
+      </aside>
+    </div>
+    <p class="footnote">本地坐标与轨迹来自本次参考会话。网页断开不代表任务取消；需要停车时请请求取消，并核对实测停车结果。</p>
+  </main>
+  <script>
+  (() => {
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const ui = {
+      canvas:$('local-canvas'), x:$('goal-x'), y:$('goal-y'), preview:$('preview-button'), execute:$('execute-button'),
+      cancel:$('cancel-button'), reset:$('reset-button'), area:$('area-clear'), message:$('action-message')
+    };
+    const model = {state:null, epoch:null, goal:null, preview:null, selectionVersion:0, pending:null,
+      cancelling:false, transportOK:false, transportError:'', lastResponse:null, trajectory:[], halfSpan:2, polling:false};
+    const finite = value => typeof value === 'number' && Number.isFinite(value);
+    const fmt = (value, digits=2) => finite(value) ? value.toFixed(digits) : '—';
+    const token = () => model.state && typeof model.state.csrf_token === 'string' ? model.state.csrf_token : '';
+    const connected = () => model.transportOK && model.state && model.state.connected === true;
+    const reference = () => model.state && model.state.reference || {};
+    const task = () => model.state && model.state.task || {};
+    const active = () => task().active === true;
+    const idle = () => connected() && !active() && !(model.state && model.state.busy) && !model.pending;
+    const pose = () => {
+      const value = reference().pose;
+      return value && finite(value.x) && finite(value.y) && finite(value.yaw) ? value : null;
+    };
+    const validReference = () => reference().valid === true && reference().epoch != null && pose() !== null;
+    const sameGoal = (a,b) => a && b && a.x === b.x && a.y === b.y;
+    function setMessage(text, kind='') { ui.message.textContent=text; ui.message.className='message'+(kind ? ' '+kind : ''); }
+    function clearSelection(clearInputs=true) {
+      model.goal=null; model.preview=null; model.selectionVersion++; ui.area.checked=false;
+      if (clearInputs) { ui.x.value=''; ui.y.value=''; }
+    }
+    function selectGoal(value, updateInputs=false) {
+      model.goal=value; model.preview=null; model.selectionVersion++; ui.area.checked=false;
+      if (updateInputs && value) { ui.x.value=value.x.toFixed(3); ui.y.value=value.y.toFixed(3); }
+      setMessage(value ? '目标已选择。请先预览，再逐项确认后执行。' : '请填写有效的 X、Y 数值。'); render();
+    }
+    function requestID() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,character=>{
+        const random=Math.floor(Math.random()*16); return (character==='x' ? random : (random&3)|8).toString(16);
+      });
+    }
+    async function post(path, payload) {
+      if (!token()) throw new Error('缺少会话校验令牌，请等待页面重新连接。');
+      const response = await fetch(path, {method:'POST',credentials:'same-origin',cache:'no-store',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':token()},body:JSON.stringify(payload)});
+      let data;
+      try { data=await response.json(); } catch (_) { throw new Error('后端响应格式异常（HTTP '+response.status+'）'); }
+      if (!response.ok || data.error) throw new Error(data.error || '请求失败（HTTP '+response.status+'）');
+      return data;
+    }
+    function applyState(next) {
+      if (!next || typeof next !== 'object' || Array.isArray(next)) throw new Error('状态响应格式异常');
+      const nextEpoch=next.reference && next.reference.epoch != null ? next.reference.epoch : null;
+      const wasActive=active();
+      if (nextEpoch !== model.epoch) {
+        clearSelection(); model.trajectory=[]; model.halfSpan=2; model.epoch=nextEpoch;
+        setMessage(nextEpoch == null ? '尚未建立局部零点。' : '参考会话已更新。旧目标与预览已清除，请重新选择。');
+      }
+      model.state=next; model.transportOK=true; model.transportError=''; model.lastResponse=new Date();
+      if (active() && !wasActive) { model.preview=null; ui.area.checked=false; }
+      if (!validReference()) { model.preview=null; ui.area.checked=false; model.selectionVersion++; }
+      const p=pose();
+      if (Array.isArray(next.history) && validReference()) {
+        model.trajectory=next.history.filter(p=>p && finite(p.x) && finite(p.y) && finite(p.yaw)).slice(-3000);
+      } else if (p && validReference() && next.connected === true) {
+        const previous=model.trajectory[model.trajectory.length-1];
+        if (!previous || Math.hypot(previous.x-p.x,previous.y-p.y)>.0001 || Math.abs(previous.yaw-p.yaw)>.005) {
+          model.trajectory.push({x:p.x,y:p.y,yaw:p.yaw});
+          if (model.trajectory.length>1500) model.trajectory.shift();
+        }
+      }
+      render();
+    }
+    async function pollState() {
+      if (model.polling) return;
+      model.polling=true;
+      const abort=new AbortController(); const deadline=window.setTimeout(()=>abort.abort(),3000);
+      try {
+        const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin',signal:abort.signal});
+        const data=await response.json();
+        if (!response.ok || data.error && !('connected' in data)) throw new Error(data.error || '无法读取状态');
+        applyState(data);
+      } catch (error) {
+        model.transportOK=false; model.transportError=String(error.message || error); ui.area.checked=false; render();
+      } finally { window.clearTimeout(deadline); model.polling=false; }
+    }
+    function previewReady() {
+      return Boolean(model.preview && model.preview.preview_id && model.preview.epoch === reference().epoch &&
+        sameGoal(model.preview.requestedGoal,model.goal));
+    }
+    function renderPreview() {
+      const box=$('preview-box'); box.replaceChildren();
+      if (!previewReady()) {
+        const text=document.createElement('span'); text.className='preview-empty';
+        text.textContent=model.goal ? '目标 ('+fmt(model.goal.x)+', '+fmt(model.goal.y)+') m · 尚未预览' : '尚未预览 · 先选择局部目标'; box.append(text); return;
+      }
+      const title=document.createElement('strong'); title.textContent='预览已就绪 · 尚未执行'; box.append(title);
+      const metrics=document.createElement('div'); metrics.className='preview-metrics';
+      for (const text of ['目标 ('+fmt(model.goal.x)+', '+fmt(model.goal.y)+') m','距当前 '+fmt(model.preview.distance_m)+' m','需转向 '+fmt(model.preview.heading_deg,1)+'°']) {
+        const span=document.createElement('span'); span.textContent=text; metrics.append(span);
+      }
+      box.append(metrics);
+    }
+    function renderMap() {
+      const saved=model.state && model.state.saved_map;
+      const image=$('saved-map-image'), empty=$('saved-map-empty');
+      if (!saved) { image.hidden=true; empty.hidden=false; return; }
+      $('saved-map-metadata').textContent=(finite(saved.width) && finite(saved.height) ? saved.width+' × '+saved.height+' 像素' : '尺寸待确认')+
+        ' · '+(finite(saved.resolution) ? (saved.resolution*100).toFixed(2)+' cm / 像素' : '分辨率待确认');
+      const hash=typeof saved.sha256 === 'string' ? saved.sha256 : '';
+      $('saved-map-sha').textContent='SHA '+(hash ? hash.slice(0,16)+'…' : '—'); $('saved-map-sha').title=hash;
+      try {
+        const url=new URL(saved.image_url,window.location.href);
+        if (url.origin !== window.location.origin || !/^https?:$/.test(url.protocol)) throw new Error('非本地同源地图');
+        if (image.dataset.url !== url.href) { image.dataset.url=url.href; image.src=url.href; }
+        image.hidden=false; empty.hidden=true;
+      } catch (_) { image.hidden=true; empty.hidden=false; empty.textContent='保存地图暂不可用'; }
+    }
+    function render() {
+      const online=Boolean(connected()), r=reference(), p=pose(), t=task(), frozen=!online;
+      const connection=$('connection-status'); connection.className='pill '+(online ? 'good' : model.lastResponse ? 'bad' : 'warn');
+      $('connection-label').textContent=online ? 'RK 已连接' : model.lastResponse ? '连接中断 · 快照' : '等待本地后端';
+      $('last-updated').textContent=model.lastResponse ? '页面响应 '+model.lastResponse.toLocaleTimeString('zh-CN',{hour12:false}) : '尚无响应';
+      $('snapshot-banner').hidden=!frozen;
+      $('snapshot-banner').textContent='当前显示'+(model.lastResponse ? '最近一次快照' : '空白初始视图')+'，不能代表机器人此刻状态；执行已禁用。'+
+        (model.transportError || model.state && model.state.error ? ' '+(model.transportError || model.state.error) : ' 等待本地后端与 RK 连接。');
+      $('reference-status').className='pill '+(validReference() && online ? 'good' : 'warn');
+      $('reference-status').textContent=validReference() ? (online ? '本次零点有效' : '历史参考快照') : '需要局部置零';
+      $('pose-x').textContent=p ? fmt(p.x,3) : '—'; $('pose-y').textContent=p ? fmt(p.y,3) : '—'; $('pose-yaw').textContent=p ? fmt(p.yaw*180/Math.PI,1) : '—';
+      $('reference-epoch').textContent=r.epoch == null ? '—' : String(r.epoch);
+      $('reference-reason').textContent=typeof r.reason === 'string' && r.reason ? r.reason : '零点方向为置零时车头方向，非保存地图方向';
+      const sourceAge=model.state && model.state.odometry_age_s, sourceLabel=$('odom-source-age');
+      sourceLabel.textContent=finite(sourceAge) && sourceAge >= 0 ? sourceAge.toFixed(3)+' s'+(sourceAge >= .75 ? ' · 快照源' : '') : '待来源';
+      sourceLabel.className='pill '+(finite(sourceAge) && sourceAge >= 0 && sourceAge < .75 ? 'good' : 'warn');
+      const labels={idle:'待命',preparing:'准备中',origin:'建立原点',arming:'准备驱动',turn:'原地对准',drive:'等速直行',stopping:'正在停车',stop:'停止',completed:'已完成',cancelled:'已取消',fault:'故障',failed:'失败'};
+      $('task-phase').textContent=t.phase ? labels[t.phase] || String(t.phase) : '待命';
+      $('task-phase').className='pill '+(t.first_failure ? 'bad' : t.active ? 'warn' : t.complete ? 'good' : '');
+      $('task-id').textContent=t.id == null ? '—' : String(t.id);
+      $('task-complete').textContent=t.complete === true ? '已报告到点' : t.active ? '任务进行中' : t.id ? '未报告到点' : '尚无任务';
+      $('stop-confirmed').textContent=t.stop_confirmed === true ? '已实测确认' : t.id ? '尚未确认停稳' : '尚无证据';
+      $('stop-confirmed').className=t.stop_confirmed === true ? 'status-good' : 'status-warn';
+      $('position-verified').textContent=t.position_verified === true ? '已验证' : t.id ? '尚未验证' : '尚无证据';
+      $('position-verified').className=t.position_verified === true ? 'status-good' : 'muted';
+      const fault=t.first_failure;
+      $('task-failure').textContent=fault ? (typeof fault === 'string' ? fault : fault.message || JSON.stringify(fault)) : '取消请求和零速度命令不等于已经停稳；以实测停车确认结果为准。';
+      $('task-failure').className='task-note'+(fault ? ' status-error' : '');
+      const canEdit=Boolean(idle() && validReference() && token());
+      ui.x.disabled=!canEdit; ui.y.disabled=!canEdit; ui.preview.disabled=!(canEdit && model.goal);
+      ui.reset.disabled=!(idle() && token());
+      ui.area.disabled=!(canEdit && previewReady());
+      ui.execute.disabled=!(canEdit && previewReady() && ui.area.checked);
+      ui.cancel.disabled=!(active() && t.id != null && token() && !model.cancelling);
+      $('busy-note').hidden=!(model.pending || model.state && model.state.busy);
+      $('busy-note').textContent=model.pending === 'execute' ? '正在提交本次目标' : model.pending === 'reset' ? '正在建立新零点' : '正在处理请求';
+      ui.canvas.style.cursor=canEdit ? 'crosshair' : 'not-allowed'; ui.canvas.setAttribute('aria-disabled',String(!canEdit));
+      $('canvas-hint').textContent=frozen ? '快照视图 · 已禁止执行' : active() ? '任务进行中 · 目标已锁定' : !validReference() ? '先完成局部置零，再点击选择目标' : '点击只选择局部目标 · 不会启动';
+      renderPreview(); renderMap(); draw();
+    }
+    function viewGeometry() {
+      const rect=ui.canvas.getBoundingClientRect(), width=rect.width, height=rect.height;
+      return {width,height,cx:width/2,cy:height/2,ppm:Math.min(width,height)/(2*model.halfSpan)};
+    }
+    function draw() {
+      const view=viewGeometry(); if (!view.width || !view.height) return;
+      const dpr=window.devicePixelRatio || 1;
+      if (ui.canvas.width !== Math.round(view.width*dpr) || ui.canvas.height !== Math.round(view.height*dpr)) {
+        ui.canvas.width=Math.round(view.width*dpr); ui.canvas.height=Math.round(view.height*dpr);
+      }
+      const ctx=ui.canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,view.width,view.height);
+      const point=(x,y) => [view.cx+x*view.ppm,view.cy-y*view.ppm];
+      const rough=model.halfSpan/4, power=Math.pow(10,Math.floor(Math.log10(rough)));
+      const step=([1,2,5,10].find(n=>n*power>=rough) || 10)*power;
+      ctx.lineWidth=1; ctx.strokeStyle='#e9eef6'; ctx.fillStyle='#9aa6b8'; ctx.font='10px system-ui';
+      for (let x=Math.floor(-view.cx/view.ppm/step)*step; x<=view.cx/view.ppm; x+=step) {
+        const px=point(x,0)[0]; ctx.beginPath(); ctx.moveTo(px,0); ctx.lineTo(px,view.height); ctx.stroke();
+        if (Math.abs(x)>step*.01) ctx.fillText(x.toFixed(step<.1 ? 2 : 1),px+4,view.cy+14);
+      }
+      for (let y=Math.floor(-view.cy/view.ppm/step)*step; y<=view.cy/view.ppm; y+=step) {
+        const py=point(0,y)[1]; ctx.beginPath(); ctx.moveTo(0,py); ctx.lineTo(view.width,py); ctx.stroke();
+        if (Math.abs(y)>step*.01) ctx.fillText(y.toFixed(step<.1 ? 2 : 1),view.cx+5,py-4);
+      }
+      ctx.strokeStyle='#b9c5d8'; ctx.beginPath(); ctx.moveTo(0,view.cy); ctx.lineTo(view.width,view.cy); ctx.moveTo(view.cx,0); ctx.lineTo(view.cx,view.height); ctx.stroke();
+      ctx.fillStyle='#6f7e96'; ctx.font='600 11px system-ui'; ctx.fillText('+X 前方',view.width-65,view.cy-9); ctx.fillText('+Y 左侧',view.cx+9,42);
+      ctx.fillStyle='#7e8ba0'; ctx.beginPath(); ctx.arc(view.cx,view.cy,4,0,Math.PI*2); ctx.fill(); ctx.font='10px system-ui'; ctx.fillText('本次零点',view.cx+9,view.cy+27);
+      if (model.trajectory.length>1) {
+        ctx.strokeStyle=connected() ? '#7099f1' : '#a1abbc'; ctx.lineWidth=2; ctx.beginPath();
+        model.trajectory.forEach((p,i)=>{const [x,y]=point(p.x,p.y);i ? ctx.lineTo(x,y) : ctx.moveTo(x,y);}); ctx.stroke();
+      }
+      let goal=model.goal;
+      const serverGoal=task().goal;
+      if (active() && serverGoal && finite(serverGoal.x) && finite(serverGoal.y)) goal=serverGoal;
+      const p=pose();
+      if (goal) {
+        const [gx,gy]=point(goal.x,goal.y);
+        if (p) { const [px,py]=point(p.x,p.y);ctx.save();ctx.setLineDash([5,5]);ctx.strokeStyle='#d7b36a';ctx.beginPath();ctx.moveTo(px,py);ctx.lineTo(gx,gy);ctx.stroke();ctx.restore(); }
+        ctx.strokeStyle='#d79427';ctx.lineWidth=2;ctx.beginPath();ctx.arc(gx,gy,8,0,2*Math.PI);ctx.moveTo(gx-13,gy);ctx.lineTo(gx+13,gy);ctx.moveTo(gx,gy-13);ctx.lineTo(gx,gy+13);ctx.stroke();
+        ctx.fillStyle='#9e6b1f';ctx.font='600 11px system-ui';ctx.fillText('目标 '+fmt(goal.x)+', '+fmt(goal.y),gx+14,gy-12);
+      }
+      if (p) {
+        const [x,y]=point(p.x,p.y);ctx.save();ctx.translate(x,y);ctx.rotate(-p.yaw);ctx.fillStyle=connected() ? '#3367e8' : '#8e9bb2';ctx.strokeStyle='white';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(17,0);ctx.lineTo(-12,-10);ctx.lineTo(-7,0);ctx.lineTo(-12,10);ctx.closePath();ctx.fill();ctx.stroke();ctx.restore();
+      }
+      $('plot-scale').textContent='网格 '+step.toFixed(step<.1 ? 2 : 1)+' m · 轮询轨迹示意';
+    }
+    ui.x.addEventListener('input',readInputs); ui.y.addEventListener('input',readInputs);
+    function readInputs() {
+      const x=ui.x.value.trim(), y=ui.y.value.trim(), nx=Number(x), ny=Number(y);
+      selectGoal(x && y && finite(nx) && finite(ny) ? {x:nx,y:ny} : null);
+    }
+    ui.canvas.addEventListener('click',event=>{
+      if (event.button !== 0 || !idle() || !validReference() || !token()) return;
+      const rect=ui.canvas.getBoundingClientRect(), v=viewGeometry();
+      const x=Math.round((event.clientX-rect.left-v.cx)/v.ppm*1000)/1000;
+      const y=Math.round((v.cy-(event.clientY-rect.top))/v.ppm*1000)/1000;
+      selectGoal({x,y},true);
+    });
+    ui.area.addEventListener('change',render);
+    ui.preview.addEventListener('click',async()=>{
+      if (ui.preview.disabled) return;
+      const requestedGoal={...model.goal}, epoch=reference().epoch, version=model.selectionVersion;
+      model.pending='preview'; model.preview=null; ui.area.checked=false; render();
+      try {
+        const result=await post('/api/preview',{epoch,x:requestedGoal.x,y:requestedGoal.y});
+        if (version !== model.selectionVersion || epoch !== reference().epoch) throw new Error('参考或目标已变化，请重新预览。');
+        if (!result.preview_id || result.epoch !== epoch || !finite(result.distance_m) || !finite(result.heading_deg)) throw new Error('预览响应不完整，请重新预览。');
+        model.preview={...result,requestedGoal}; setMessage('预览完成。请重新确认现场条件，再明确执行。');
+      } catch(error) { setMessage(String(error.message || error),'error'); }
+      finally { model.pending=null; render(); }
+    });
+    ui.execute.addEventListener('click',async()=>{
+      if (ui.execute.disabled || !idle() || !validReference() || !previewReady() || !ui.area.checked) return;
+      const payload={epoch:reference().epoch,x:model.goal.x,y:model.goal.y,preview_id:model.preview.preview_id,area_clear:true,request_id:requestID()};
+      model.pending='execute'; model.preview=null; ui.area.checked=false; render();
+      try { await post('/api/execute',payload); setMessage('本次执行请求已提交。请观察任务与实测停车状态。','success'); await pollState(); }
+      catch(error) { setMessage(String(error.message || error),'error'); }
+      finally { model.pending=null; render(); }
+    });
+    ui.reset.addEventListener('click',async()=>{
+      if (ui.reset.disabled || !idle()) return;
+      clearSelection(); model.pending='reset'; render();
+      try { await post('/api/reset',{request_id:requestID()}); setMessage('已提交局部置零请求，等待新零点与位姿确认。'); await pollState(); }
+      catch(error) { setMessage(String(error.message || error),'error'); }
+      finally { model.pending=null; render(); }
+    });
+    ui.cancel.addEventListener('click',async()=>{
+      if (ui.cancel.disabled || !active()) return;
+      model.cancelling=true; ui.area.checked=false; model.preview=null; render();
+      try { await post('/api/cancel',{task_id:task().id}); setMessage('已请求取消并停车。等待实测停车确认，尚不能认定已经停稳。'); await pollState(); }
+      catch(error) { setMessage('取消请求未确认：'+String(error.message || error)+'。请核对现场，必要时人工停车。','error'); }
+      finally { model.cancelling=false; render(); }
+    });
+    $('zoom-in').addEventListener('click',()=>{model.halfSpan=Math.max(.25,model.halfSpan/1.5);draw();});
+    $('zoom-out').addEventListener('click',()=>{model.halfSpan=Math.min(50,model.halfSpan*1.5);draw();});
+    $('fit-view').addEventListener('click',()=>{
+      const coordinates=[{x:0,y:0},...model.trajectory]; if (model.goal) coordinates.push(model.goal);
+      model.halfSpan=Math.min(50,Math.max(1,...coordinates.map(p=>Math.max(Math.abs(p.x),Math.abs(p.y))*1.3))); draw();
+    });
+    $('saved-map-image').addEventListener('error',()=>{$('saved-map-image').hidden=true;$('saved-map-empty').hidden=false;$('saved-map-empty').textContent='保存地图图像暂不可用';});
+    if (window.ResizeObserver) new ResizeObserver(draw).observe(ui.canvas.parentElement); else window.addEventListener('resize',draw);
+    render(); pollState(); window.setInterval(pollState,1000);
+  })();
+  </script>
+</body>
+</html>

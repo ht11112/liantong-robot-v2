@@ -30,3 +30,5 @@ jobs:
         run: python -B scripts/build_simple_p2p_package.py --name ci-simple-p2p
       - name: Packaged simple point-to-point regression suite
         run: python -B -m unittest discover -s dist/ci-simple-p2p/package -p 'test_simple*.py'
+      - name: Packaged local task remote operations
+        run: python -B -m unittest discover -s dist/ci-simple-p2p/package -p 'test_local_p2p_remote.py'

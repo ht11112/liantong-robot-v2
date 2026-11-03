@@ -138,7 +138,8 @@ class SessionPort(QueryOnlyPort):
 
 def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 execute=False, cancelled=lambda: False, clock=time.monotonic,
-                sleep=time.sleep, wall_clock=time.time, evidence_limit=131072):
+                sleep=time.sleep, wall_clock=time.time, evidence_limit=131072,
+                expected_start_encoders=None, event_sink=None):
     """Use one caller-owned FD/thread. execute=False only observes software zero.
 
     scan_provider is called only for execution and must be a short RAM read.
@@ -151,6 +152,11 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         raise ValueError("Reviewed v9 protocol required")
     if type(evidence_limit) is not int or not 2048 <= evidence_limit <= 262144:
         raise ValueError("Evidence limit must be 2048..262144")
+    if expected_start_encoders is not None and (type(expected_start_encoders) is not dict
+            or set(expected_start_encoders) != {"left_raw", "right_raw"}
+            or any(type(value) is not int or not 0 <= value <= 0xffffffff
+                   for value in expected_start_encoders.values())):
+        raise ValueError("Expected original encoder fields must be uint32 left_raw/right_raw")
     cfg = controller.config
     if not finite(cfg.duration_s) or not 0 < cfg.duration_s <= 200:
         raise ValueError("Trial duration must be positive and <=200 seconds")
@@ -166,7 +172,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         geometry=dict(diameter_m=odom.diameter, separation_m=odom.separation),
         host_source_timeout_s=.75, CAN_source_timeout_s=.25, zero_speed_rpm=.2,
         max_setpoint_hz=20, MCU_lease_s=.5, arm_handoff=None,
-        encoder_unchanged_since_origin=True, first_origin_encoder_change=None)
+        encoder_unchanged_since_origin=True, first_origin_encoder_change=None,
+        expected_start_encoders=expected_start_encoders, event_sink_errors=[])
     phase, latest, last_scan, scan_phase = "origin", None, None, None
     began, last_time, lease_deadline, applied_order = clock(), None, float("inf"), -1
     next_order = 0
@@ -183,6 +190,26 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         if result["first_failure"] is None:
             result["first_failure"] = dict(phase=where, message=str(exc),
                 error_type=type(exc).__name__, monotonic_s=clock())
+
+    def emit(kind, packet=None, measurement=None, pose=None):
+        if event_sink is None:
+            return
+        event = dict(event=kind, phase=phase, boot_id=boot_id, execute=execute,
+            event_monotonic_s=clock(), source_monotonic_s=None if measurement is None else measurement["source_monotonic_s"],
+            raw_packet=None if packet is None else dict(packet),
+            pose=None if pose is None else {key: pose[key] for key in ("x", "y", "yaw")})
+        try:
+            event_sink(event)  # The caller must only replace a bounded RAM slot.
+        except BaseException as exc:
+            if len(result["event_sink_errors"]) < 8:
+                result["event_sink_errors"].append(type(exc).__name__+": "+str(exc))
+            if port.phase != "stopping":
+                raise BaseFault("RAM event callback failed: "+str(exc))
+
+    def expected_encoder(packet):
+        if expected_start_encoders is not None and any(packet[field] != expected_start_encoders[key]
+                for field, key in (("position_left_raw", "left_raw"), ("position_right_raw", "right_raw"))):
+            raise BaseFault("Expected start encoder changed; reset the local frame before a new task")
 
     def health():
         nonlocal last_scan
@@ -219,6 +246,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 result["encoder_unchanged_since_origin"] = False
                 if result["first_origin_encoder_change"] is None:
                     result["first_origin_encoder_change"] = row
+        if kind != 5:
+            emit("phase")
         return row
 
     def exchange(kind, left=0, right=0, session=0, challenge=0, guard=True, stopping=False):
@@ -254,6 +283,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 raise BaseFault("Measured MCU odometry discontinuity; missing motion not integrated")
             latest = dict(observed, source_monotonic_s=measurement["source_monotonic_s"])
             row["odometry"] = dict(latest)
+        emit("odometry", packet, measurement,
+             latest if latest is not None and latest["sample_sequence"] == packet["sample_sequence"] else None)
         return packet
 
     def stop_chain(integrate_parking=False):
@@ -334,10 +365,12 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             if packet["controller_state"] != 1 or max(abs(packet["speed_left_rpm"]), abs(packet["speed_right_rpm"])) > .2:
                 raise BaseFault("Origin requires actual zero speed within 0.2 RPM")
             if feedback(packet, row) is not None:
+                expected_encoder(packet)
                 result["origin"] = dict(pose=dict(x=0., y=0., yaw=0.), boot_id=boot_id,
                     source_monotonic_s=source.source, received_monotonic_s=now(),
                     received_wall_s=wall_clock(), raw_packet=dict(packet),
                     software_zero_only=True, MCU_encoder_reset=False)
+                emit("origin", packet, dict(source_monotonic_s=source.source), latest)
 
     try:
         result["nonblocking"] = client.enable_nonblocking()
@@ -366,6 +399,23 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             if not stopped(state):
                 raise BaseFault("ARM preflight requires new healthy stopped STATUS")
             before = result["initial_stop_chain"]["zero_samples"][-1]
+            if expected_start_encoders is not None:
+                prearm_deadline = now()+.2
+                while True:
+                    if now() >= prearm_deadline:
+                        raise BaseFault("New pre-ARM encoder verification timed out")
+                    packet, row = exchange(5)
+                    sample = feedback(packet,row,integrate=False)
+                    if sample is not None:
+                        if sample["controller_state"] != 1 or max(abs(sample["speed_left_rpm"]),abs(sample["speed_right_rpm"])) > .2:
+                            raise BaseFault("Pre-ARM encoder verification requires actual stopped DISARMED feedback")
+                        before = sample
+                        result["expected_start_verification"] = row
+                        break
+                    sleep(.001)
+            expected_encoder(before)
+            if expected_start_encoders is not None and not result["encoder_unchanged_since_origin"]:
+                raise BaseFault("Start encoder changed during preparation; reset the local frame")
             session = secrets.randbelow(0xffffffff)+1
             _, arm_row = exchange(6, session=session, challenge=state["challenge"])
             arm_deadline, ready_lower_bound = now()+4., arm_row["request_start_monotonic_s"]
@@ -403,6 +453,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     # No motion target existed; establish the next measured interval.
                     odom.invalidate()
                     latest = dict(odom.update(sample), source_monotonic_s=source.source)
+                    emit("odometry", sample, dict(source_monotonic_s=source.source), latest)
                     break
                 sleep(.001)
             phase, port.phase = "motion", "active"
@@ -511,6 +562,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     fail(BaseFault(result["final_stop_chain"]["parking_position_error"] or
                         "Final parking position not verified"), phase)
                     result["motion_complete"] = False
+        if result["event_sink_errors"]:
+            fail(BaseFault("RAM event callback failed: "+result["event_sink_errors"][0]), phase)
         result.update(rows=rows, raw_events=port.events, command_intents=intents,
             query_counts=dict(port.attempts), complete_write_counts=dict(port.complete_writes),
             elapsed_s=clock()-began, latest_odometry=latest, arm_count=port.arm_count)

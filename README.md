@@ -2,11 +2,13 @@
 
 本分支 `feature/simple-point-to-point` 新增独立点到点控制：**原地对准目标 → 两轮等速直行 → STOP并核实零速**。只使用真实轮速odom，不加载地图或AMCL，不自动绕障。直行偏航过大先停稳再对准；靠近目标减速，到点不调整车头。见[简版使用说明](docs/SIMPLE_P2P.md)。main及手推回退标签保持原范围。
 
-新功能默认只建立本次软件odom零点。只有显式 `--execute` 加目标才会ARM；本次开发不自动运行行驶任务。手推建图和只读网页保持原程序字节，网页没有新增车辆控制接口。
+新增本地网页入口位于 `http://127.0.0.1:8766/`：查看已保存地图、设置软件局部原点、预览局部坐标目标、显式执行或取消单次RK任务。地图仅作只读参考，局部坐标图独立显示；不把保存地图当作机器人定位。设原点和预览不发车，执行才允许ARM。页面或PC断开后，RK按原任务边界继续运行。
+
+原手推建图、配套只读网页及12项来源文件保持原字节。新增入口使用独立的 `local_p2p_server.py` / `run_local_p2p.py`；启动方法见[使用说明](docs/USAGE.md#本地局部坐标网页)。
 
 原手推基线保存已实现的**手推创建新地图、PC只读查看及其测试**，来源于“重新设计点到点导航”对话最后完成的手推建图 r5。
 
-RK运行程序、主机通信依赖和网页保持原始字节。当前main已移除点到点导航、定位/路径预览/运动联调入口、无关配置和对应测试；不携带STM32固件、现场地图、日志或凭据。
+原手推RK程序、主机通信依赖和配套只读网页保持原始字节。当前main已移除旧点到点导航、定位/路径预览/运动联调入口、无关配置和对应测试；本feature独立增加上述局部坐标功能，不携带STM32固件、现场地图、日志或凭据。
 
 ## 当前功能
 
@@ -28,7 +30,9 @@ RK运行程序、主机通信依赖和网页保持原始字节。当前main已�
 | `app/test_manual_mapping_query.py` | 手推查询与里程计测试 |
 | `app/test_mapping_viewer.py` | 只读网页数据处理测试 |
 
-`app`总共12个文件：8个程序Python文件、3个测试Python文件、1个HTML文件。手推程序只发STATUS/FEEDBACK，不发STOP、ARM或轮速给定。基础依赖文件包含共用辅助代码，保留完整文件便于核验已实测源文件身份。
+以上是原手推的12项来源子集：8个程序Python文件、3个测试Python文件、1个HTML文件。手推程序只发STATUS/FEEDBACK，不发STOP、ARM或轮速给定。基础依赖文件包含共用辅助代码，保留完整文件便于核验已实测源文件身份。
+
+简版控制另含 `simple_p2p.py`、`simple_p2p_base.py`、`simple_p2p_runtime.py`、RK任务入口 `local_p2p_remote.py` 和各自测试。PC网页服务与UI不进入RK运动包；手推包仍独立构建。
 
 ## 离线检查与构建
 
@@ -39,6 +43,9 @@ python -B -m unittest discover -s app -p "test_*.py"
 python -B scripts/verify_source.py --verify-manual-import --verify-r5-baseline
 python -B scripts/build_package.py --name manual-mapping --verify-r5-baseline
 python -B -m unittest discover -s dist/manual-mapping/package -p "test_manual_mapping*.py"
+python -B scripts/build_simple_p2p_package.py --name simple-p2p-web
+python -B -m unittest discover -s dist/simple-p2p-web/package -p "test_simple*.py"
+python -B -m unittest discover -s dist/simple-p2p-web/package -p "test_local_p2p_remote.py"
 ```
 
 现有测试只用标准库，不连接设备。构建输出在`dist/`，已存在的构建目录拒绝覆盖；需要再次构建时换一个`--name`。未来修改代码后正常构建可省略历史身份检查参数。

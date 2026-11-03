@@ -37,6 +37,7 @@ class MCU:
         self.arm_at, self.stop_tick, self.stop_count = None, None, 0
         self.first_old = False
         self.speed_sample, self.sampled_speed = None, (0, 0)
+        self.last_stopped_status_tick = None
 
     def write(self, raw):
         self.writes.append((self.clock.value, bytes(raw)))
@@ -69,8 +70,8 @@ class MCU:
                 self.speed_sample, self.sampled_speed = sample_tick, (l, r)
             l, r = self.sampled_speed
             if self.mode == "origin_nonzero" and self.arm_at is None: l = 1
-            if self.first_old and (self.mode != "new_parking_nonzero" or tick > self.stop_tick):
-                sample_tick = self.stop_tick-10 if self.mode == "old_parking" else self.stop_tick+1
+            if self.first_old and (self.mode != "new_parking_nonzero" or tick > self.last_stopped_status_tick):
+                sample_tick = self.stop_tick-10 if self.mode == "old_parking" else self.last_stopped_status_tick+1
                 sample_seq, l, r = sample_tick//50, -.5, 0
                 self.first_old = False
             raw_speed = (int(round(l*10)) & 65535) | ((int(round(r*10)) & 65535)<<16)
@@ -81,6 +82,8 @@ class MCU:
             if self.mode == "encoder_changed" and self.stop_count:
                 words[4] = 1
         else:
+            if kind == 2 and self.state == 1 and self.stop_count:
+                self.last_stopped_status_tick = tick
             target_pack = (self.target[0] & 65535) | ((self.target[1] & 65535)<<16)
             applied = self.applied
             if self.mode == "not_applied": target_pack = 0
@@ -91,7 +94,13 @@ class MCU:
         reply = body+struct.pack("<H", api.crc16(body))
         if self.mode == "bad_crc" and kind == 5: reply = reply[:-1]+bytes([reply[-1]^1])
         if self.mode == "short" and kind == 5: return 10
-        self.queue.append((at+self.delay, reply))
+        # A healthy stopped STATUS requires a *new* disabled-driver CAN sample.
+        # Delay STOP ACK to that sample boundary instead of changing frozen CAN
+        # status_raw from 7 to 0 under the same sample_sequence.
+        ready_at = at+self.delay
+        if kind == 3:
+            ready_at = max(ready_at,(math.floor(at/.05)+1)*.05+.002)
+        self.queue.append((ready_at, reply))
         return 20
 
     def read(self, count):
@@ -118,7 +127,8 @@ class Script:
 
 
 class BaseTests(unittest.TestCase):
-    def run_case(self, mode="healthy", execute=False, phases=("drive",), scan=None, cancelled=None, delay=0., goal_x=0.):
+    def run_case(self, mode="healthy", execute=False, phases=("drive",), scan=None, cancelled=None, delay=0., goal_x=0.,
+                 expected=None,event_sink=None):
         clock = Clock(); port = MCU(clock, mode, delay)
         controller = Script(clock, phases)
         controller.goal_x = goal_x
@@ -126,7 +136,8 @@ class BaseTests(unittest.TestCase):
         with patch.object(api.time, "monotonic", clock.monotonic), patch.object(api.time, "sleep", clock.sleep):
             result = base.run_session(port, api, core, controller, scan_provider=scan,
                 boot_id="this-boot", execute=execute, cancelled=cancelled or (lambda:False),
-                clock=clock.monotonic, sleep=clock.sleep, wall_clock=lambda:1000.+clock.value)
+                clock=clock.monotonic, sleep=clock.sleep, wall_clock=lambda:1000.+clock.value,
+                expected_start_encoders=expected,event_sink=event_sink)
         return result, port
 
     def test_origin_only_queries_no_scan_and_first_true_sample_zero(self):
@@ -268,6 +279,35 @@ class BaseTests(unittest.TestCase):
         self.assertIsNotNone(result["first_origin_encoder_change"])
         self.assertIsNone(result["position_verification"]["pose"])
         self.assertIn("Encoder changed",result["first_failure"]["message"])
+
+    def test_expected_encoder_mismatch_at_origin_or_during_preparation_never_arms(self):
+        for mode,expected in (("healthy",dict(left_raw=1,right_raw=0)),
+                              ("encoder_changed",dict(left_raw=0,right_raw=0))):
+            with self.subTest(mode=mode):
+                result,port=self.run_case(mode,execute=True,expected=expected)
+                self.assertFalse(result['session_complete'])
+                self.assertIn('encoder',result['first_failure']['message'])
+                self.assertFalse(any(raw[3] in (6,7) for _,raw in port.writes))
+                self.assertTrue(result['final_stop_chain']['complete'])
+        result,_=self.run_case(execute=True,expected=dict(left_raw=0,right_raw=0))
+        self.assertTrue(result['session_complete'],result['first_failure'])
+        self.assertEqual(result['expected_start_verification']['packet']['position_left_raw'],0)
+        self.assertTrue(result['expected_start_verification']['distinct'])
+
+    def test_ram_events_keep_original_feedback_source_and_callback_fault_still_stops(self):
+        events=[]
+        result,_=self.run_case(execute=True,event_sink=events.append)
+        self.assertTrue(result['session_complete'],result['first_failure'])
+        self.assertEqual(sum(event['event']=='origin' for event in events),1)
+        for event in (event for event in events if event['source_monotonic_s'] is not None):
+            self.assertLessEqual(event['source_monotonic_s'],event['event_monotonic_s'])
+            self.assertIsNotNone(event['raw_packet'])
+        def broken(event): raise ValueError('RAM callback fault')
+        result,port=self.run_case(execute=True,event_sink=broken)
+        self.assertFalse(result['session_complete'])
+        self.assertIn('RAM event callback failed',result['first_failure']['message'])
+        self.assertTrue(result['final_stop_chain']['complete'])
+        self.assertFalse(any(raw[3] in (6,7) for _,raw in port.writes))
 
     def test_wire_forbids_unknown_bad_crc_second_arm_other_thread_and_stale_physical_target(self):
         clock = Clock(); physical = MCU(clock); wire = base.SessionPort(physical, True, clock.monotonic)

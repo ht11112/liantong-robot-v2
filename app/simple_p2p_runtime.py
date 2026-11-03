@@ -3,6 +3,7 @@ import argparse
 from dataclasses import asdict
 import json
 import math
+import os
 from pathlib import Path
 import signal
 import threading
@@ -16,6 +17,75 @@ from simple_p2p_base import run_session
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = (HERE / 'config' / 'simple-p2p.json' if (HERE / 'config' / 'simple-p2p.json').is_file()
                   else HERE.parent / 'config' / 'simple-p2p.json')
+
+
+class LiveStatusWriter:
+    """One latest RAM slot; only its worker touches disk, at most twice/sec."""
+    def __init__(self, path, boot_id, clock=time.monotonic):
+        self.path, self.clock = Path(path), clock
+        self.lock, self.done = threading.Lock(), threading.Event()
+        self.latest = dict(schema='simple-p2p-live-v1', boot_id=boot_id, phase='starting',
+            pose=None, raw_packet=None, source_monotonic_s=None, finished=False,
+            position_verified=False)
+        self.error = None
+        self.thread = threading.Thread(target=self._run, name='live-status-writer', daemon=True)
+
+    def submit(self, event):
+        # Called by the serial thread: bounded copies of flat scalar dictionaries.
+        with self.lock:
+            self.latest['phase'] = event['phase']
+            self.latest['event_monotonic_s'] = event['event_monotonic_s']
+            if event['source_monotonic_s'] is not None:
+                self.latest.update(source_monotonic_s=event['source_monotonic_s'],
+                    raw_packet=event['raw_packet'], pose=event['pose'])
+            if event['event'] == 'origin':
+                self.latest['origin'] = dict(pose=event['pose'], raw_packet=event['raw_packet'],
+                    source_monotonic_s=event['source_monotonic_s'])
+
+    def _write(self):
+        with self.lock:
+            snapshot = dict(self.latest)
+        snapshot['written_monotonic_s'] = self.clock()  # Distinct from original source.
+        temporary = self.path.with_name(self.path.name+'.writer-tmp')
+        temporary.write_text(json.dumps(snapshot, allow_nan=False), encoding='utf-8')
+        os.replace(str(temporary), str(self.path))
+
+    def _run(self):
+        try:
+            while True:
+                self._write()
+                if self.done.wait(.5):
+                    return
+        except BaseException as exc:
+            self.error = type(exc).__name__+': '+str(exc)
+
+    def start(self):
+        self.thread.start()
+
+    def close(self, result, timeout=2.):
+        self.done.set()
+        self.thread.join(timeout)
+        if self.thread.is_alive():
+            self.error = 'Live status writer did not exit within bounded cleanup'
+            return False
+        # The port has already closed. No background write can race this final one.
+        proof = result.get('final_stop_chain') or {}
+        packet = (proof.get('zero_samples') or [None])[-1]
+        pose = result.get('latest_odometry')
+        with self.lock:
+            self.latest.update(finished=True, phase='finished',
+                position_verified=result.get('position_verified',False),
+                first_failure=result.get('first_failure'),
+                session_complete=result.get('session_complete',False))
+            if packet is not None:
+                self.latest['raw_packet'] = packet
+            if result.get('position_verified') and pose is not None:
+                self.latest['pose'] = {key:pose[key] for key in ('x','y','yaw')}
+        try:
+            self._write()
+        except BaseException as exc:
+            self.error = type(exc).__name__+': '+str(exc)
+        return self.error is None
 
 
 def finite(name, value, positive=False):
@@ -139,6 +209,8 @@ def main(argv=None):
     parser.add_argument('--turn-area-clear', action='store_true',
                         help='Operator has checked the whole swept body area including the rear blind sector')
     parser.add_argument('--scan-topic', default='/lidar1/laser_fan')
+    parser.add_argument('--expected-start-encoders', nargs=2, type=int, metavar=('LEFT_RAW','RIGHT_RAW'))
+    parser.add_argument('--cancel-request-file', type=Path, help='Optional fixed broker-owned cancellation file')
     args = parser.parse_args(argv)
     if str(uuid.UUID(args.expected_boot_id)) != args.expected_boot_id:
         parser.error('Expected a canonical boot UUID')
@@ -146,6 +218,9 @@ def main(argv=None):
         parser.error('--execute requires --goal-x and --goal-y')
     if not args.execute and (args.goal_x is not None or args.goal_y is not None):
         parser.error('An origin-only observation does not accept a motion goal')
+    if args.expected_start_encoders is not None and any(not 0 <= value <= 0xffffffff for value in args.expected_start_encoders):
+        parser.error('--expected-start-encoders requires two original uint32 values')
+    expected = None if args.expected_start_encoders is None else dict(zip(('left_raw','right_raw'),args.expected_start_encoders))
     goal_x = finite('goal_x', args.goal_x or 0.)
     goal_y = finite('goal_y', args.goal_y or 0.)
     config, obstacle = load_config(args.config)
@@ -161,7 +236,7 @@ def main(argv=None):
         signal.signal(sig, cancel_handler)
     def watch_cancel_file():
         while not watcher_done.wait(.05):
-            if (args.output_dir/'cancel.request').exists():
+            if (args.output_dir/'cancel.request').exists() or (args.cancel_request_file is not None and args.cancel_request_file.exists()):
                 cancelled.set()
                 return
     scan, subscriber, rospy = None, None, None
@@ -195,12 +270,14 @@ def main(argv=None):
     result = None
     watcher = threading.Thread(target=watch_cancel_file, name='local-cancel-file', daemon=True)
     watcher.start()
+    live = LiveStatusWriter(args.output_dir/'live_status.json',actual_boot)
+    live.start()
     try:
         with transport.exclusive_port(target['port']) as physical:
             result = run_session(physical, api, core,
                 SimplePointController(goal_x, goal_y, config=config, started_at=time.monotonic()),
                 scan_provider=scan, boot_id=actual_boot, execute=args.execute,
-                cancelled=cancelled.is_set)
+                cancelled=cancelled.is_set, expected_start_encoders=expected, event_sink=live.submit)
         result['exclusive_port_closed_normally'] = True
     except BaseException as exc:
         if result is None:
@@ -219,13 +296,20 @@ def main(argv=None):
             subscriber.unregister()
         if rospy is not None:
             rospy.signal_shutdown('single local goal finished')
+        live_ok = live.close(result)
+        result['live_status_writer_complete'] = live_ok
+        if not live_ok:
+            result.setdefault('cleanup_errors',[]).append(dict(phase='live_status_writer',message=live.error))
+            result['session_complete'] = False
     result.update(schema='simple-p2p-result-v1', boot_id=actual_boot, goal=dict(x=goal_x, y=goal_y),
                   motion_requested=args.execute, reset_odom_requested=True, encoders_reset=False,
                   config=asdict(config), obstacle=obstacle, geometry_accuracy_verified=False,
                   turn_area_operator_checked=args.turn_area_clear,
                   origin_valid_only_for_this_process=True, old_map_loaded=False, amcl_started=False)
     # All serial work has ended before filesystem serialization.
-    (args.output_dir/'result.json').write_text(json.dumps(result, indent=2, allow_nan=False), encoding='utf-8')
+    result_tmp = args.output_dir/'result.json.tmp'
+    result_tmp.write_text(json.dumps(result, indent=2, allow_nan=False), encoding='utf-8')
+    os.replace(str(result_tmp),str(args.output_dir/'result.json'))
     if result.get('origin') is not None:
         (args.output_dir/'origin.json').write_text(json.dumps(result['origin'], indent=2, allow_nan=False), encoding='utf-8')
     print(json.dumps({key: result.get(key) for key in ('schema', 'motion_requested', 'session_complete',

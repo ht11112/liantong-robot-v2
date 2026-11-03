@@ -14,7 +14,9 @@ from build_package import archive_bytes, sha256
 from verify_source import ROOT
 
 
-ENTRY_POINTS = ("simple_p2p_runtime.py", "simple_p2p.py", "simple_p2p_base.py")
+ENTRY_POINTS = ("simple_p2p_runtime.py", "simple_p2p.py", "simple_p2p_base.py",
+                "local_p2p_remote.py")
+REMOTE_TEST = "test_local_p2p_remote.py"
 DEPENDENCIES = tuple("deps/" + name + ".py" for name in
                      ("control_client", "core", "rk_link", "transport"))
 CONFIGURATION = "config/simple-p2p.json"
@@ -22,12 +24,14 @@ FORBIDDEN_MODULES = {
     "trial_navigation_runtime", "base_trial_adapter", "rk_localization_runtime",
     "rk_path_preview", "global_pose_proposal", "localization_ros_adapter",
     "localization_anchor", "maploc_core", "amcl", "map_server", "firmware",
+    "local_p2p_server", "test_local_p2p_server",
 }
 
 
 def allowed_source(relative):
     """Keep this package separate from mapping and historical navigation."""
-    return (relative in DEPENDENCIES or relative == "base_static_adapter.py"
+    return (relative in DEPENDENCIES or relative in
+            ("base_static_adapter.py", "local_p2p_remote.py", REMOTE_TEST)
             or "/" not in relative and relative.endswith(".py")
             and (relative.startswith("simple_p2p") or relative.startswith("test_simple")))
 
@@ -50,7 +54,7 @@ def selected_sources(app):
     tests = sorted(path.name for path in app.glob("test_simple*.py"))
     if not tests:
         raise ValueError("Simple point-to-point offline tests are missing")
-    selected, pending = {}, list(ENTRY_POINTS) + list(DEPENDENCIES) + tests
+    selected, pending = {}, list(ENTRY_POINTS) + list(DEPENDENCIES) + tests + [REMOTE_TEST]
     while pending:
         relative = pending.pop()
         if relative in selected:
@@ -109,6 +113,7 @@ def main(argv=None):
     manifest = dict(schema="simple-p2p-package-v1",
                     created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     entry_point="simple_p2p_runtime.py", configuration=CONFIGURATION,
+                    remote_entry_point="local_p2p_remote.py",
                     motion_capability=True, launched=False, deployed=False,
                     robot_connected=False,
                     files={name: sha256(raw) for name, raw in sorted(files.items())})
