@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>手推建图 · 只读观察</title>
+<style>
+:root{--navy:#14345b;--blue:#2367bb;--ink:#20344d;--muted:#68788d;--line:#dce4ee;--pale:#f3f6fa;--green:#17724b;--amber:#97600c;--red:#b22e37}
+*{box-sizing:border-box}body{margin:0;background:var(--pale);color:var(--ink);font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:default;opacity:.45}header{height:82px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 30px;gap:18px}h1{font-size:22px;color:var(--navy);margin:0;letter-spacing:.02em}.subtitle{color:var(--muted);font-size:12px;margin-top:3px}.readonly{color:var(--blue);border:1px solid #cbdcf1;border-radius:5px;padding:2px 7px;font-size:11px;vertical-align:middle;margin-left:10px}.header-right{display:flex;gap:13px;align-items:center}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;border-radius:20px;padding:5px 11px;background:#edf2f8;color:var(--muted)}.pill:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.good{background:#eaf5ee;color:var(--green)}.warn{background:#fff4df;color:var(--amber)}.bad{background:#fcecef;color:var(--red)}.btn{background:#fff;border:1px solid #cbd6e4;border-radius:6px;padding:6px 11px;color:var(--navy)}.btn:hover{background:#f0f5fb}.btn.selected{background:var(--navy);border-color:var(--navy);color:white}.layout{max-width:1680px;margin:22px auto;padding:0 26px}.banner{border:1px solid #dde5ef;background:#fff;border-radius:7px;padding:11px 15px;margin-bottom:17px;display:flex;align-items:center;gap:10px}.banner strong{color:var(--navy)}.banner.bad,.banner.warn{border-color:currentColor}.banner.bad strong,.banner.warn strong{color:inherit}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.metric{background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px 18px}.metric .label{font-size:12px;color:var(--muted)}.metric .value{font-size:24px;line-height:1.3;margin-top:5px;font-weight:600;color:var(--navy);font-variant-numeric:tabular-nums}.metric .detail{font-size:11px;color:var(--muted);margin-top:4px}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 306px;gap:18px}.panel{background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden}.panel-head{padding:14px 17px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px}.panel-title{font-weight:600;color:var(--navy)}.tabs{display:flex;gap:5px}.tabs .btn{font-size:12px;padding:4px 9px}.tools{display:flex;gap:13px;align-items:center;padding:10px 17px;border-bottom:1px solid #e9edf3;flex-wrap:wrap;font-size:12px}.tools label{display:flex;align-items:center;gap:5px;cursor:pointer}input{accent-color:var(--blue)}.tools .zoom{display:flex;gap:5px;margin-left:auto}.tools .btn{font-size:12px;padding:3px 9px}.canvas-wrap{height:min(62vh,660px);min-height:380px;position:relative;background:#f8fafc;overflow:hidden}.canvas-wrap canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}.canvas-wrap canvas.dragging{cursor:grabbing}.canvas-badge{position:absolute;top:13px;left:14px;background:rgba(255,255,255,.94);border:1px solid #dbe4ef;border-radius:5px;padding:4px 8px;font-size:11px;color:var(--muted);pointer-events:none}.canvas-note{padding:10px 17px;font-size:11px;color:var(--muted);min-height:37px;border-top:1px solid var(--line)}.legend{display:flex;gap:15px;align-items:center;padding:8px 17px;color:var(--muted);font-size:11px}.legend i{display:inline-block;width:9px;height:9px;margin-right:5px;border:1px solid #b2bdcb;vertical-align:-1px}.legend .line{height:2px;background:var(--blue);border:0;vertical-align:3px}.side{display:grid;gap:14px;align-content:start}.side .body{padding:13px 16px}.small-canvas{width:100%;height:204px;display:block;background:#fbfcfe}.facts{margin:0}.facts>div{display:flex;justify-content:space-between;gap:14px;padding:6px 0;border-bottom:1px solid #eef1f6}.facts>div:last-child{border:0}.facts dt{color:var(--muted);font-size:12px}.facts dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.number{font-family:Consolas,monospace}.meta{font-size:11px;color:var(--muted);overflow-wrap:anywhere}.meta b{display:block;font-weight:500;color:#38516f;margin-top:7px}.age-row{display:grid;grid-template-columns:1fr auto;gap:6px;padding:6px 0}.age-row .age{font-variant-numeric:tabular-nums}.age-row small{grid-column:1/-1;color:var(--muted);font-size:10px}.error{font-size:12px;color:var(--red);overflow-wrap:anywhere;margin-top:8px}.footer{font-size:11px;color:var(--muted);display:flex;justify-content:space-between;gap:12px;padding:16px 1px}a{color:var(--blue)}.hidden{display:none!important}@media(max-width:1000px){.workspace{grid-template-columns:1fr}.side{grid-template-columns:repeat(3,1fr)}.small-canvas{height:180px}.layout{padding:0 16px}header{padding:0 18px}}@media(max-width:700px){header{height:auto;padding:16px;align-items:flex-start}.header-right{flex-direction:column;gap:8px;align-items:flex-end}.summary{grid-template-columns:repeat(2,1fr)}.side{grid-template-columns:1fr}.canvas-wrap{min-height:340px}.footer{flex-direction:column}h1{font-size:19px}.readonly{margin-left:4px}.tools{gap:9px}.panel-head{padding:12px}.layout{margin-top:14px}}
+</style>
+</head>
+<body>
+<header><div><h1>手推建图<span class="readonly">只读观察</span></h1><div class="subtitle">新地图与真实轮速里程计 · 页面断开不影响机器人采集</div></div><div class="header-right"><span id="connection" class="pill">等待后端</span><button id="pause" class="btn">暂停刷新</button></div></header>
+<main class="layout">
+<div id="banner" class="banner"><strong id="phase">等待当前采集数据</strong><span id="phaseDetail">页面每秒读取一次只读接口。</span></div>
+<section class="summary">
+ <div class="metric"><div class="label">记录状态</div><div id="recording" class="value">—</div><div id="recordingDetail" class="detail">未收到当前会话</div></div>
+ <div class="metric"><div class="label">新地图尺寸</div><div id="mapSize" class="value">—</div><div id="mapDetail" class="detail">未知区域保留为未知</div></div>
+ <div class="metric"><div class="label">里程计缺段</div><div id="gaps" class="value">—</div><div id="gapDetail" class="detail">缺段不补积分</div></div>
+ <div class="metric"><div class="label">PC 最近拉取</div><div id="fetched" class="value">—</div><div id="fetchDetail" class="detail">拉取成功不刷新传感器源时间</div></div>
+</section>
+<div class="workspace">
+ <section class="panel"><div class="panel-head"><span class="panel-title">采集视图</span><div class="tabs"><button id="mapTab" class="btn selected">新地图</button><button id="odomTab" class="btn">odom 参考</button></div></div>
+ <div class="tools"><label><input id="showPath" type="checkbox" checked>轨迹</label><label><input id="showOrigin" type="checkbox" checked>原点</label><label><input id="showScan" type="checkbox">前 180° 扫描</label><div class="zoom"><button id="zoomOut" class="btn" title="缩小">−</button><button id="zoomIn" class="btn" title="放大">＋</button><button id="fit" class="btn">适配视图</button></div></div>
+ <div class="canvas-wrap"><canvas id="mapCanvas" aria-label="地图与里程计可视化"></canvas><div id="canvasBadge" class="canvas-badge">拖动平移 · 滚轮缩放</div></div>
+ <div class="legend"><span><i style="background:#fff"></i>空闲</span><span><i style="background:#26384a"></i>占用</span><span><i style="background:#cdcdcd"></i>未知</span><span><i class="line"></i>浏览器观察轨迹</span></div>
+ <div id="canvasNote" class="canvas-note">等待新地图。不会加载旧会话作为当前地图。</div></section>
+ <aside class="side">
+ <section class="panel"><div class="panel-head"><span class="panel-title">odom 实时参考</span><span id="odomBadge" class="meta">轮速积分</span></div><canvas id="odomCanvas" class="small-canvas" aria-label="独立odom参考坐标"></canvas><div class="body"><dl class="facts"><div><dt>X / Y</dt><dd id="position" class="number">—</dd></div><div><dt>车头朝向</dt><dd id="heading" class="number">—</dd></div><div><dt>线速度 / 角速度</dt><dd id="velocity" class="number">—</dd></div></dl></div></section>
+ <section class="panel"><div class="panel-head"><span class="panel-title">原始来源</span></div><div class="body"><div class="age-row"><span>轮速 / odom</span><span id="odomAge" class="age">—</span><small id="odomAgeNote">尚未收到来源</small></div><div class="age-row"><span>前方激光</span><span id="scanAge" class="age">—</span><small id="scanAgeNote">尚未收到来源</small></div><div class="age-row"><span>状态快照年龄</span><span id="statusAge" class="age">未核验</span></div><div id="sourceStamp" class="meta"></div><div id="error" class="error hidden"></div></div></section>
+ <section class="panel"><div class="panel-head"><span class="panel-title">当前会话 / 原点</span></div><div class="body meta"><b>会话</b><span id="session">—</span><b>RK boot</b><span id="boot">—</span><b>采集目录</b><span id="directory">—</span><b>首个真实样本</b><span id="origin">—</span><b>坐标说明</b><span id="frameNote">地图与 odom 不自动假定重合。</span></div></section>
+ </aside>
+</div><footer class="footer"><span>只读 GET 接口 · 暂停仅停止本页刷新 · 不发送底盘或导航命令</span><span>几何与激光外参沿用估计；叠加视图不代表精度验收。</span></footer>
+</main>
+<script>
+(() => {
+ 'use strict';
+ const $=id=>document.getElementById(id), finite=x=>typeof x==='number'&&Number.isFinite(x);
+ const S={data:null,received:0,lastSuccess:0,error:'',paused:false,busy:false,identity:null,points:[],lastPoint:null,lastGap:0,image:null,imageMeta:null,imageKey:null,loadingMapKey:null,imageError:'',mode:'map',view:{scale:1,x:0,y:0,ready:false},drag:null};
+ const main=$('mapCanvas'), mini=$('odomCanvas');
+ const text=(id,value)=>{$(id).textContent=value;}, fmt=(x,n=3)=>finite(x)?x.toFixed(n):'—';
+ const timeLabel=x=>finite(x)?new Date(x*1000).toLocaleTimeString('zh-CN',{hour12:false}):'—';
+ const headerTime=h=>h&&finite(h.stamp_secs)&&finite(h.stamp_nsecs)?h.stamp_secs+h.stamp_nsecs/1e9:null;
+ function status(){return S.data?.status||{};}
+ function pose(){const o=status().latest?.odom?.observation;return o&&[o.x,o.y,o.yaw].every(finite)?o:null;}
+ function map(){return S.data?.map||null;}
+ function transform(){const t=S.data?.map_to_odom;if(!t||t.valid===false)return null;const x=t.translation?.x??t.x,y=t.translation?.y??t.y,a=t.yaw??t.yaw_rad;return [x,y,a].every(finite)?{x,y,a}:null;}
+ function toMap(p){const t=transform();return t?{x:t.x+Math.cos(t.a)*p.x-Math.sin(t.a)*p.y,y:t.y+Math.sin(t.a)*p.x+Math.cos(t.a)*p.y,yaw:(p.yaw||0)+t.a}:null;}
+ function mapPixel(p){const m=S.imageMeta||map(),o=m?.origin;if(!m||!Array.isArray(o)||!o.slice(0,3).every(finite)||!finite(m.resolution)||m.resolution<=0)return null;const x=p.x-o[0],y=p.y-o[1],a=o[2];return {x:(Math.cos(a)*x+Math.sin(a)*y)/m.resolution,y:m.height-(-Math.sin(a)*x+Math.cos(a)*y)/m.resolution};}
+ function currentStatusAge(){if(!finite(S.data?.status_age_s))return null;return Math.max(0,S.data.status_age_s)+(performance.now()-S.received)/1000;}
+ function setConnection(label,kind){text('connection',label);$('connection').className='pill '+kind;}
+ function showError(message){text('error',message||'');$('error').classList.toggle('hidden',!message);}
+ function updateInfo(){
+  const d=S.data,s=status(),m=map(),p=pose(),age=currentStatusAge();
+  const fetchAge=S.lastSuccess?(Date.now()-S.lastSuccess)/1000:Infinity;
+  if(S.paused)setConnection('本页刷新已暂停','warn');else if(S.error||d?.connected===false||fetchAge>3.5)setConnection(d?'连接中断 · 保留快照':'等待后端连接','bad');else if(d)setConnection('PC 拉取正常','good');
+  if(!d){showError(S.error);return;}
+  const historical=!!d.historical||s.phase==='finished'||s.recording_active===false||S.paused||d.connected===false||!!S.error||fetchAge>3.5||age===null||age>2;
+  const failed=!!s.first_failure||d.recording_failed===true;
+  const gaps=s.gap_count??s.counters?.odom_gap_count??0;
+  const continuous=s.odometry_continuity_validated??s.odom_continuity_validated;
+  let phase='采集中',detail='当前会话的只读观察。';
+  if(failed){phase='记录失败 · 部分地图';detail=s.first_failure?.message||s.first_failure?.reason||'已有地图与原始数据仍保留。';}
+  else if(s.phase==='finished'||s.recording_active===false){phase='记录已结束';detail=s.mapping_quality_complete===false||continuous===false?'已保存快照；轨迹完整性未通过。':'展示已结束记录的历史快照。';}
+  else if(historical){phase='历史 / 待核验快照';detail=S.paused?'本页刷新已暂停，机器人采集不受影响。':'连接或状态已过期，保留最后成功快照。';}
+  else if(!s.ready_to_push){phase='采集暖机中';detail='是否可以继续手推，以当前采集状态为准。';}
+  $('banner').className='banner '+(failed?'bad':historical||!s.ready_to_push?'warn':'');text('phase',phase);text('phaseDetail',detail);
+  text('recording',failed?'已失败':s.phase==='finished'||s.recording_active===false?'已结束':historical?'快照':s.ready_to_push?'记录中':'暖机中');
+  text('recordingDetail',finite(s.elapsed_s)?'已采集 '+Math.floor(s.elapsed_s)+' 秒 · '+(historical?'历史显示':'来源独立核验'):(historical?'历史快照':'当前状态文件'));
+  text('mapSize',m?`${m.width} × ${m.height}`:'等待地图');text('mapDetail',m?`${fmt(m.resolution,3)} m / 格 · 已知格 ${m.known_cells??'—'}`:'从新会话空白地图开始');
+  text('gaps',String(gaps));text('gapDetail',gaps||continuous===false?'连续性未通过 · 缺段不补积分':'暂未观察到缺段');$('gaps').style.color=gaps||continuous===false?'var(--amber)':'var(--navy)';
+  text('fetched',timeLabel(d.observed_wall_s));text('fetchDetail',S.paused?'页面暂停；非传感器时间':`距本页最后成功接收 ${fmt(Math.min(fetchAge,9999),1)} s`);
+  text('position',p?`${fmt(p.x)} / ${fmt(p.y)} m`:'—');text('heading',p?`${fmt(p.yaw*180/Math.PI,1)}°`:'—');text('velocity',p?`${fmt(p.linear_x,4)} m/s · ${fmt(p.angular_z,4)} rad/s`:'—');
+  for(const [name,value] of [['odom',s.odom_source_age_s],['scan',s.scan_source_age_s]]){const current=finite(value)&&age!==null?value+age:null;const out=$(name+'Age');out.textContent=finite(value)?`${fmt(current??value,3)} s`:'—';out.style.color=finite(current)&&current>=.75?'var(--amber)':'var(--ink)';text(name+'AgeNote',current===null?'状态写入时源龄；当前年龄未核验':`本页快照源龄 · RK写入时 ${fmt(value,3)} s`);}
+  text('statusAge',age===null?'未核验':fmt(age,2)+' s');
+  text('sourceStamp',`状态 mono：${fmt(s.monotonic_s,3)} · 地图源：${typeof m?.map_stamp==='object'?JSON.stringify(m.map_stamp):m?.map_stamp??'—'}`);
+  const origin=d.origin||{};text('session',s.nonce||d.nonce||'—');text('boot',s.boot_id||d.boot_id||'—');text('directory',d.remote_dir||d.session_dir||d.directory||'未提供');
+  text('origin',origin.sample_sequence!==undefined?`sample ${origin.sample_sequence} · mono ${fmt(origin.source_monotonic_s,3)} · 软件 (0, 0, 0)`:'等待首个真实样本');
+  text('frameNote',transform()?'地图叠加使用后端提供的 map→odom 变换。':'未提供 map→odom：odom 参考独立显示，不冒充地图定位。');
+  text('canvasBadge',(historical?'历史快照 · ':'')+(S.mode==='map'?'新地图':'odom 参考坐标')+' · 拖动 / 滚轮缩放');
+  text('canvasNote',S.mode==='map'?(transform()?'已按 map→odom 与地图 origin 变换叠加。':'未提供 map→odom 变换；地图上不叠加 odom，右侧仍显示真实里程计。'):'软件原点与轮速积分坐标；浏览器轨迹按收到的样本绘制，缺段不连线。');
+  if($('showScan').checked)text('canvasNote',$('canvasNote').textContent+' 扫描按最新 odom / 估计外参叠加，非逐束时间校正。');
+  showError([S.error,d.error,d.image_error,S.imageError,s.first_failure?.message||s.first_failure?.reason].filter(Boolean).join(' · '));
+ }
+ function addPoint(){const p=pose(),s=status();if(!p)return;const key=p.sample_sequence+':'+p.source_monotonic_s;if(key===S.lastPoint)return;const gaps=s.gap_count??s.counters?.odom_gap_count??0;S.points.push({x:p.x,y:p.y,yaw:p.yaw,breakBefore:!!p.discontinuity||gaps>S.lastGap});if(S.points.length>5000)S.points.shift();S.lastGap=gaps;S.lastPoint=key;}
+ function originPoint(){const o=S.data?.origin?.pose;return o&&[o.x,o.y].every(finite)?{x:o.x,y:o.y}:{x:0,y:0};}
+ function scanPoints(){const scan=status().latest?.scan,p=pose();if(!scan||!p||!Array.isArray(scan.raw_selected_ranges)||!finite(scan.angle_min)||!finite(scan.angle_increment))return[];const g=S.data?.origin?.geometry||{},lx=finite(g.laser_x_m)?g.laser_x_m:.13,ly=finite(g.laser_y_m)?g.laser_y_m:0,la=finite(g.laser_yaw_rad)?g.laser_yaw_rad:0,c=Math.cos(p.yaw),s=Math.sin(p.yaw);return scan.raw_selected_ranges.map((r,i)=>{if(!finite(r)||r<(scan.range_min??0)||r>(scan.range_max??50))return null;const a=scan.angle_min+i*scan.angle_increment+la,x=lx+r*Math.cos(a),y=ly+r*Math.sin(a);return{x:p.x+c*x-s*y,y:p.y+s*x+c*y};}).filter(Boolean);}
+ function surface(canvas){const box=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(1,Math.round(box.width)),h=Math.max(1,Math.round(box.height));if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);}const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);return{c,w,h};}
+ function odomBounds(){const points=[originPoint(),...S.points];const p=pose();if(p)points.push(p);let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;for(const p of points){minx=Math.min(minx,p.x);maxx=Math.max(maxx,p.x);miny=Math.min(miny,p.y);maxy=Math.max(maxy,p.y);}return{minx:minx-.35,maxx:maxx+.35,miny:miny-.35,maxy:maxy+.35};}
+ function fit(){const {w,h}=surface(main),m=S.imageMeta||map();if(S.mode==='map'&&m){const scale=Math.min((w-48)/m.width,(h-48)/m.height);S.view={scale,x:(w-m.width*scale)/2,y:(h-m.height*scale)/2,ready:true};}else{const b=odomBounds(),scale=Math.min((w-64)/(b.maxx-b.minx),(h-64)/(b.maxy-b.miny));S.view={scale,x:w/2-(b.minx+b.maxx)/2*scale,y:h/2+(b.miny+b.maxy)/2*scale,ready:true};}render();}
+ function arrow(c,p,project,color='#2367bb'){const a=project(p),b=project({x:p.x+Math.cos(p.yaw)*.18,y:p.y+Math.sin(p.yaw)*.18});if(!a||!b)return;const yaw=Math.atan2(b.y-a.y,b.x-a.x);c.save();c.translate(a.x,a.y);c.rotate(yaw);c.fillStyle=color;c.strokeStyle='#fff';c.lineWidth=2;c.beginPath();c.moveTo(14,0);c.lineTo(-9,-8);c.lineTo(-5,0);c.lineTo(-9,8);c.closePath();c.fill();c.stroke();c.restore();}
+ function overlays(c,project,mapper=x=>x){if($('showPath').checked){c.strokeStyle='#3874bd';c.lineWidth=1.8;let previous=null;for(const p of S.points){const current=project(mapper(p));if(!current)continue;if(previous&&!p.breakBefore){c.beginPath();c.moveTo(previous.x,previous.y);c.lineTo(current.x,current.y);c.stroke();}previous=current;}}
+  if($('showScan').checked){c.fillStyle='rgba(17,142,145,.55)';for(const p of scanPoints()){const q=project(mapper(p));if(q){c.beginPath();c.arc(q.x,q.y,1.7,0,Math.PI*2);c.fill();}}}
+  if($('showOrigin').checked&&S.data?.origin){const p=project(mapper(originPoint()));if(p){c.strokeStyle='#c17b1c';c.lineWidth=1.5;c.beginPath();c.arc(p.x,p.y,6,0,Math.PI*2);c.moveTo(p.x-10,p.y);c.lineTo(p.x+10,p.y);c.moveTo(p.x,p.y-10);c.lineTo(p.x,p.y+10);c.stroke();c.fillStyle='#98601d';c.font='11px Segoe UI';c.fillText('原点',p.x+10,p.y-10);}}
+  const p=pose();if(p){const q=mapper(p);if(q)arrow(c,q,project);}}
+ function drawMain(){const {c,w,h}=surface(main),v=S.view,m=S.imageMeta||map();c.fillStyle='#f8fafc';c.fillRect(0,0,w,h);if(S.mode==='map'){
+   if(!m||!S.image){c.fillStyle='#7a899c';c.textAlign='center';c.font='14px Microsoft YaHei';c.fillText(S.imageError?'地图图片暂不可用 · 保留其他快照':'等待当前会话的新地图',w/2,h/2);return;}
+   c.imageSmoothingEnabled=false;c.drawImage(S.image,v.x,v.y,m.width*v.scale,m.height*v.scale);c.strokeStyle='#c4cfdd';c.strokeRect(v.x,v.y,m.width*v.scale,m.height*v.scale);
+   if(transform())overlays(c,p=>{const px=mapPixel(p);return px?{x:v.x+px.x*v.scale,y:v.y+px.y*v.scale}:null;},toMap);
+  }else{drawGrid(c,w,h,p=>({x:v.x+p.x*v.scale,y:v.y-p.y*v.scale}),v.scale);overlays(c,p=>({x:v.x+p.x*v.scale,y:v.y-p.y*v.scale}));}
+ }
+ function drawGrid(c,w,h,project,scale){const step=scale<30?1:scale<100?.5:.1;c.strokeStyle='#e4eaf3';c.lineWidth=1;const left=-S.view.x/scale,right=(w-S.view.x)/scale,bottom=(S.view.y-h)/scale,top=S.view.y/scale;for(let x=Math.ceil(left/step)*step;x<=right;x+=step){const p=project({x,y:0});c.beginPath();c.moveTo(p.x,0);c.lineTo(p.x,h);c.stroke();}for(let y=Math.ceil(bottom/step)*step;y<=top;y+=step){const p=project({x:0,y});c.beginPath();c.moveTo(0,p.y);c.lineTo(w,p.y);c.stroke();}}
+ function drawMini(){const{c,w,h}=surface(mini),b=odomBounds(),s=Math.min((w-44)/(b.maxx-b.minx),(h-40)/(b.maxy-b.miny)),cx=(b.minx+b.maxx)/2,cy=(b.miny+b.maxy)/2,project=p=>({x:w/2+(p.x-cx)*s,y:h/2-(p.y-cy)*s});c.fillStyle='#fbfcfe';c.fillRect(0,0,w,h);c.strokeStyle='#e0e7f1';const o=project({x:0,y:0});c.beginPath();c.moveTo(0,o.y);c.lineTo(w,o.y);c.moveTo(o.x,0);c.lineTo(o.x,h);c.stroke();overlays(c,project);c.fillStyle='#8190a2';c.font='10px Segoe UI';c.fillText('+X',w-21,Math.max(12,Math.min(h-4,o.y-5)));c.fillText('+Y',Math.max(4,Math.min(w-22,o.x+5)),13);}
+ function render(){drawMain();drawMini();}
+ function zoom(factor,x=main.clientWidth/2,y=main.clientHeight/2){const v=S.view,next=Math.max(S.mode==='map'?.03:5,Math.min(S.mode==='map'?100:10000,v.scale*factor)),r=next/v.scale;v.x=x-(x-v.x)*r;v.y=y-(y-v.y)*r;v.scale=next;render();}
+ async function loadMap(d){const m=d.map;if(!m||!finite(m.width)||!finite(m.height)||m.width<=0||m.height<=0)return;const stamp=typeof m.map_stamp==='object'?JSON.stringify(m.map_stamp):m.map_stamp??Math.floor((d.observed_wall_s||Date.now()/1000)/5),key=(m.image_url||'/api/map.png')+'|'+stamp;if(key===S.imageKey)return;let url;try{url=new URL(m.image_url||'/api/map.png',location.href);if(url.origin!==location.origin)throw Error('地图图片必须来自同一只读后端');url.searchParams.set('snapshot',String(stamp));}catch(e){S.imageError=e.message;return;}
+  S.loadingMapKey=key;const accept=img=>{if(S.loadingMapKey!==key)return;const first=!S.image;S.image=img;S.imageMeta=m;S.imageKey=key;S.imageError='';if(first||!S.view.ready)fit();else render();};
+  if(Array.isArray(m.data)&&m.width*m.height<=8000000&&m.data.length===m.width*m.height){const off=document.createElement('canvas');off.width=m.width;off.height=m.height;const c=off.getContext('2d'),pixels=c.createImageData(m.width,m.height);for(let y=0;y<m.height;y++)for(let x=0;x<m.width;x++){const value=m.data[(m.height-1-y)*m.width+x],v=value>=65?38:value>=0&&value<=25?254:205,i=(y*m.width+x)*4;pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=v;pixels.data[i+3]=255;}c.putImageData(pixels,0,0);accept(off);return;}
+  const identity=S.identity,img=new Image();img.onload=()=>{if(identity===S.identity)accept(img);};img.onerror=()=>{if(identity===S.identity&&S.loadingMapKey===key){S.imageError='地图图片读取失败，保留上次成功图像与其坐标元数据';updateInfo();}};img.src=url.href;
+ }
+ async function poll(){if(S.paused||S.busy)return;S.busy=true;try{const response=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(5000)});if(!response.ok)throw Error('只读后端 HTTP '+response.status);const d=await response.json();if(!d||typeof d!=='object'||!d.status||typeof d.status!=='object')throw Error('后端状态格式无效；保留上次成功快照');const id=(d.status.boot_id||d.boot_id||'?')+'|'+(d.status.nonce||d.nonce||'?');if(S.identity!==null&&id!==S.identity){S.points=[];S.lastPoint=null;S.lastGap=0;S.image=null;S.imageMeta=null;S.imageKey=null;S.loadingMapKey=null;S.view.ready=false;}
+   S.identity=id;S.data=d;S.received=performance.now();S.lastSuccess=Date.now();S.error=d.connected===false?(d.error||'SSH / 采集后端连接中断'):'';addPoint();await loadMap(d);updateInfo();render();
+  }catch(e){S.error=e.name==='TimeoutError'?'后端读取超时，保留最后成功快照':e.message;updateInfo();}finally{S.busy=false;}}
+ $('pause').onclick=()=>{S.paused=!S.paused;text('pause',S.paused?'继续刷新':'暂停刷新');updateInfo();if(!S.paused)poll();};
+ $('mapTab').onclick=()=>{S.mode='map';$('mapTab').classList.add('selected');$('odomTab').classList.remove('selected');fit();updateInfo();};$('odomTab').onclick=()=>{S.mode='odom';$('odomTab').classList.add('selected');$('mapTab').classList.remove('selected');fit();updateInfo();};
+ for(const id of ['showPath','showOrigin','showScan'])$(id).onchange=()=>{render();updateInfo();};$('zoomIn').onclick=()=>zoom(1.3);$('zoomOut').onclick=()=>zoom(1/1.3);$('fit').onclick=fit;
+ main.addEventListener('wheel',e=>{e.preventDefault();const b=main.getBoundingClientRect();zoom(e.deltaY<0?1.12:1/1.12,e.clientX-b.left,e.clientY-b.top);},{passive:false});
+ main.addEventListener('pointerdown',e=>{main.setPointerCapture(e.pointerId);S.drag={x:e.clientX,y:e.clientY,vx:S.view.x,vy:S.view.y};main.classList.add('dragging');});main.addEventListener('pointermove',e=>{if(!S.drag)return;S.view.x=S.drag.vx+e.clientX-S.drag.x;S.view.y=S.drag.vy+e.clientY-S.drag.y;render();});const release=()=>{S.drag=null;main.classList.remove('dragging');};main.addEventListener('pointerup',release);main.addEventListener('pointercancel',release);
+ window.addEventListener('resize',()=>{if(!S.view.ready)fit();else render();});fit();poll();setInterval(poll,1000);setInterval(()=>{updateInfo();},500);
+})();
+</script>
+</body>
+</html>

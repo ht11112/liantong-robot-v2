@@ -1,0 +1,49 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Generated packages, evidence, runtime state and site data
+/dist/
+/build/
+/output/
+/runtime/
+/data/
+/maps/
+/tmp/
+*.log
+*.bag
+*.tar.gz
+*.zip
+
+# Local authentication and machine settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts
+rk_known_hosts
+*.local.json
+.vscode/
+.idea/
+
+# Firmware/build outputs do not belong to this host-only repository
+/firmware/
+/firmware-backups/
+*.hex
+*.elf
+*.bin
+*.axf
+*.o
+*.obj
+*.map
+*.uvprojx
+*.uvoptx
+*.ioc

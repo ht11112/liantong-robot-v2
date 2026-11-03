@@ -1,0 +1,301 @@
+{
+  "schema": "host-source-import-manifest-v1",
+  "created_at": "2026-11-03T16:44:45.912490+08:00",
+  "latest_thread_id": "01a19f01-1ef9-76f3-b7d8-5c38faff4b96",
+  "latest_turn_id": "01a1a072-129d-7792-ad7e-8912685d621f",
+  "source_thread_last_completed_unix_s": 1793693566,
+  "source_project": "联通智能机器人",
+  "source_paths_relative_to": "original project root",
+  "record_kind": "immutable initial import provenance, not a future-development lock",
+  "scope": "Redesigned point-to-point RK host application, PC viewer and offline tests; no MCU firmware or runtime credentials.",
+  "known_development_differences": {
+    "comparison_manifest": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/trial_package_manifest.json",
+    "changed_since_actual_r6": [
+      "app/base_trial_adapter.py",
+      "app/test_base_trial_adapter.py"
+    ],
+    "status": "PC-only STOP-source filter changes; not deployed or accepted on RK; navigation half-metre acceptance remains incomplete."
+  },
+  "files": {
+    "app/base_static_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/base_static_adapter.py",
+      "sha256": "a529dd532009c70e172ed81fb211b7a4a7e62451c4d20eca7d84a5984107cde7",
+      "bytes": 18824
+    },
+    "app/base_trial_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/base_trial_adapter.py",
+      "sha256": "4ab102c479a7dee987db6506c7fb1bb8a2eee335969bf71bc8103940fc2092f7",
+      "bytes": 49702
+    },
+    "app/config.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/config.py",
+      "sha256": "3e65862dc7faec288be6c5df7566300990cfc77ec8ada670b07a22dc615e4200",
+      "bytes": 15968
+    },
+    "app/feedback_watchdog.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/feedback_watchdog.py",
+      "sha256": "a7d83c70941f1136ff43b1e57d910dea60c1f02c6d813ec93d756cb5cedcc8a3",
+      "bytes": 3403
+    },
+    "app/global_pose_proposal.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/global_pose_proposal.py",
+      "sha256": "4c50713c492dbe40cd3775ebe1ca88a04575817661ea15c73dd8715590a04fb9",
+      "bytes": 23251
+    },
+    "docs/original/INTEGRATION_REPORT.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/INTEGRATION_REPORT.md",
+      "sha256": "552c7065ef7255a542ec3d357414408c0cd935486a26f58ad0d2848629079744",
+      "bytes": 23702
+    },
+    "docs/original/INTEGRATION_REUSE_NOTES.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/INTEGRATION_REUSE_NOTES.md",
+      "sha256": "3729046d956b1a2d9273415fb8713a88de9f517596b76a6a5d96d69f6214d484",
+      "bytes": 12027
+    },
+    "app/localization_anchor.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/localization_anchor.py",
+      "sha256": "0ae77e70e13bdb7ffeb9d21d1986e7b1161471dc0ffb319fc2f069008565d938",
+      "bytes": 12673
+    },
+    "docs/original/LOCALIZATION_REUSE_NOTES.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/LOCALIZATION_REUSE_NOTES.md",
+      "sha256": "31b9f0a918d004c22bd31616ee4469c90c942e547fbf7fb2a3c8a9a3d8f2ff61",
+      "bytes": 14611
+    },
+    "app/localization_ros_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/localization_ros_adapter.py",
+      "sha256": "fb9680ec99661aaec8dc6e570cd171baf33671f6ac197748e0112d03524d4f01",
+      "bytes": 20005
+    },
+    "docs/original/MANUAL_MAPPING.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/MANUAL_MAPPING.md",
+      "sha256": "4a57e3e61eb002f9e5c3481fad8baea01a49de84396e5b352ec172b944148f6c",
+      "bytes": 5273
+    },
+    "app/manual_mapping_query.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/manual_mapping_query.py",
+      "sha256": "bd11f67a25bf5e3abd6b12fc1f8b3082bcdef028f686b90a53284f6940b6f692",
+      "bytes": 15287
+    },
+    "docs/original/MANUAL_MAPPING_RESULT.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/MANUAL_MAPPING_RESULT.md",
+      "sha256": "9444ddbe4457bae26267843b8520ebe915e328c95b6d2a467ba87b5f1c91c2c3",
+      "bytes": 3341
+    },
+    "app/manual_mapping_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/manual_mapping_runtime.py",
+      "sha256": "eeeb2c0c9ee3e49cf8a660dcc530c420cbd39de2e7b898dc248b2458ca800dde",
+      "bytes": 37844
+    },
+    "app/manual_mapping_viewer.html": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/manual_mapping_viewer.html",
+      "sha256": "d5c67592a14de0080527fe55045a23fa383b134d34364165113e3550a68a5b24",
+      "bytes": 26281
+    },
+    "app/manual_mapping_viewer.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/manual_mapping_viewer.py",
+      "sha256": "d22983d7afa7650e99d8c2cdb04c76dea3b1b85b4affe1670438c94d54f54d81",
+      "bytes": 17157
+    },
+    "docs/original/MOTION_ACCEPTANCE_REPORT.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/MOTION_ACCEPTANCE_REPORT.md",
+      "sha256": "fb99ce46f6426f70f7034459a366a4a927a1a3b9c59858ddc6ea247aa2c6f1dd",
+      "bytes": 10926
+    },
+    "app/p2p_cli.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/p2p_cli.py",
+      "sha256": "e0610469b537e2c4a081037a1d345a0071fb94f5ac396fbdee8b0b9eb0aabace",
+      "bytes": 3943
+    },
+    "docs/original/README.md": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/README.md",
+      "sha256": "69cc1180f095f1941ffec0e2d1d729c09a2d623892b11e384bc40b2af7dae2fc",
+      "bytes": 13888
+    },
+    "app/rk_localization_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/rk_localization_runtime.py",
+      "sha256": "fd99755df41cfdba5f65bb2dd41269d63f8441c4297eae6eb0ec032317f4eb8f",
+      "bytes": 42844
+    },
+    "app/rk_path_preview.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/rk_path_preview.py",
+      "sha256": "a2e1fd31f5303ebbf149956690a0a2b25fb918e443cc91a67a4c8bbd24e63192",
+      "bytes": 33181
+    },
+    "app/rk_static_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/rk_static_runtime.py",
+      "sha256": "2cd11aadac86ac1e3aa6c6f2848326ef027136db02dddf5db8665951f978ccad",
+      "bytes": 12223
+    },
+    "app/ros_sensor_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/ros_sensor_adapter.py",
+      "sha256": "3b80ae0357bd08a08e423305cb89d3268abfe2609a96672631c9f0dffb7d7654",
+      "bytes": 17585
+    },
+    "app/scan_sector.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/scan_sector.py",
+      "sha256": "79433171225c04fe7548bbe6d04c0161ba41fb6f90b54088a6e804e38ede0809",
+      "bytes": 2096
+    },
+    "app/site_config.json": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/site_config.json",
+      "sha256": "a0940ba7f9e8955f101796c0a4a3ad0780b8245fc83ade429b32f148e0b347b7",
+      "bytes": 1259
+    },
+    "app/site_config.template.json": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/site_config.template.json",
+      "sha256": "74f9ca297382ec475f1b15f943b4d41812d2806c2e7c4fd626c5a37bf3a28e41",
+      "bytes": 1247
+    },
+    "app/task_model.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/task_model.py",
+      "sha256": "6afd108afc97d760c18fbf3ca1db1d4badd739908c1fbf96039a86c0f888f876",
+      "bytes": 17904
+    },
+    "app/test_base_static_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_base_static_adapter.py",
+      "sha256": "a342e595ccbb4c41c0378a467daa2f5ad214fce618be331e5e8f63d46a5d3d41",
+      "bytes": 22483
+    },
+    "app/test_base_trial_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_base_trial_adapter.py",
+      "sha256": "2bae1da26b88c76e609b3687c7543ed4c4c0ad2e9e129f30fd31d92afdb78d1f",
+      "bytes": 35822
+    },
+    "app/test_config.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_config.py",
+      "sha256": "9da87e4a20a85c0932056c939c861939b6c30b193abc1abf093c40ad498c05d6",
+      "bytes": 14017
+    },
+    "app/test_feedback_watchdog.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_feedback_watchdog.py",
+      "sha256": "be13d8c539ee73e4658ab2b8426601e1a238cfd73d6bc2ca61a0167a7ee3fe6a",
+      "bytes": 1967
+    },
+    "app/test_global_pose_proposal.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_global_pose_proposal.py",
+      "sha256": "e756959ac82c4b0f3494490e1e12d2e3361b34e64d638c6ed8835359aaa441e1",
+      "bytes": 10653
+    },
+    "app/test_localization_anchor.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_localization_anchor.py",
+      "sha256": "495e960c5a0d47d2a88efa2fbef5c7f1df43cae1b9a66c0562ee7bab8a4b7822",
+      "bytes": 9228
+    },
+    "app/test_localization_ros_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_localization_ros_adapter.py",
+      "sha256": "da580f0b90a43fec151be80c0b06651f3555653da63cd564f4dc963ec981192d",
+      "bytes": 8299
+    },
+    "app/test_manual_mapping_query.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_manual_mapping_query.py",
+      "sha256": "8633f482ce3163b3c37bcda01917a3bd12354d39e93254bc1ce2475532ee0390",
+      "bytes": 11229
+    },
+    "app/test_manual_mapping_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_manual_mapping_runtime.py",
+      "sha256": "f566ddc3a3984b96011c0f574e15d2796c1e617d8ac5337db5bd120cbf8d30a4",
+      "bytes": 14134
+    },
+    "app/test_mapping_viewer.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_mapping_viewer.py",
+      "sha256": "f31cdf22ad34874cf629e64ba9a0f3f92538c985925c663ac7d4f5b5827330b6",
+      "bytes": 5052
+    },
+    "app/test_rk_localization_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_rk_localization_runtime.py",
+      "sha256": "81bb22ff0185d8108065c07aab82efdc54334fbffa9bfbe9a6002239ebc9c867",
+      "bytes": 10308
+    },
+    "app/test_rk_path_preview.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_rk_path_preview.py",
+      "sha256": "5407288db48afce50bfea2f72c9d8532bbe7aca9fab7d6fcd23c72ec4f933648",
+      "bytes": 11019
+    },
+    "app/test_rk_static_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_rk_static_runtime.py",
+      "sha256": "c1f0230362c758d319fb773f20a48bbb103d17264e48578a525b274d3ae4fd0f",
+      "bytes": 2298
+    },
+    "app/test_ros_sensor_adapter.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_ros_sensor_adapter.py",
+      "sha256": "52b2e9dec32e08897daaecf88864af7eb9a107008f13a4d86ccee5a4b1897f25",
+      "bytes": 8857
+    },
+    "app/test_scan_sector.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_scan_sector.py",
+      "sha256": "3dfca0d246169ba992f026c2219cdeca432e78e5df86d3dd8a4dfd9a73303c62",
+      "bytes": 1595
+    },
+    "app/test_task_model.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_task_model.py",
+      "sha256": "cf26d395a0c6a09ebb9c44009e2e37e5c98670b9d5f17abe783db1a65012c1e4",
+      "bytes": 14236
+    },
+    "app/test_trial_navigation_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_trial_navigation_runtime.py",
+      "sha256": "0ed617659bb65d09926255f1b09edcc5ea9a292aab354f180ef831ef6d5060db",
+      "bytes": 23046
+    },
+    "app/test_trial_obstacle_gate.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_trial_obstacle_gate.py",
+      "sha256": "37b98530c9a1a918cff8fc304cc2d90d7262215c6a88a716179beabd242f5db3",
+      "bytes": 7231
+    },
+    "app/test_wheel_envelope.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/test_wheel_envelope.py",
+      "sha256": "7a4316402afee2b6a6a3d11d61a1e561fa90eaefd9a3dc2fadc4078228ce43ca",
+      "bytes": 8829
+    },
+    "app/trial_config.json": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/trial_config.json",
+      "sha256": "971b2b5a8eac83d987cf4d4bdba22812cea5d929c4ce05366851052e77e7d1a8",
+      "bytes": 1954
+    },
+    "app/trial_navigation_runtime.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/trial_navigation_runtime.py",
+      "sha256": "be6e2118ada6e9642ad948e5634d0426459af92a2037dc413f773edbcfb5b105",
+      "bytes": 70399
+    },
+    "app/trial_obstacle_gate.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/trial_obstacle_gate.py",
+      "sha256": "bad76ce380ff783c3b7a555c705a5c0003252d5d057bd9a085adc600d960ad62",
+      "bytes": 9933
+    },
+    "app/wheel_envelope.py": {
+      "source_path": "navigation-demo/p2p_navigation_20261103/wheel_envelope.py",
+      "sha256": "d64e0a13e23f18b1d68fb9f8178897420bd33adbf98e489efdbd8882838a5610",
+      "bytes": 7117
+    },
+    "app/deps/control_client.py": {
+      "source_path": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/deps/control_client.py",
+      "sha256": "a293816a54a52eed2a60dbb310b639c43763f14146797dc22e6dd8ab992b5e55",
+      "bytes": 18236
+    },
+    "app/deps/core.py": {
+      "source_path": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/deps/core.py",
+      "sha256": "181f1f6d1e6fec9de6143355ded815d9ce75946dc4b0aad9e77fd7a1f567baba",
+      "bytes": 10433
+    },
+    "app/deps/rk_link.py": {
+      "source_path": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/deps/rk_link.py",
+      "sha256": "d3546a87e31f79d43de63396f4d5c5699b32a532df2182757f5324ee49a99f0b",
+      "bytes": 1408
+    },
+    "app/deps/transport.py": {
+      "source_path": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/deps/transport.py",
+      "sha256": "45950cfdd941b6f0d49f27f9a99ad6294ea32443ae3d34e64569f7c1ca7f57ae",
+      "bytes": 1883
+    },
+    "app/deps/stop_observation.py": {
+      "source_path": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/deps/stop_observation.py",
+      "sha256": "4492427d57479a884f5efe11da96596eace31605355af5ac7f0ca3c301eac97b",
+      "bytes": 1244
+    },
+    "app/deps/maploc_core.py": {
+      "source_path": "output/p2p_redesign_20261103/trial_package_20261103_134604_88633b17/deps/maploc_core.py",
+      "sha256": "646a24ac438a573d4ce27019dfceb8e6b15268573f27ca65ab4ce8225665bcc6",
+      "bytes": 5591
+    }
+  }
+}

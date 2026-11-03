@@ -1,0 +1,55 @@
+{
+  "schema": "host-manual-mapping-r5-baseline-v1",
+  "historical_only": true,
+  "archive": {
+    "source_path": "output/p2p_redesign_20261103/manual_mapping_package_20261103_152058_27088651.tar.gz",
+    "sha256": "312707b5d01dae045438899f7c8213165add1f44d86daf6497486c9bc7c1e0f9",
+    "included_in_repository": false
+  },
+  "original_manifest": {
+    "schema": "manual-new-map-package-v1",
+    "created_at": "2026-11-03T15:20:58.291346",
+    "serial_allowed_kinds": [
+      2,
+      5
+    ],
+    "motion_capability": false,
+    "new_blank_map": true,
+    "geometry": {
+      "wheel_diameter_m": 0.2,
+      "wheel_separation_m": 0.3,
+      "laser_x_m": 0.13,
+      "laser_y_m": 0.0,
+      "laser_z_m": 0.2,
+      "laser_yaw_rad": 0.0,
+      "calibrated": false
+    },
+    "files": {
+      "base_static_adapter.py": "a529dd532009c70e172ed81fb211b7a4a7e62451c4d20eca7d84a5984107cde7",
+      "deps/control_client.py": "a293816a54a52eed2a60dbb310b639c43763f14146797dc22e6dd8ab992b5e55",
+      "deps/core.py": "181f1f6d1e6fec9de6143355ded815d9ce75946dc4b0aad9e77fd7a1f567baba",
+      "deps/rk_link.py": "d3546a87e31f79d43de63396f4d5c5699b32a532df2182757f5324ee49a99f0b",
+      "deps/transport.py": "45950cfdd941b6f0d49f27f9a99ad6294ea32443ae3d34e64569f7c1ca7f57ae",
+      "manual_mapping_query.py": "bd11f67a25bf5e3abd6b12fc1f8b3082bcdef028f686b90a53284f6940b6f692",
+      "manual_mapping_runtime.py": "eeeb2c0c9ee3e49cf8a660dcc530c420cbd39de2e7b898dc248b2458ca800dde",
+      "test_manual_mapping_query.py": "8633f482ce3163b3c37bcda01917a3bd12354d39e93254bc1ce2475532ee0390",
+      "test_manual_mapping_runtime.py": "f566ddc3a3984b96011c0f574e15d2796c1e617d8ac5337db5bd120cbf8d30a4"
+    }
+  },
+  "latest_actual_session": {
+    "nonce": "76ebb1d2",
+    "remote_directory": "/home/cat/p2p_navigation_20261103_manual_mapping_155534_76ebb1d2",
+    "boot_id": "2fee0fae-658d-4245-9bd8-fc65e39f297b",
+    "recording_complete": true,
+    "odometry_continuity_validated": true,
+    "software_tests_on_rk": 27,
+    "geometry_accuracy_verified": false
+  },
+  "evidence_archive_sha256": "e722fe456c83f9f70e2ca5d70bc3ed0b496cf2a3cf2332745088ed3712b11ac0",
+  "evidence_review_source": "output/p2p_redesign_20261103/manual_mapping_r5_independent_review.json",
+  "notes": [
+    "r5 reused the unchanged r4 nine-source package.",
+    "Import and packaging do not connect to the robot, confirm a current origin, or start recording.",
+    "The original archive identity is historical; newly built archives have their own SHA256."
+  ]
+}

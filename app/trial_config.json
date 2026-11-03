@@ -1,0 +1,62 @@
+{
+  "schema": "p2p-half-metre-trial-v1",
+  "user": {
+    "forward_m": 0.5,
+    "position_tolerance_m": 0.10,
+    "allow_reverse": false,
+    "heading_required": false,
+    "max_linear_m_s": 0.03,
+    "max_angular_deg_s": 6.9,
+    "front_clearance_m": 0.20,
+    "feedback_timeout_s": 0.75,
+    "max_duration_s": 200,
+    "connection_loss_action": "continue_local_task"
+  },
+  "engineering": {
+    "scope": "this_unoccupied_half_metre_acceptance_only",
+    "scan_timeout_s": 0.75,
+    "odom_timeout_s": 0.75,
+    "amcl_timeout_s": 2.0,
+    "command_timeout_s": 0.25,
+    "supervisor_timeout_s": 0.25,
+    "warmup_timeout_s": 100.0,
+    "arm_timeout_s": 4.0,
+    "apply_timeout_s": 0.30,
+    "zero_proof_timeout_s": 2.0,
+    "post_stop_observation_timeout_s": 2.0,
+    "motion_sources_timeout_s": 0.20,
+    "costmap_transform_tolerance_s": 0.50,
+    "zero_speed_rpm": 0.2,
+    "zero_sample_count": 5,
+    "side_front_margin_m": 0.10,
+    "max_heading_departure_deg": 15.0,
+    "max_trial_path_m": 1.0,
+    "allow_in_place_rotation": false,
+    "require_nonnegative_physical_wheels": true,
+    "amcl_update_min_d_m": 0.005,
+    "amcl_update_min_a_rad": 0.01
+  },
+  "geometry": {
+    "wheel_diameter_m": 0.2,
+    "wheel_separation_m": 0.3,
+    "planning_width_m": 0.5,
+    "front_from_axle_m": 0.2,
+    "rear_from_axle_m": 0.2,
+    "laser_x_m": 0.13,
+    "laser_y_m": 0.0,
+    "laser_z_m": 0.2,
+    "laser_yaw_rad": 0.0,
+    "confirmed": false,
+    "wheel_diameter_basis": "ZLLG80ASM250-L manufacturer nominal 200mm; rolling calibration pending",
+    "other_geometry_basis": "existing estimates; not a new dimensional calibration"
+  },
+  "onsite_confirmation": {
+    "robot_stopped": true,
+    "original_map_room": true,
+    "unoccupied": true,
+    "front_and_surroundings_clear": true,
+    "operator_present_with_manual_stop": true,
+    "external_half_metre_floor_mark_available": true,
+    "source": "user_confirmed_in_current_motion_acceptance_turn"
+  }
+}

@@ -1,0 +1,2 @@
+# Preserve the exact source bytes recorded in provenance and frozen manifests.
+* -text

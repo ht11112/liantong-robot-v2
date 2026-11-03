@@ -1,0 +1,46 @@
+{
+  "schema": "p2p-navigation-config-v1",
+  "user": {
+    "max_linear_m_s": 0.03,
+    "max_angular_deg_s": 6.9,
+    "front_clearance_cm": 20,
+    "side_clearance_cm": null,
+    "rear_clearance_cm": null,
+    "position_tolerance_cm": 10,
+    "heading_required": false,
+    "heading_tolerance_deg": null,
+    "max_duration_s": 200,
+    "max_path_m": null,
+    "feedback_source_timeout_ms": 750,
+    "scan_source_timeout_ms": null,
+    "localization_timeout_ms": null,
+    "command_timeout_ms": null,
+    "supervisor_timeout_ms": null,
+    "stop_confirmation_timeout_s": null,
+    "allow_reverse": false,
+    "obstacle_mode": null,
+    "connection_loss_action": "continue_local_task"
+  },
+  "geometry": {
+    "wheel_diameter_m": 0.2,
+    "wheel_separation_m": 0.3,
+    "planning_width_m": 0.5,
+    "front_from_axle_m": 0.2,
+    "rear_from_axle_m": 0.2,
+    "confirmed": false
+  },
+  "firmware": {
+    "baseline_lease_ms": 500,
+    "baseline_max_wheel_rpm": 5,
+    "baseline_can_source_timeout_ms": 250,
+    "baseline_feedback_stop_rpm": 15,
+    "verified_current": false
+  },
+  "sensing": {
+    "navigation_fov_deg": 180,
+    "rear_unobserved_deg": 180,
+    "rear_coverage_confirmed": false,
+    "raw_scan_preserved": true,
+    "unobserved_is_free": false
+  }
+}

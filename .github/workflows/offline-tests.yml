@@ -1,0 +1,28 @@
+name: Offline tests
+
+on:
+  push:
+    branches: [main, 'feature/**', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements-pc.txt
+      - run: python -m pip install -r requirements-pc.txt
+      - name: Existing offline regression suite
+        run: python -B -m unittest discover -s app -p 'test_*.py'
+      - name: Build standalone manual mapping package
+        run: python -B scripts/build_package.py --name ci-manual-mapping
+      - name: Packaged offline regression suite
+        run: python -B -m unittest discover -s dist/ci-manual-mapping/package -p 'test_manual_mapping*.py'
