@@ -29,8 +29,9 @@ class Clock:
 
 
 class MCU:
-    def __init__(self, clock, mode="healthy", delay=0.):
+    def __init__(self, clock, mode="healthy", delay=0., sample_period_ms=50):
         self.clock, self.mode, self.delay = clock, mode, delay
+        self.sample_period_ms = sample_period_ms
         self.timeout = self.write_timeout = .1
         self.writes, self.queue, self.buffer = [], [], bytearray()
         self.state, self.session, self.target, self.rx, self.applied = 1, 0, (0, 0), 0, 0
@@ -38,6 +39,8 @@ class MCU:
         self.first_old = False
         self.speed_sample, self.sampled_speed = None, (0, 0)
         self.last_stopped_status_tick = None
+        self.applied_target = (0,0)
+        self.parking_sequence, self.parking_sources, self.parking_speed = None,0,(0,0)
 
     def write(self, raw):
         self.writes.append((self.clock.value, bytes(raw)))
@@ -53,15 +56,17 @@ class MCU:
             self.state, self.session, self.rx, self.arm_at = 2, session, sequence, at
         elif kind == 7:
             self.state, self.target, self.rx = 5, (left, right), sequence
-            if self.mode != "not_applied": self.applied = sequence
+            if self.mode not in ("not_applied","ack_progress"):
+                self.applied, self.applied_target = sequence,(left,right)
         if self.state == 2 and at-self.arm_at >= (.8 if self.mode == "slow_arm" else .09):
             self.state = 10
+            self.applied,self.applied_target = self.rx,(0,0)
         if kind == 5:
-            sample_tick = int(tick/50)*50
-            sample_seq = sample_tick//50
+            sample_tick = int(tick/self.sample_period_ms)*self.sample_period_ms
+            sample_seq = sample_tick//self.sample_period_ms
             if self.mode == "gap" and self.arm_at is not None and self.target != (0, 0):
                 sample_seq += 2
-            if self.mode == "parking_gap" and self.stop_count == 2:
+            if self.mode in ("parking_gap","settle_with_gap") and self.stop_count == 2:
                 sample_seq += 2
             if self.mode == "frozen": sample_tick, sample_seq = 100000, 2000
             age = 251 if self.mode == "old_can" else 0
@@ -72,11 +77,22 @@ class MCU:
             if self.mode == "origin_nonzero" and self.arm_at is None: l = 1
             if self.first_old and (self.mode != "new_parking_nonzero" or tick > self.last_stopped_status_tick):
                 sample_tick = self.stop_tick-10 if self.mode == "old_parking" else self.last_stopped_status_tick+1
-                sample_seq, l, r = sample_tick//50, -.5, 0
+                sample_seq, l, r = sample_tick//self.sample_period_ms, -.5, 0
                 self.first_old = False
+            if (self.stop_count == 2 and self.mode in ('settle_then_zero','zero_interrupted','continuous_moving','settle_with_gap')
+                    and self.last_stopped_status_tick is not None and sample_tick > self.last_stopped_status_tick):
+                if sample_seq != self.parking_sequence:
+                    self.parking_sequence,self.parking_sources = sample_seq,self.parking_sources+1
+                    moving = (self.mode == 'continuous_moving' or
+                        self.mode in ('settle_then_zero','settle_with_gap') and self.parking_sources <= 3 or
+                        self.mode == 'zero_interrupted' and self.parking_sources == 3)
+                    self.parking_speed = (.4,0.) if moving else (0.,0.)
+                l,r = self.parking_speed
             raw_speed = (int(round(l*10)) & 65535) | ((int(round(r*10)) & 65535)<<16)
             flags = (self.state<<8) | (5 if self.state == 1 else 1)
             enabled = 0 if self.state == 1 else 0x70007
+            if self.mode == 'parking_lost_state' and self.stop_count == 2 and sample_tick > self.last_stopped_status_tick:
+                flags,enabled=(5<<8)|1,0x70007
             words = [tick, sample_seq, sample_tick-age, 31, 0, 0, raw_speed,
                      sample_tick-age, sample_tick-age, sample_tick-age, enabled, 0, flags]
             if self.mode == "encoder_changed" and self.stop_count:
@@ -87,11 +103,15 @@ class MCU:
             target_pack = (self.target[0] & 65535) | ((self.target[1] & 65535)<<16)
             applied = self.applied
             if self.mode == "not_applied": target_pack = 0
+            if self.mode == 'ack_progress' and kind == 7:
+                target_pack = (self.applied_target[0]&65535)|((self.applied_target[1]&65535)<<16)
             flags = (self.state<<8) | (5 if self.state == 1 else 1)
             words = [tick, self.state, 0, self.session, self.rx, applied, target_pack,
                      int(self.state == 1), flags, api.IDENTITY, 0, 54321, 0]
         body = struct.pack("<BBBBHBB13IH", 0xaa, 0x55, 9, kind|0x80, sequence, 0, 0, *words, 0)
         reply = body+struct.pack("<H", api.crc16(body))
+        if self.mode == 'ack_progress' and kind == 7:
+            self.applied,self.applied_target=sequence,(left,right)
         if self.mode == "bad_crc" and kind == 5: reply = reply[:-1]+bytes([reply[-1]^1])
         if self.mode == "short" and kind == 5: return 10
         # A healthy stopped STATUS requires a *new* disabled-driver CAN sample.
@@ -99,7 +119,8 @@ class MCU:
         # status_raw from 7 to 0 under the same sample_sequence.
         ready_at = at+self.delay
         if kind == 3:
-            ready_at = max(ready_at,(math.floor(at/.05)+1)*.05+.002)
+            period=self.sample_period_ms/1000.
+            ready_at = max(ready_at,(math.floor(at/period)+1)*period+.002)
         self.queue.append((ready_at, reply))
         return 20
 
@@ -128,8 +149,8 @@ class Script:
 
 class BaseTests(unittest.TestCase):
     def run_case(self, mode="healthy", execute=False, phases=("drive",), scan=None, cancelled=None, delay=0., goal_x=0.,
-                 expected=None,event_sink=None):
-        clock = Clock(); port = MCU(clock, mode, delay)
+                 expected=None,event_sink=None,sample_period_ms=50):
+        clock = Clock(); port = MCU(clock, mode, delay,sample_period_ms)
         controller = Script(clock, phases)
         controller.goal_x = goal_x
         scan = scan or (lambda now, phase: dict(ok=True, reason="clear", source_monotonic_s=now-.01))
@@ -203,16 +224,16 @@ class BaseTests(unittest.TestCase):
         self.assertGreaterEqual(len(between), 5)
         self.assertEqual(result["arm_count"], 1)
 
-    def test_old_pre_status_nonzero_is_excluded_but_new_nonzero_fails(self):
+    def test_old_pre_status_nonzero_is_excluded_and_new_nonzero_restarts_settling(self):
         result, _ = self.run_case("old_parking", execute=True)
         self.assertTrue(result["session_complete"], result["first_failure"])
         excluded = [row for row in result["rows"] if row.get("excluded_reason", "").startswith("CAN source")]
         self.assertGreaterEqual(len(excluded), 1)
         self.assertTrue(all("source_monotonic_s" not in row for row in excluded))
         result, port = self.run_case("new_parking_nonzero", execute=True)
-        self.assertFalse(result["session_complete"])
-        self.assertIn("not physically stopped", result["first_failure"]["message"])
-        self.assertEqual(result["arm_count"], 0)
+        self.assertTrue(result["session_complete"],result["first_failure"])
+        self.assertEqual(result["initial_stop_chain"]["settling_nonzero_samples"],1)
+        self.assertEqual(len(result["initial_stop_chain"]["zero_samples"]),5)
 
     def test_moving_gap_frozen_source_slow_arm_and_unapplied_target_stop_once_without_rearm(self):
         for mode, reason in (("gap", "discontinuity"),
@@ -341,6 +362,95 @@ class BaseTests(unittest.TestCase):
         self.assertEqual(duplicate["source_monotonic_s"],100.)
         with self.assertRaisesRegex(Exception,"Host feedback source age"):
             tracker.accept(dict(packet,sample_sequence=2),100.75,100.75)
+
+    def test_ack_applied_progress_is_evidence_during_status_gap_not_acceptance_alone(self):
+        packet=dict(identity=api.IDENTITY,session=9,state=10,error=0,reserved=0,status=0,
+            uart_critical_short=0,uart_critical_total=0,last_applied_seq=39,target_pack=0)
+        tracker=base.AppliedTargets(packet)
+        previous=39
+        for index in range(12):
+            sequence=53+index*3
+            at=100.+index*.05
+            tracker.register(sequence,2,-2,at)
+            # A real ACK carries the prior target applied, never the new
+            # accepted seq. There are deliberately no STATUS observations.
+            tracker.observe(dict(packet,state=5,last_applied_seq=previous,
+                target_pack=0 if previous==39 else 0xfffe0002),at)
+            tracker.check_deadline(at+.049)
+            previous=sequence
+        self.assertEqual(len(tracker.targets),2)  # Current applied plus one pending.
+        self.assertEqual(tracker.applied_order,10)
+
+    def test_immediate_apply_and_unknown_pack_identity_or_regression_are_checked(self):
+        packet=dict(identity=api.IDENTITY,session=9,state=10,error=0,reserved=0,status=0,
+            uart_critical_short=0,uart_critical_total=0,last_applied_seq=39,target_pack=0)
+        tracker=base.AppliedTargets(packet)
+        tracker.register(53,2,-2,100.)
+        current=dict(packet,state=5,last_applied_seq=53,target_pack=0xfffe0002)
+        tracker.observe(current,100.)  # Register-before-observe permits immediate application.
+        self.assertEqual(tracker.applied_order,0)
+        for change in (dict(last_applied_seq=999),dict(target_pack=0),dict(last_applied_seq=39,target_pack=0),
+                       dict(identity=1),dict(session=10)):
+            with self.subTest(change=change),self.assertRaises(base.BaseFault):
+                tracker.observe(dict(current,**change),100.1)
+
+    def test_true_unapplied_or_late_application_still_fails_at_original_300ms(self):
+        packet=dict(identity=api.IDENTITY,session=9,state=10,error=0,reserved=0,status=0,
+            uart_critical_short=0,uart_critical_total=0,last_applied_seq=39,target_pack=0)
+        tracker=base.AppliedTargets(packet);tracker.register(53,2,-2,100.)
+        tracker.observe(packet,100.299)
+        with self.assertRaisesRegex(base.BaseFault,'within 300ms'):
+            tracker.observe(dict(packet,last_applied_seq=53,target_pack=0xfffe0002),100.301)
+        with self.assertRaisesRegex(base.BaseFault,'within 300ms'):
+            tracker.check_deadline(100.3)
+
+    def test_twenty_ms_rtt_does_not_starve_status_or_ignore_ack_application(self):
+        result,_=self.run_case('ack_progress',execute=True,delay=.021,sample_period_ms=100)
+        self.assertEqual(result.get('termination_reason'),'arrived',result['first_failure'])
+        active=[r for r in result['rows'] if r['phase'] in ('drive','turn','motion')]
+        statuses=[r for r in active if r['kind']==2]
+        feedback=[r for r in active if r['kind']==5]
+        self.assertGreaterEqual(len(statuses),3)
+        self.assertGreaterEqual(len(feedback),3)
+        self.assertLess(max(b['request_start_monotonic_s']-a['request_start_monotonic_s']
+                            for a,b in zip(statuses,statuses[1:])),.2)
+        self.assertTrue(any(r['kind']==7 and r['packet']['last_applied_seq']!=r['packet']['sequence'] for r in active))
+        if result['first_failure'] is not None:
+            self.assertIn('Parking MCU odometry discontinuity',result['first_failure']['message'])
+
+    def test_parking_nonzero_then_five_zero_and_interrupted_zero_run(self):
+        for mode,nonzero,restarts in (('settle_then_zero',3,0),('zero_interrupted',1,1)):
+            with self.subTest(mode=mode):
+                result,_=self.run_case(mode,execute=True)
+                proof=result['final_stop_chain']
+                self.assertTrue(proof['complete'],proof.get('error'))
+                self.assertEqual(proof['settling_nonzero_samples'],nonzero)
+                self.assertEqual(proof['zero_run_restarts'],restarts)
+                self.assertEqual(len({p['sample_sequence'] for p in proof['zero_samples']}),5)
+                final_source=next(r for r in reversed(result['rows']) if r['kind']==5)
+                self.assertLess(final_source['completed_monotonic_s']-proof['stopped_status']['completed_monotonic_s'],2.)
+
+    def test_parking_continuous_motion_uses_original_two_seconds_but_state_loss_fails(self):
+        result,_=self.run_case('continuous_moving',execute=True)
+        proof=result['final_stop_chain']
+        self.assertFalse(proof['complete'])
+        self.assertIn('zero samples timed out',proof['error'])
+        final_row=result['rows'][-1]
+        self.assertGreaterEqual(final_row['completed_monotonic_s']-proof['stopped_status']['completed_monotonic_s'],1.99)
+        self.assertLess(final_row['completed_monotonic_s']-proof['stopped_status']['completed_monotonic_s'],2.02)
+        result,_=self.run_case('parking_lost_state',execute=True)
+        self.assertFalse(result['final_stop_chain']['complete'])
+        self.assertIn('lost DISARMED',result['final_stop_chain']['error'])
+
+    def test_parking_gap_remains_position_failure_while_settled_zero_proof_completes(self):
+        result,_=self.run_case('settle_with_gap',execute=True)
+        proof=result['final_stop_chain']
+        self.assertTrue(proof['complete'],proof.get('error'))
+        self.assertEqual(len(proof['zero_samples']),5)
+        self.assertFalse(proof['position_verified'])
+        self.assertIn('Parking MCU odometry discontinuity',proof['parking_position_error'])
+        self.assertFalse(result['session_complete'])
+        self.assertFalse(result['motion_complete'])
 
 
 if __name__ == "__main__": unittest.main()

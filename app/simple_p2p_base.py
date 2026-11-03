@@ -17,6 +17,45 @@ class BaseFault(RuntimeError):
     pass
 
 
+class AppliedTargets:
+    """Bounded accepted/current-applied identities, observed equally in 2/7."""
+    def __init__(self, ready_packet):
+        self.session = ready_packet['session']
+        self.order, self.applied_order = 0, -1
+        self.targets = {ready_packet['last_applied_seq']:dict(order=-1,pack=0,accepted_monotonic_s=None)}
+        self.observe(ready_packet)
+
+    def register(self, sequence, left, right, accepted_at):
+        if (type(sequence) is not int or not 1 <= sequence <= 65535
+                or sequence in self.targets or not finite(accepted_at)):
+            raise BaseFault('Invalid or reused accepted SETPOINT sequence')
+        self.targets[sequence] = dict(order=self.order,pack=(left & 65535)|((right & 65535)<<16),
+                                      accepted_monotonic_s=accepted_at)
+        self.order += 1
+
+    def observe(self, packet, at=None):
+        if at is not None:
+            self.check_deadline(at)  # Late evidence cannot erase an expired pending deadline.
+        if (packet['identity'] != MCU_IDENTITY or packet['session'] != self.session
+                or packet['state'] not in (5,10) or packet['error']
+                or packet['reserved'] or packet['status'] or packet['uart_critical_short']
+                or packet['uart_critical_total']):
+            raise BaseFault('Applied observation lost healthy MCU/session identity')
+        applied = packet['last_applied_seq']
+        item = self.targets.get(applied)
+        if item is None or item['pack'] != packet['target_pack'] or item['order'] < self.applied_order:
+            raise BaseFault('Applied command/target identity mismatch or sequence moved backwards')
+        self.applied_order = item['order']
+        for sequence in list(self.targets):
+            if self.targets[sequence]['order'] < self.applied_order:
+                del self.targets[sequence]
+
+    def check_deadline(self, at):
+        if any(item['order'] > self.applied_order and at >= item['accepted_monotonic_s']+.3
+               for item in self.targets.values()):
+            raise BaseFault('Accepted target not observed applied within 300ms')
+
+
 def finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
@@ -165,7 +204,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
     odom = RawRpm(cfg.wheel_diameter_m, cfg.wheel_separation_m, calibrated=False)
     port = SessionPort(physical, execute, clock, evidence_limit)
     client, source = api.Client(port), SourceTracker(.75)
-    rows, intents, sent = [], [], {}
+    rows, intents = [], []
     result = dict(schema="simple-p2p-base-v1", boot_id=boot_id, execute=execute,
         origin=None, first_failure=None, initial_stop_chain=None, final_stop_chain=None,
         session_complete=False, motion_complete=False, geometry_calibrated=False,
@@ -175,8 +214,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         encoder_unchanged_since_origin=True, first_origin_encoder_change=None,
         expected_start_encoders=expected_start_encoders, event_sink_errors=[])
     phase, latest, last_scan, scan_phase = "origin", None, None, None
-    began, last_time, lease_deadline, applied_order = clock(), None, float("inf"), -1
-    next_order = 0
+    began, last_time, lease_deadline = clock(), None, float("inf")
+    applied = None
 
     def now():
         nonlocal last_time
@@ -229,6 +268,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 raise BaseFault("Scan/clearance rejected: " + str(last_scan.get("reason", "invalid") if isinstance(last_scan, dict) else "invalid"))
         if port.phase == "active" and at >= lease_deadline:
             raise BaseFault("Original MCU lease deadline reached")
+        if port.phase == "active" and applied is not None:
+            applied.check_deadline(at)
 
     def record(kind, packet):
         done = client.last_exchange_completion
@@ -292,7 +333,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         port.phase, port.permit, port.finishing = "stopping", None, True
         client.cancel_for_stop()
         proof = dict(complete=False, ack=None, stopped_status=None, zero_samples=[],
-                     parking_position_error=None, position_verified=False)
+                     parking_position_error=None, position_verified=False,
+                     settling_nonzero_samples=0, zero_run_restarts=0)
         motion_source = source
         try:
             ack, ack_row = exchange(3, guard=False)
@@ -338,9 +380,16 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                         proof["parking_position_error"] = type(exc).__name__+": "+str(exc)
                 sample = feedback(packet, row, state["tick_ms"], integrate=False)
                 if sample is not None:
-                    if sample["controller_state"] != 1 or max(abs(sample["speed_left_rpm"]), abs(sample["speed_right_rpm"])) > .2:
-                        raise BaseFault("New post-STATUS feedback is not physically stopped")
-                    proof["zero_samples"].append(dict(sample))
+                    if sample["controller_state"] != 1:
+                        raise BaseFault("New post-STATUS feedback lost DISARMED state")
+                    if max(abs(sample["speed_left_rpm"]), abs(sample["speed_right_rpm"])) > .2:
+                        proof["settling_nonzero_samples"] += 1
+                        if proof["zero_samples"]:
+                            proof["zero_run_restarts"] += 1
+                        proof["zero_samples"].clear()
+                        row["zero_proof_rejected_reason"] = "Healthy DISARMED wheel speed still above 0.2 RPM; original deadline unchanged"
+                    else:
+                        proof["zero_samples"].append(dict(sample))
                 sleep(.005)
             proof["complete"] = True
             proof["position_verified"] = bool(integrate_parking
@@ -457,6 +506,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     break
                 sleep(.001)
             phase, port.phase = "motion", "active"
+            applied = AppliedTargets(state)
             next_command = next_status = next_feedback = now()
             current_axis, barrier, barrier_count, barrier_zero_tick = None, None, 0, None
             while True:
@@ -486,9 +536,11 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     packet, row = exchange(7, target["left_rpm"], target["right_rpm"], session=client.session)
                     if packet["last_rx_seq"] != packet["sequence"] or packet["state"] not in (5, 10):
                         raise BaseFault("SETPOINT acceptance/state mismatch")
-                    sent[packet["sequence"]] = dict(order=next_order, pack=(target["left_rpm"] & 65535) | ((target["right_rpm"] & 65535)<<16),
-                        accepted_monotonic_s=row["completed_monotonic_s"])
-                    next_order += 1
+                    # ACK may already report this target applied, or a previous
+                    # known target. Acceptance alone never advances application.
+                    applied.register(packet["sequence"],target["left_rpm"],target["right_rpm"],
+                                     row["completed_monotonic_s"])
+                    applied.observe(packet,row["completed_monotonic_s"])
                     row["quantized_command"] = dict(target)
                     if barrier is not None and barrier_zero_tick is None:
                         barrier_zero_tick = packet["tick_ms"]
@@ -497,7 +549,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     if barrier is None and intended:
                         current_axis = intended
                     next_command = row["request_start_monotonic_s"]+.05
-                elif at >= next_feedback:
+                elif at >= next_feedback and (at < next_status or next_feedback < next_status):
                     packet, row = exchange(5)
                     sample = feedback(packet, row)
                     if (sample is not None and barrier is not None and barrier_zero_tick is not None
@@ -514,20 +566,11 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     packet, row = exchange(2)
                     if packet["state"] not in (5, 10):
                         raise BaseFault("Motion STATUS lost READY/RUNNING state")
-                    applied = packet["last_applied_seq"]
-                    if applied:
-                        item = sent.get(applied)
-                        if item is None or item["pack"] != packet["target_pack"] or item["order"] < applied_order:
-                            raise BaseFault("Applied command/target identity mismatch")
-                        applied_order = item["order"]
-                        for sequence in list(sent):
-                            if sent[sequence]["order"] < applied_order:
-                                del sent[sequence]
+                    applied.observe(packet,row["completed_monotonic_s"])
                     next_status = at+.1
                 else:
                     sleep(.001)
-                if any(item["order"] > applied_order and now()-item["accepted_monotonic_s"] >= .3 for item in sent.values()):
-                    raise BaseFault("Accepted target not observed applied within 300ms")
+                applied.check_deadline(now())
     except BaseException as exc:
         fail(exc, phase)
     finally:
