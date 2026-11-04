@@ -1,6 +1,6 @@
 # 联通机器人：手推建图与简版点到点控制
 
-当前第二分支`feature/mcu-odom-queue`从`f86ab2b`派生，增加STM32G474 v10源码、默认只监听的PC工具及独立离线测试。MCU累计odom、主动20Hz上报，并独立执行一次上传的MOVE/TURN队列；本轮交付未刷写、未实车验收。构建与使用见[MCU说明](mcu/README.md)，线协议见[协议说明](mcu/docs/PROTOCOL.md)。RK costmap/A*、一次AMCL和网页接入属于下一阶段。
+当前第二分支`feature/mcu-odom-queue`从`f86ab2b`派生，增加STM32G474 v10源码、默认只监听的PC工具及独立离线测试。MCU累计odom、主动20Hz上报，并独立执行一次上传的MOVE/TURN队列。新增[隔离部署工具](mcu/docs/DEPLOYMENT.md)与[零发送静止采集工具](mcu/docs/STATIC_CAPTURE.md)；首次实机部署因独立读回异常中止，保持隔离，尚未完成静止或运动验收。构建与使用见[MCU说明](mcu/README.md)，线协议见[协议说明](mcu/docs/PROTOCOL.md)。RK costmap/A*、一次AMCL和网页接入属于下一阶段。
 
 新生产固件只接受v10，下面继承的第一分支程序仍使用v9，须配原固件运行。原main、第一分支和手推基线保持回退；生成固件和日志不提交Git。
 

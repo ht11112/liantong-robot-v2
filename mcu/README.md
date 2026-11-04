@@ -1,6 +1,6 @@
 # MCU v10：累计里程计与独立动作队列
 
-本目录是第二分支`feature/mcu-odom-queue`的独立交付，从第一分支`f86ab2b`及操作者提供的G474 v9源码派生。当前阶段为离线候选，未刷写或实车验证；RK costmap/A*、一次AMCL和8766网页接入留到下一阶段。
+本目录是第二分支`feature/mcu-odom-queue`的独立交付，从第一分支`f86ab2b`及操作者提供的G474 v9源码派生。已提供默认离线的部署和静止采集工具；首次隔离部署因独立读回异常中止，尚未完成静止或运动验收。RK costmap/A*、一次AMCL和8766网页接入留到下一阶段。
 
 ## 运行方式
 
@@ -51,4 +51,4 @@ python -B mcu/tools/mcu_v10.py stop --port COM_PORT --timing-budget measured.jso
 
 `queue.json`只是协议示例，构建、监听、上传都不执行它。`reset`是停稳后的显式MCU odom置零，会增加odom代次并撤销旧队列；下一阶段AMCL只建立map→odom关系，不需要每个目标都把MCU置零。
 
-新固件仅接受v10，不能配第一分支的v9程序控制。原RAR、第一分支及旧固件作为回退基线保留，来源身份见`provenance.json`。本轮不会自动刷写；后续按新鲜设备身份/完整备份核对后，依次做静止采样、架空动作、低速地面验收。
+新固件仅接受v10，不能配第一分支的v9程序控制。原RAR、第一分支及旧固件作为回退基线保留，来源身份见`provenance.json`。部署流程及实际中止结果见[隔离部署](docs/DEPLOYMENT.md)，零发送采集与判定范围见[静止验收](docs/STATIC_CAPTURE.md)。静止通过后才单独安排架空动作和低速地面验收。
