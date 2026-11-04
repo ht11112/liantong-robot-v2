@@ -5,8 +5,9 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace as NS
 import unittest
+from unittest.mock import patch
 
-from simple_p2p_runtime import DEFAULT_CONFIG, ScanGate, load_config, LiveStatusWriter
+from simple_p2p_runtime import DEFAULT_CONFIG, ScanGate, load_config, LiveStatusWriter, durable_json
 
 
 SETTINGS = dict(stop_clearance_m=.2, body_front_m=.2, body_rear_m=.2, body_half_width_m=.25,
@@ -142,6 +143,39 @@ class ScanGateTests(unittest.TestCase):
             writer.start()
             self.assertFalse(writer.close(dict(session_complete=False)))
             self.assertIsNotNone(writer.error)
+
+    def test_raw_feedback_without_accumulated_pose_does_not_renew_pose_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer=LiveStatusWriter(Path(directory)/'live.json','boot',clock=lambda:30.)
+            writer.submit(dict(event='odometry',phase='drive',event_monotonic_s=10.,
+                source_monotonic_s=9.9,raw_packet=dict(sample_sequence=1),
+                measurement_monotonic_s=9.95,pose=dict(x=.4,y=0.,yaw=0.)))
+            writer.submit(dict(event='odometry',phase='final_stop',event_monotonic_s=20.,
+                source_monotonic_s=19.9,raw_packet=dict(sample_sequence=2),pose=None))
+            writer._write()
+            state=json.loads(writer.path.read_text(encoding='utf-8'))
+            self.assertEqual(state['source_monotonic_s'],19.9)
+            self.assertEqual(state['pose_source_monotonic_s'],9.9)
+            self.assertEqual(state['pose_measurement_monotonic_s'],9.95)
+            self.assertEqual(state['pose']['x'],.4)
+
+    def test_durable_result_flushes_before_replace_and_rejects_nan_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'result.json'
+            path.write_text('{"previous":true}',encoding='utf-8')
+            events=[]
+            import os
+            original_replace=os.replace
+            def replace(source,target):
+                events.append('replace')
+                self.assertEqual(events[0],'fsync')
+                original_replace(source,target)
+            with patch('simple_p2p_runtime.os.fsync',side_effect=lambda fd:events.append('fsync')), patch('simple_p2p_runtime.os.replace',side_effect=replace):
+                durable_json(path,dict(complete=True))
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')),dict(complete=True))
+            with self.assertRaises(ValueError):
+                durable_json(path,dict(invalid=float('nan')))
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')),dict(complete=True))
 
 
 if __name__ == '__main__':

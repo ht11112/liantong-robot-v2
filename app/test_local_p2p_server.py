@@ -8,9 +8,11 @@ import tempfile
 import threading
 import unittest
 import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 
-from local_p2p_server import Broker, RequestError, compose, relative_goal, handler_for
+from local_p2p_server import Broker, RequestError, SSHRemote, compose, relative_goal, handler_for
 
 
 def rid():
@@ -168,6 +170,53 @@ class BrokerTest(unittest.TestCase):
     def test_map_hash_mismatch_refused(self):
         with self.assertRaises(ValueError):
             Broker(self.remote,self.map,"0"*64,.05)
+
+    def test_repeated_disconnect_does_not_increment_an_already_invalid_reference(self):
+        self.reset()
+        self.broker.invalidate('disconnected')
+        version = self.broker.reference['version']
+        self.broker.invalidate('disconnected')
+        self.assertEqual(self.broker.reference['version'],version)
+
+    def test_failed_ssh_authentication_closes_the_unassigned_client(self):
+        clients=[]
+        class Client:
+            closed=False
+            def __init__(self): clients.append(self)
+            def load_host_keys(self,path): pass
+            def set_missing_host_key_policy(self,policy): pass
+            def connect(self,*args,**kwargs): raise OSError('unavailable')
+            def close(self): self.closed=True
+        fake = SimpleNamespace(SSHClient=Client,RejectPolicy=lambda:object())
+        remote = SSHRemote('host','cat','known-hosts',None,
+                           '/home/cat/p2p_navigation_20261103_test',None)
+        with patch.dict('sys.modules',{'paramiko':fake}):
+            for _ in range(3):
+                with self.assertRaises(OSError): remote.request(dict(op='poll'))
+        self.assertEqual(len(clients),3)
+        self.assertTrue(all(client.closed for client in clients))
+        self.assertIsNone(remote.client)
+
+    def test_new_raw_feedback_does_not_rejuvenate_old_accumulated_pose(self):
+        self.reset()
+        self.broker.task.update(id=rid(),active=True)
+        self.broker.task_start=dict(x=0.,y=0.,yaw=0.)
+        self.broker.update_task(dict(boot_id=self.remote.boot,task_id=self.broker.task['id'],active=True,
+            now_monotonic_s=100.,live_status=dict(boot_id=self.remote.boot,pose=dict(x=.2,y=0.,yaw=0.),
+                source_monotonic_s=99.95,pose_source_monotonic_s=98.)))
+        self.assertAlmostEqual(self.broker.snapshot()['odometry_age_s'],2.)
+
+    def test_completed_pose_uses_its_own_source_when_live_snapshot_is_older(self):
+        self.reset()
+        self.broker.task.update(id=rid(),active=True)
+        self.broker.task_start=dict(x=0.,y=0.,yaw=0.)
+        self.broker.update_task(dict(boot_id=self.remote.boot,task_id=self.broker.task['id'],active=False,
+            now_monotonic_s=100.,live_status=dict(boot_id=self.remote.boot,pose=dict(x=.1,y=0.,yaw=0.),
+                source_monotonic_s=98.,pose_source_monotonic_s=98.),
+            result=dict(boot_id=self.remote.boot,latest_odometry=dict(x=.2,y=0.,yaw=0.,source_monotonic_s=99.8),
+                session_complete=False,position_verified=False,final_stop_chain=dict(complete=True))))
+        self.assertAlmostEqual(self.broker.snapshot()['odometry_age_s'],.2)
+        self.assertFalse(self.broker.reference['valid'])
 
     def test_ssh_round_trip_delay_is_included_in_original_source_age(self):
         current = [100.]

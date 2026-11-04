@@ -1,5 +1,19 @@
 # 离线与历史实测验证
 
+## 2026-11-04：累计odom、独立控制tick与短历史
+
+旧任务`75f10972-5b82-40f2-bfd9-652bb4a70a26`报告“Measured MCU odometry discontinuity; missing motion not integrated”。重新连接时RK已重启，远端该任务的`result.json`和`runtime.log`实际均为0字节，仅保留job和完成状态快照。因此无法从原任务恢复具体漏样序号、速度tick间隔或串口往返时间，也不能认定串口拥堵是该轮唯一原因。历史失败及位置未验证结果保持。
+
+本轮把运动期串口等待改为单owner的非阻塞事务循环；每个返回的不同真实FEEDBACK先积分，再进入256项有界位姿历史，控制每50ms读取最新累计pose。独立期限调度FEEDBACK、STATUS和命令保活；不排队追赶旧控制意图。新短历史提供连续实测区间内的x/y线性与yaw最短弧插值，控制当前只用latest，不外推、不补未返回的MCU样本。原source750ms、CAN250ms、租约500ms、应用300ms和额外净距0均保持。
+
+离线审查复现并修复了两项边界：首条SETPOINT回包等待期间换轴，必须在物理发送后保守记录可能已生效的轴，发送前再核对新意图，直到零ACK及五个新实测零源才换轴；转向待ACK期间仍使用turn扫掠检查。合法零目标ARM之后的保守source可以回退，历史测量轴继续按MCU速度tick前进，原source不改写，空窗不积分且插值段清空。`history.gap_count`可能包含合法ARM空窗切段，不能直接当作运动缺段数；连续性另由core检查及`odometry_continuity_validated`记录。
+
+新增回归还覆盖回包等待期间控制tick运行、控制使用最新已积分pose、实际发送快照与ACK绑定、查询公平性、真实缺段锁存、原source过期、取消优先STOP与正常到点仅收完原事务。网页不以新raw续鲜旧pose；完整结果和后台实时快照使用fsync后原子替换。损坏结果会报告证据错误而不冒作成功，也不妨碍取消仍活跃的已登记任务；损坏任务归属仍阻止新owner。软件验证不能代替实车运动与地面精度验收。
+
+最终r2在PC全app137项通过、0skip；包内简版74项与remote10项均通过，RK系统Python实际运行同74+10项软件测试通过、0skip。28个app/scripts Python文件通过3.8语法解析，原12手推来源及r5九源身份保持。r2包`dist/odom-latest-20261104-r2/simple-p2p.tar.gz` SHA256为`e1e154ae9f281a0043c873d6041e9f42425719ae310e9d9ae0cde64885641ca5`，16项SHA绑定、17个tar成员；安装到新RK目录`/home/cat/p2p_navigation_20261103_odom_latest_20261104_a91c406e`。首候选r1在独审后作废，未上传或运行；不把r1测试当作最终r2结果。
+
+部署后同`http://127.0.0.1:8766/`已连接新目录；实际只读STATUS/FEEDBACK各1次，ARM/SETPOINT/STOP均0，双轮0RPM、UARTcritical0。新RK boot为`28544ea9-75f0-4206-ad36-a3e5926c59d2`，新旧任务目录均无活动任务，16项新源和14项旧源SHA未变，旧0字节结果保持。网页未替用户设置原点或重新执行旧目标，保存图SHA保持；本轮没有实车运动验收。
+
 ## 指令应用回包与停车采样修复
 
 实车旧任务`9ed7b073-a799-469f-b230-be6525193db2`在转直控制中报告“Accepted target not observed applied within 300ms”。原450次请求、450帧响应与450业务记录CRC、序号、原字节一致。seq422在6010.736157016秒被接收，seq425回包在57.071ms后已报告applied422；此后SETPOINT回包持续报告应用进度，旧程序只消费STATUS，后段STATUS被反馈查询挤占，312.334ms后误报超时。

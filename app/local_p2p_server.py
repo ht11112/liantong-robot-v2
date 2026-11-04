@@ -8,6 +8,7 @@ import copy
 import getpass
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import queue
@@ -90,19 +91,27 @@ class SSHRemote:
 
     def request(self, payload):
         import paramiko
+        transport_log = logging.getLogger('paramiko.transport')
+        if not transport_log.handlers:
+            transport_log.addHandler(logging.NullHandler())
+        transport_log.propagate = False  # The bounded web error retains the cause.
         if self.client is None or not self.client.get_transport() or not self.client.get_transport().is_active():
             self.close()
             client = paramiko.SSHClient()
-            client.load_host_keys(self.known_hosts)
-            if self.alias:
-                keys = paramiko.HostKeys(self.known_hosts).lookup(self.alias)
-                if not keys:
-                    raise ValueError("Pinned RK host key alias is missing")
-                for kind, key in keys.items():
-                    client.get_host_keys().add(self.host, kind, key)
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
-            client.connect(self.host, username=self.user, password=self.password, allow_agent=False,
-                           look_for_keys=False, timeout=6, banner_timeout=12, auth_timeout=12)
+            try:
+                client.load_host_keys(self.known_hosts)
+                if self.alias:
+                    keys = paramiko.HostKeys(self.known_hosts).lookup(self.alias)
+                    if not keys:
+                        raise ValueError("Pinned RK host key alias is missing")
+                    for kind, key in keys.items():
+                        client.get_host_keys().add(self.host, kind, key)
+                client.set_missing_host_key_policy(paramiko.RejectPolicy())
+                client.connect(self.host, username=self.user, password=self.password, allow_agent=False,
+                               look_for_keys=False, timeout=6, banner_timeout=12, auth_timeout=12)
+            except BaseException:
+                client.close()
+                raise
             self.client = client
         command = "/usr/bin/python3 -B " + shlex.quote(self.directory+"/local_p2p_remote.py") + " --stdio"
         try:
@@ -184,6 +193,9 @@ class Broker:
                                     clearance_m=0., timeout_s=200, feedback_timeout_ms=750))
 
     def invalidate(self, reason):
+        if not self.reference["valid"] and self.reference["reason"] == reason:
+            self.preview = None
+            return
         self.reference.update(valid=False, reason=reason, version=self.reference["version"]+1)
         self.preview = None
 
@@ -395,19 +407,25 @@ class Broker:
                                  "RK 进程已退出，但没有完整结果；请检查现场并重新置零")
             if response.get("result_file"):
                 self.task["result_file"] = response["result_file"]
+            self.task["evidence_errors"] = response.get("evidence_errors") or []
             local_pose = live.get("pose")
-            source, current = live.get("source_monotonic_s"), response.get("now_monotonic_s")
-            if number(source) and number(current) and current >= source:
-                self.odometry_age_at_receipt = current-source
-                self.odometry_reference_mono = response.get("_pc_request_started_monotonic_s", self.last_received)
+            source = live.get("pose_source_monotonic_s", live.get("source_monotonic_s"))
+            current = response.get("now_monotonic_s")
             if result:
                 local_pose = result.get("latest_odometry")
+                # The completed pose may be newer than the last live snapshot.
+                # Bind its age to its own original source when it is available.
+                if isinstance(local_pose, dict):
+                    source = local_pose.get("source_monotonic_s", source)
                 stop = result.get("final_stop_chain") or {}
                 self.task.update(complete=result.get("session_complete") is True,
                                  stop_confirmed=stop.get("complete") is True,
                                  position_verified=result.get("position_verified") is True,
                                  first_failure=result.get("first_failure"),
                                  phase="completed" if result.get("session_complete") else "failed")
+            if number(source) and number(current) and current >= source:
+                self.odometry_age_at_receipt = current-source
+                self.odometry_reference_mono = response.get("_pc_request_started_monotonic_s", self.last_received)
             if local_pose and self.task_start:
                 pose = compose(self.task_start, pose_of(local_pose))
                 self.reference["pose"] = pose
@@ -450,18 +468,21 @@ class Broker:
                 self.idle_probe()
 
     def run(self):
+        retry_wait = 1.
         while not self.stop.is_set():
             try:
-                operation = self.queue.get(timeout=.5 if self.task["active"] else 1.)
+                operation = self.queue.get(timeout=retry_wait if self.error else (.5 if self.task["active"] else 1.))
             except queue.Empty:
                 operation = None
             try:
                 self.cycle(operation)
+                retry_wait = 1.
             except Exception as exc:
                 with self.lock:
                     self.error = str(exc)
                     self.discovery_needed = True
                     self.invalidate("连接或状态核对中断，请等待重连并重新置零")
+                    retry_wait = min(10., retry_wait*2.)
             finally:
                 if operation:
                     with self.lock:

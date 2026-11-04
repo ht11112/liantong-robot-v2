@@ -80,7 +80,8 @@ def compact_result(result):
     keys = ('schema','boot_id','origin','latest_odometry','first_failure','session_complete',
             'motion_complete','position_verified','final_distance_m','query_counts',
             'complete_write_counts','exclusive_port_closed_normally','elapsed_s','arm_count',
-            'position_verification','cleanup_errors','live_status_writer_complete')
+            'position_verification','cleanup_errors','live_status_writer_complete',
+            'history','history_timebase','control_metrics','odometry_continuity_validated')
     compact = {key:result.get(key) for key in keys}
     proof = result.get('final_stop_chain') or {}
     samples = proof.get('zero_samples') or []
@@ -214,11 +215,25 @@ class Remote:
         if record is None:
             raise ValueError('Unknown task')
         result_file = path/'run/result.json'
-        result = compact_result(read_json(result_file))
-        live = read_json(path/'run/live_status.json',65536)
+        evidence_errors = []
+        def evidence(file, limit):
+            try:
+                value = read_json(file, limit)
+                if value is not None and type(value) is not dict:
+                    raise ValueError('Evidence must be a JSON object')
+                return value
+            except (ValueError, UnicodeError) as exc:
+                # Missing/corrupt result is never success, but must not prevent
+                # discovering or cancelling the recorded live child. Path and
+                # bounded-read violations remain fatal and are not swallowed.
+                evidence_errors.append(dict(file=file.name, message=str(exc)[:512]))
+                return None
+        result = compact_result(evidence(result_file,128*1024*1024))
+        live = evidence(path/'run/live_status.json',65536)
         active = self.active(record)
         return dict(task_id=task,boot_id=self.boot(),record=record,active=active,
             live_status=live,result=result,now_monotonic_s=self.clock(),
+            evidence_errors=evidence_errors,
             terminal_without_result=not active and result is None,
             startup_error=record.get('startup_error'),result_file=str(result_file))
 

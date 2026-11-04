@@ -11,6 +11,7 @@ import time
 
 from base_static_adapter import QueryOnlyPort, FeedbackSourceTracker, crc16, MCU_IDENTITY
 from simple_p2p import Pose
+from simple_p2p_history import PoseHistory
 
 
 class BaseFault(RuntimeError):
@@ -204,7 +205,17 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
     odom = RawRpm(cfg.wheel_diameter_m, cfg.wheel_separation_m, calibrated=False)
     port = SessionPort(physical, execute, clock, evidence_limit)
     client, source = api.Client(port), SourceTracker(.75)
+    history = PoseHistory(capacity=256,epoch=boot_id)
     rows, intents = [], []
+    control_updates = []
+    control_metrics = dict(control_ticks=0,skipped_control_ticks=0,feedback_distinct=0,
+        control_period_s=.05,feedback_period_s=.04,status_period_s=.2,
+        same_target_keepalive_s=.1,minimum_setpoint_period_s=.05,
+        max_feedback_request_gap_s=0.,max_status_request_gap_s=0.,max_setpoint_request_gap_s=0.,
+        max_inflight_transactions=0,control_ticks_while_inflight=0,max_control_interval_s=0.,
+        max_control_sample_age_s=0.,feedback_requests=0,status_requests=0,setpoint_requests=0,
+        arm_history_reset_count=0)
+    measurement_anchors = []
     result = dict(schema="simple-p2p-base-v1", boot_id=boot_id, execute=execute,
         origin=None, first_failure=None, initial_stop_chain=None, final_stop_chain=None,
         session_complete=False, motion_complete=False, geometry_calibrated=False,
@@ -216,6 +227,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
     phase, latest, last_scan, scan_phase = "origin", None, None, None
     began, last_time, lease_deadline = clock(), None, float("inf")
     applied = None
+    measurement_tick = measurement_time = None
+    odometry_failure = None
 
     def now():
         nonlocal last_time
@@ -237,6 +250,10 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             event_monotonic_s=clock(), source_monotonic_s=None if measurement is None else measurement["source_monotonic_s"],
             raw_packet=None if packet is None else dict(packet),
             pose=None if pose is None else {key: pose[key] for key in ("x", "y", "yaw")})
+        if pose is not None:
+            event.update(measurement_monotonic_s=pose.get('measurement_monotonic_s'),
+                pose_sample_sequence=pose.get('sample_sequence'),history_summary=history.summary(),
+                control_summary=dict(control_metrics))
         try:
             event_sink(event)  # The caller must only replace a bounded RAM slot.
         except BaseException as exc:
@@ -307,6 +324,37 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             and not packet["error"] and packet["stop_verified"] == 1
             and packet["guard_flags"] & 7 == 5 and not packet["uart_critical_total"])
 
+    def accumulated(packet, observed, measurement, reset=False):
+        nonlocal latest,measurement_tick,measurement_time,odometry_failure
+        if observed is None or observed['discontinuity']:
+            history.invalidate()
+            odometry_failure = 'Measured MCU odometry discontinuity; missing motion not integrated'
+            raise BaseFault(odometry_failure)
+        if odometry_failure is not None:
+            raise BaseFault(odometry_failure)
+        if reset:
+            history.reset(epoch=boot_id)
+            control_metrics['arm_history_reset_count'] += 1
+        if measurement_tick is None:
+            measurement_time = measurement['source_monotonic_s']
+        else:
+            delta=(packet['speed_tick_ms']-measurement_tick)&0xffffffff
+            if not 0 < delta < 0x80000000:
+                history.invalidate()
+                odometry_failure='MCU measurement clock did not advance'
+                raise BaseFault(odometry_failure)
+            measurement_time += delta/1000.
+        if measurement_tick is None or reset:
+            measurement_anchors.append(dict(sample_sequence=packet['sample_sequence'],
+                mcu_speed_tick_ms=packet['speed_tick_ms'],source_monotonic_s=measurement['source_monotonic_s'],
+                measurement_monotonic_s=measurement_time,
+                reason='verified_zero_ARM_clock_continuation' if reset else 'origin'))
+        measurement_tick = packet['speed_tick_ms']
+        latest = dict(observed,source_monotonic_s=measurement['source_monotonic_s'],
+                      measurement_monotonic_s=measurement_time)
+        history.push(latest,epoch=boot_id)
+        return latest
+
     def feedback(packet, row, parking_tick=None, integrate=True):
         nonlocal latest
         api.fresh(packet)
@@ -320,9 +368,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             return None
         if integrate:
             observed = odom.update(packet)
-            if observed is None or observed["discontinuity"]:
-                raise BaseFault("Measured MCU odometry discontinuity; missing motion not integrated")
-            latest = dict(observed, source_monotonic_s=measurement["source_monotonic_s"])
+            row['odometry_observation'] = None if observed is None else dict(observed)
+            accumulated(packet,observed,measurement)
             row["odometry"] = dict(latest)
         emit("odometry", packet, measurement,
              latest if latest is not None and latest["sample_sequence"] == packet["sample_sequence"] else None)
@@ -333,7 +380,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         port.phase, port.permit, port.finishing = "stopping", None, True
         client.cancel_for_stop()
         proof = dict(complete=False, ack=None, stopped_status=None, zero_samples=[],
-                     parking_position_error=None, position_verified=False,
+                     parking_position_error=odometry_failure, position_verified=False,
                      settling_nonzero_samples=0, zero_run_restarts=0)
         motion_source = source
         try:
@@ -373,8 +420,9 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                         if measurement["distinct"]:
                             observed = odom.update(packet)
                             if observed is None or observed["discontinuity"]:
+                                history.invalidate()
                                 raise BaseFault("Parking MCU odometry discontinuity; final position unverified")
-                            latest = dict(observed, source_monotonic_s=measurement["source_monotonic_s"])
+                            accumulated(packet,observed,measurement)
                             row["parking_odometry"] = dict(latest)
                     except BaseException as exc:
                         proof["parking_position_error"] = type(exc).__name__+": "+str(exc)
@@ -491,6 +539,10 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     row["excluded_reason"] = "Waiting for first new post-READY CAN sample"
                     sleep(.001)
                     continue
+                if measurement_tick is not None and packet['speed_tick_ms']==measurement_tick:
+                    row['excluded_reason']='Waiting for advancing true MCU speed sample after READY'
+                    sleep(.001)
+                    continue
                 sample = feedback(packet, row, integrate=False)
                 if sample is not None:
                     if (sample["controller_state"] != 10 or max(abs(sample["speed_left_rpm"]), abs(sample["speed_right_rpm"])) > .2
@@ -501,76 +553,160 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     # ARM states 2/4 do not permit original Client feedback use.
                     # No motion target existed; establish the next measured interval.
                     odom.invalidate()
-                    latest = dict(odom.update(sample), source_monotonic_s=source.source)
+                    accumulated(sample,odom.update(sample),dict(source_monotonic_s=source.source),reset=True)
                     emit("odometry", sample, dict(source_monotonic_s=source.source), latest)
                     break
                 sleep(.001)
             phase, port.phase = "motion", "active"
             applied = AppliedTargets(state)
-            next_command = next_status = next_feedback = now()
+            next_control = now()
+            next_feedback,next_status = next_control+.04,next_control+.2
             current_axis, barrier, barrier_count, barrier_zero_tick = None, None, 0, None
+            pending = desired = terminal = None
+            last_send = last_pair = None
+            last_starts = {}
             while True:
                 health()
                 at = now()
-                if at >= next_command:
-                    command = controller.tick(Pose(latest["x"], latest["y"], latest["yaw"]), at)
+                # Acquisition owns every returned sample; no raw/latest mailbox
+                # sits before MCU-time integration. Only control intents coalesce.
+                if pending is not None:
+                    packet = client.poll_exchange(pending['ticket']['id'])
+                    if packet is not None:
+                        kind = pending['ticket']['kind']
+                        row = record(kind,packet)
+                        if kind == 7:
+                            target = pending['target']  # Immutable send-time intent.
+                            if packet['last_rx_seq'] != packet['sequence'] or packet['state'] not in (5,10):
+                                raise BaseFault('SETPOINT acceptance/state mismatch')
+                            applied.register(packet['sequence'],target['left_rpm'],target['right_rpm'],row['completed_monotonic_s'])
+                            applied.observe(packet,row['completed_monotonic_s'])
+                            row['quantized_command'] = dict(target)
+                            row['control_pose'] = dict(pending['control_pose'])
+                            row['control_tick_monotonic_s'] = pending['control_time']
+                            intents.append(dict(phase=pending['command'].phase,reason=pending['command'].reason,**target))
+                            if pending['barrier'] is not None and barrier == pending['barrier'] and barrier_zero_tick is None:
+                                barrier_zero_tick = packet['tick_ms']
+                            if pending['intended'] is not None and pending['barrier'] is None:
+                                current_axis = pending['intended']
+                        elif kind == 5:
+                            sample = feedback(packet,row)
+                            if sample is not None:
+                                control_metrics['feedback_distinct'] += 1
+                            if (sample is not None and barrier is not None and barrier_zero_tick is not None
+                                    and all(0 < (sample[k]-barrier_zero_tick)&0xffffffff < 0x80000000
+                                            for k in ('sample_tick_ms','left_tick_ms','right_tick_ms','speed_tick_ms'))):
+                                if max(abs(sample['speed_left_rpm']),abs(sample['speed_right_rpm'])) <= .2:
+                                    barrier_count += 1
+                                    if barrier_count >= 5:
+                                        current_axis,barrier = barrier,None
+                                else:
+                                    barrier_count = 0
+                        else:
+                            applied.observe(packet,row['completed_monotonic_s'])
+                        pending = None
+                        if terminal is not None:
+                            result['normal_quiesce']['complete'] = True
+                            result['normal_quiesce']['completed_monotonic_s'] = now()
+                at = now()
+                if terminal is None and at >= next_control:
+                    pose = history.latest(at,max_age=.75)
+                    command = controller.tick(Pose(pose['x'],pose['y'],pose['yaw']),at)
+                    control_metrics['skipped_control_ticks'] += int((at-next_control)/.05)
+                    control_metrics['control_ticks'] += 1
+                    if pending is not None:
+                        control_metrics['control_ticks_while_inflight'] += 1
+                    if len(control_updates) >= 5000:
+                        raise BaseFault('Bounded control evidence exhausted')
+                    if control_updates:
+                        control_metrics['max_control_interval_s'] = max(control_metrics['max_control_interval_s'],
+                            at-control_updates[-1]['monotonic_s'])
+                    control_metrics['max_control_sample_age_s'] = max(control_metrics['max_control_sample_age_s'],
+                        at-pose['source_monotonic_s'])
+                    control_updates.append(dict(monotonic_s=at,source_monotonic_s=pose['source_monotonic_s'],
+                        measurement_monotonic_s=pose['measurement_monotonic_s'],sample_sequence=pose['sample_sequence'],
+                        x=pose['x'],y=pose['y'],yaw=pose['yaw'],phase=command.phase,reason=command.reason,
+                        linear_m_s=command.linear_m_s,angular_rad_s=command.angular_rad_s))
+                    next_control = at+.05  # Never replay a queue of missed control ticks.
                     if command.phase == "fault":
                         raise BaseFault("Controller fault: "+command.reason)
                     if command.phase == "stop" and command.reason in ("arrived", "cancelled"):
                         result["termination_reason"] = command.reason
                         result["motion_complete"] = command.reason == "arrived"
+                        terminal = command
+                        if command.reason == 'cancelled':
+                            break
+                        result['normal_quiesce'] = dict(pending=None if pending is None else pending['ticket'],
+                            started_monotonic_s=at,complete=pending is None,queries_started=0,
+                            deadline_basis='original_Client_transaction_only')
+                        if pending is None:
+                            result['normal_quiesce']['completed_monotonic_s'] = at
+                    else:
+                        phase = command.phase
+                        target = quantize(command,cfg)
+                        intended = command.phase if target['left_rpm'] or target['right_rpm'] else None
+                        if intended and current_axis is not None and intended != current_axis and barrier is None:
+                            barrier,barrier_count,barrier_zero_tick = intended,0,None
+                        scan_phase = 'turn' if 'turn' in (current_axis,intended,barrier) else command.phase
+                        desired = dict(command=command,target=target,intended=intended,control_time=at,control_pose=pose)
+                if terminal is not None:
+                    if pending is None:
                         break
-                    phase = command.phase
-                    scan_phase = command.phase
-                    target = quantize(command, cfg)
-                    intended = command.phase if target["left_rpm"] or target["right_rpm"] else None
-                    if intended and current_axis is not None and intended != current_axis and barrier is None:
-                        barrier, barrier_count, barrier_zero_tick = intended, 0, None
-                    if barrier is not None:
-                        target = dict(target, left_rpm=0, right_rpm=0, linear_m_s=0., angular_rad_s=0.)
-                    health()
-                    note = dict(target=(target["left_rpm"], target["right_rpm"], client.session),
-                        command_source=at, feedback_source=source.source,
-                        scan_source=last_scan["source_monotonic_s"], lease_deadline=lease_deadline)
-                    port.permit = note
-                    packet, row = exchange(7, target["left_rpm"], target["right_rpm"], session=client.session)
-                    if packet["last_rx_seq"] != packet["sequence"] or packet["state"] not in (5, 10):
-                        raise BaseFault("SETPOINT acceptance/state mismatch")
-                    # ACK may already report this target applied, or a previous
-                    # known target. Acceptance alone never advances application.
-                    applied.register(packet["sequence"],target["left_rpm"],target["right_rpm"],
-                                     row["completed_monotonic_s"])
-                    applied.observe(packet,row["completed_monotonic_s"])
-                    row["quantized_command"] = dict(target)
-                    if barrier is not None and barrier_zero_tick is None:
-                        barrier_zero_tick = packet["tick_ms"]
-                    intents.append(dict(phase=command.phase, reason=command.reason, **target))
-                    lease_deadline = row["request_start_monotonic_s"]+.5
-                    if barrier is None and intended:
-                        current_axis = intended
-                    next_command = row["request_start_monotonic_s"]+.05
-                elif at >= next_feedback and (at < next_status or next_feedback < next_status):
-                    packet, row = exchange(5)
-                    sample = feedback(packet, row)
-                    if (sample is not None and barrier is not None and barrier_zero_tick is not None
-                            and all(0 < (sample[k]-barrier_zero_tick) & 0xffffffff < 0x80000000
-                                    for k in ("sample_tick_ms", "left_tick_ms", "right_tick_ms", "speed_tick_ms"))):
-                        if max(abs(sample["speed_left_rpm"]), abs(sample["speed_right_rpm"])) <= .2:
-                            barrier_count += 1
-                            if barrier_count >= 5:
-                                current_axis, barrier = barrier, None
-                        else:
-                            barrier_count = 0
-                    next_feedback = at+.02
-                elif at >= next_status:
-                    packet, row = exchange(2)
-                    if packet["state"] not in (5, 10):
-                        raise BaseFault("Motion STATUS lost READY/RUNNING state")
-                    applied.observe(packet,row["completed_monotonic_s"])
-                    next_status = at+.1
-                else:
                     sleep(.001)
+                    continue
+                if pending is None:
+                    at = now()
+                    # A control tick may have changed desired while the prior
+                    # target ACK was in flight. Recheck at the physical send
+                    # boundary, using axes already sent (possibly applied).
+                    if (desired is not None and desired['intended'] is not None and current_axis is not None
+                            and desired['intended'] != current_axis and barrier is None):
+                        barrier,barrier_count,barrier_zero_tick=desired['intended'],0,None
+                    if desired is not None:
+                        scan_phase='turn' if 'turn' in (current_axis,desired['intended'],barrier) else desired['command'].phase
+                    target = None if desired is None else dict(desired['target'])
+                    if target is not None and barrier is not None:
+                        target.update(left_rpm=0,right_rpm=0,linear_m_s=0.,angular_rad_s=0.)
+                    pair = None if target is None else (target['left_rpm'],target['right_rpm'])
+                    send_due = (at if last_send is None else last_send+(.05 if pair != last_pair else .1))
+                    due = []
+                    if target is not None and at >= send_due:
+                        due.append((send_due,7))
+                    if at >= next_feedback:
+                        due.append((next_feedback,5))
+                    if at >= next_status:
+                        due.append((next_status,2))
+                    if due:
+                        _,kind = min(due)
+                        health()
+                        if kind == 7:
+                            port.permit = dict(target=(pair[0],pair[1],client.session),
+                                command_source=desired['control_time'],feedback_source=source.source,
+                                scan_source=last_scan['source_monotonic_s'],lease_deadline=lease_deadline)
+                            ticket = client.begin_exchange(7,pair[0],pair[1],session=client.session)
+                            pending = dict(desired,ticket=ticket,target=target,barrier=barrier)
+                            if desired['intended'] is not None and barrier is None:
+                                # Full write can take effect before its ACK.
+                                # Retain this axis for clearance and transitions.
+                                current_axis=desired['intended']
+                            last_send,last_pair = ticket['started_monotonic_s'],pair
+                            lease_deadline = last_send+.5
+                        else:
+                            ticket = client.begin_exchange(kind)
+                            pending = dict(ticket=ticket)
+                            if kind == 5:
+                                next_feedback = ticket['started_monotonic_s']+.04
+                            else:
+                                next_status = ticket['started_monotonic_s']+.2
+                        gap_key={2:'max_status_request_gap_s',5:'max_feedback_request_gap_s',7:'max_setpoint_request_gap_s'}[kind]
+                        if kind in last_starts:
+                            control_metrics[gap_key] = max(control_metrics[gap_key],ticket['started_monotonic_s']-last_starts[kind])
+                        last_starts[kind] = ticket['started_monotonic_s']
+                        count_key={2:'status_requests',5:'feedback_requests',7:'setpoint_requests'}[kind]
+                        control_metrics[count_key] += 1
+                        control_metrics['max_inflight_transactions'] = 1
                 applied.check_deadline(now())
+                sleep(.001)
     except BaseException as exc:
         fail(exc, phase)
     finally:
@@ -610,6 +746,12 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         result.update(rows=rows, raw_events=port.events, command_intents=intents,
             query_counts=dict(port.attempts), complete_write_counts=dict(port.complete_writes),
             elapsed_s=clock()-began, latest_odometry=latest, arm_count=port.arm_count)
+        result.update(history=history.summary(),controller_updates=control_updates,control_metrics=control_metrics)
+        result['history_timebase'] = dict(method='origin_first_source_plus_MCU_speed_tick_modular_delta',
+            freshness_clock='unmodified_source_monotonic_s',anchors=measurement_anchors,
+            interpolation_used_by_controller=False,missing_motion_recovered=False)
+        result['odometry_continuity_validated'] = bool(result['origin'] and odometry_failure is None
+            and not (result.get('final_stop_chain') or {}).get('parking_position_error'))
         result["session_complete"] = bool(not result["first_failure"] and result["origin"]
             and (not execute or result["motion_complete"] and result["final_stop_chain"]["complete"]))
     return result

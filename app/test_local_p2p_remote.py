@@ -141,6 +141,30 @@ class RemoteTests(unittest.TestCase):
         for text in ('{"op":"probe","op":"start"}','{"goal":NaN}','{"goal":Infinity}'):
             with self.assertRaises(ValueError):remote.strict_json(text)
 
+    def test_corrupt_evidence_never_certifies_success_or_blocks_active_cancel(self):
+        self.service.handle(self.request())
+        output=self.directory/'jobs'/TASK/'run';output.mkdir()
+        for text in ('', '{"session_complete":', '[]', '{"value":NaN}'):
+            with self.subTest(text=text):
+                (output/'result.json').write_text(text)
+                (output/'live_status.json').write_text('')
+                status=self.service.handle(dict(op='poll',task_id=TASK))
+                self.assertTrue(status['active'])
+                self.assertIsNone(status['result'])
+                self.assertEqual(len(status['evidence_errors']),2)
+                self.assertFalse(status['terminal_without_result'])
+                self.assertTrue(self.service.handle(dict(op='cancel',task_id=TASK))['cancel_requested'])
+        self.identity=None
+        status=self.service.handle(dict(op='poll',task_id=TASK))
+        self.assertTrue(status['terminal_without_result'])
+        self.assertIsNone(status['result'])
+        # Corrupt ownership metadata still blocks new owners rather than being
+        # treated like an unavailable optional result.
+        (self.directory/'jobs'/TASK/'job.json').write_text('')
+        with self.assertRaises(ValueError):
+            self.service.handle(self.request(request_id=TASK2))
+        self.assertEqual(len(self.starts),1)
+
     def test_stdio_returns_one_json_per_request_and_never_prints_child_output(self):
         incoming=io.StringIO('{"op":"probe"}\n{"op":"unknown"}\n')
         outgoing=io.StringIO()

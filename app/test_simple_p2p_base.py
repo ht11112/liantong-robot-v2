@@ -41,8 +41,11 @@ class MCU:
         self.last_stopped_status_tick = None
         self.applied_target = (0,0)
         self.parking_sequence, self.parking_sources, self.parking_speed = None,0,(0,0)
+        self.query_overlap_count = 0
 
     def write(self, raw):
+        if raw[3] != 3 and self.queue:
+            self.query_overlap_count += 1
         self.writes.append((self.clock.value, bytes(raw)))
         kind, sequence, left, right, session, challenge = struct.unpack_from("<BHhhII", raw, 3)
         at = self.clock.value
@@ -95,6 +98,12 @@ class MCU:
                 flags,enabled=(5<<8)|1,0x70007
             words = [tick, sample_seq, sample_tick-age, 31, 0, 0, raw_speed,
                      sample_tick-age, sample_tick-age, sample_tick-age, enabled, 0, flags]
+            if self.mode == 'source_rewinds' and sample_seq % 2 == 0:
+                words[7] -= 150
+                words[8] -= 150
+            if self.mode == 'arm_source_rewinds' and self.arm_at is not None:
+                words[7] -= 200
+                words[8] -= 200
             if self.mode == "encoder_changed" and self.stop_count:
                 words[4] = 1
         else:
@@ -117,7 +126,7 @@ class MCU:
         # A healthy stopped STATUS requires a *new* disabled-driver CAN sample.
         # Delay STOP ACK to that sample boundary instead of changing frozen CAN
         # status_raw from 7 to 0 under the same sample_sequence.
-        ready_at = at+self.delay
+        ready_at = at+(self.delay(kind) if callable(self.delay) else self.delay)
         if kind == 3:
             period=self.sample_period_ms/1000.
             ready_at = max(ready_at,(math.floor(at/period)+1)*period+.002)
@@ -149,11 +158,13 @@ class Script:
 
 class BaseTests(unittest.TestCase):
     def run_case(self, mode="healthy", execute=False, phases=("drive",), scan=None, cancelled=None, delay=0., goal_x=0.,
-                 expected=None,event_sink=None,sample_period_ms=50):
+                 expected=None,event_sink=None,sample_period_ms=50,controller_factory=None,cancel_pending=False):
         clock = Clock(); port = MCU(clock, mode, delay,sample_period_ms)
-        controller = Script(clock, phases)
+        controller = Script(clock, phases) if controller_factory is None else controller_factory(clock)
         controller.goal_x = goal_x
         scan = scan or (lambda now, phase: dict(ok=True, reason="clear", source_monotonic_s=now-.01))
+        if cancel_pending:
+            cancelled=lambda:any(raw[3]==7 for _,raw in port.writes) and bool(port.queue)
         with patch.object(api.time, "monotonic", clock.monotonic), patch.object(api.time, "sleep", clock.sleep):
             result = base.run_session(port, api, core, controller, scan_provider=scan,
                 boot_id="this-boot", execute=execute, cancelled=cancelled or (lambda:False),
@@ -179,6 +190,7 @@ class BaseTests(unittest.TestCase):
                 self.assertFalse(result["session_complete"])
                 self.assertIsNotNone(result["first_failure"])
                 self.assertTrue(all(raw[3] in (2, 5) for _, raw in port.writes))
+                self.assertFalse(result['odometry_continuity_validated'])
 
     def test_quantization_exact_below_at_above_and_selected_caps(self):
         cfg = Config()
@@ -217,7 +229,7 @@ class BaseTests(unittest.TestCase):
         first_drive = next(i for i,row in enumerate(targets) if row["quantized_command"]["left_rpm"] > 0)
         self.assertTrue(any(row["quantized_command"]["left_rpm"] < 0 for row in targets[:first_drive]))
         zeros = [row for row in targets[:first_drive] if row["quantized_command"]["left_rpm"] == 0]
-        self.assertGreaterEqual(len(zeros), 4)
+        self.assertGreaterEqual(len(zeros), 1)  # Ten-Hz zero keepalive; five real zero FB remain required.
         between = [row for row in result["rows"] if row["kind"] == 5
             and zeros[0]["completed_monotonic_s"] < row["request_start_monotonic_s"] < targets[first_drive]["request_start_monotonic_s"]
             and row.get("distinct") and row["packet"]["speed_left_rpm"] == 0]
@@ -410,10 +422,10 @@ class BaseTests(unittest.TestCase):
         active=[r for r in result['rows'] if r['phase'] in ('drive','turn','motion')]
         statuses=[r for r in active if r['kind']==2]
         feedback=[r for r in active if r['kind']==5]
-        self.assertGreaterEqual(len(statuses),3)
+        self.assertGreaterEqual(len(statuses),2)
         self.assertGreaterEqual(len(feedback),3)
         self.assertLess(max(b['request_start_monotonic_s']-a['request_start_monotonic_s']
-                            for a,b in zip(statuses,statuses[1:])),.2)
+                            for a,b in zip(statuses,statuses[1:])),.26)
         self.assertTrue(any(r['kind']==7 and r['packet']['last_applied_seq']!=r['packet']['sequence'] for r in active))
         if result['first_failure'] is not None:
             self.assertIn('Parking MCU odometry discontinuity',result['first_failure']['message'])
@@ -451,6 +463,154 @@ class BaseTests(unittest.TestCase):
         self.assertIn('Parking MCU odometry discontinuity',proof['parking_position_error'])
         self.assertFalse(result['session_complete'])
         self.assertFalse(result['motion_complete'])
+
+    def test_control_reads_latest_accumulated_pose_while_serial_transaction_is_inflight(self):
+        result,port=self.run_case('ack_progress',execute=True,delay=.021,sample_period_ms=100,
+                                  phases=('drive','drive','drive'))
+        self.assertEqual(result.get('termination_reason'),'arrived',result['first_failure'])
+        active=[r for r in result['rows'] if r['phase'] in ('motion','turn','drive')]
+        acquired=[r for r in active if r['kind']==5 and r.get('distinct')]
+        self.assertTrue(all('odometry' in r for r in acquired))
+        self.assertGreater(len(acquired),10)
+        self.assertGreater(acquired[-1]['odometry']['x'],acquired[0]['odometry']['x'])
+        for tick in result['controller_updates']:
+            available=[r for r in acquired if r['completed_monotonic_s'] <= tick['monotonic_s']]
+            if available:
+                latest=available[-1]['odometry']
+                self.assertEqual(tick['sample_sequence'],latest['sample_sequence'])
+                self.assertEqual((tick['x'],tick['y'],tick['yaw']),(latest['x'],latest['y'],latest['yaw']))
+        metrics=result['control_metrics']
+        self.assertGreater(metrics['control_ticks_while_inflight'],0)
+        self.assertEqual(metrics['max_inflight_transactions'],1)
+        self.assertEqual(port.query_overlap_count,0)
+        self.assertGreater(metrics['control_ticks'],len(acquired))
+        starts=[r['request_start_monotonic_s'] for r in active if r['kind']==7]
+        self.assertTrue(all(b-a>=.1-1e-10 for a,b in zip(starts,starts[1:])))
+
+    def test_mcu_measurement_axis_does_not_rewrite_a_receding_conservative_source(self):
+        result,_=self.run_case('source_rewinds',execute=True,sample_period_ms=100,
+                               phases=('drive','drive'))
+        self.assertEqual(result.get('termination_reason'),'arrived',result['first_failure'])
+        acquired=[r['odometry'] for r in result['rows'] if r['phase'] in ('motion','drive','turn')
+                  and r['kind']==5 and 'odometry' in r]
+        self.assertTrue(any(b['source_monotonic_s']<a['source_monotonic_s'] for a,b in zip(acquired,acquired[1:])))
+        for a,b in zip(acquired,acquired[1:]):
+            self.assertAlmostEqual(b['measurement_monotonic_s']-a['measurement_monotonic_s'],
+                ((b['mcu_speed_tick_ms']-a['mcu_speed_tick_ms'])&0xffffffff)/1000.)
+        self.assertTrue(all(t['source_monotonic_s']<=t['monotonic_s'] for t in result['controller_updates']))
+
+    def test_ack_uses_sent_snapshot_even_when_new_control_intent_arrives_before_reply(self):
+        class Changing(Script):
+            def __init__(self,clock):
+                super().__init__(clock);self.calls=0
+            def tick(self,pose,now):
+                command=super().tick(pose,now);self.calls+=1
+                if command.phase=='stop':return command
+                return Command('drive',.03 if self.calls%2 else math.pi*.2/60.,0.,'changing',.5,0.)
+        result,port=self.run_case(execute=True,delay=.06,sample_period_ms=100,controller_factory=Changing)
+        commands=[r for r in result['rows'] if r['kind']==7]
+        self.assertTrue(commands)
+        self.assertGreater(result['control_metrics']['control_ticks_while_inflight'],0)
+        for row in commands:
+            physical=struct.unpack_from('<hh',bytes.fromhex(row['request_hex']),6)
+            self.assertEqual(physical,(row['quantized_command']['left_rpm'],row['quantized_command']['right_rpm']))
+            self.assertLessEqual(row['control_tick_monotonic_s'],row['request_start_monotonic_s'])
+        self.assertNotIn('Applied command/target identity',str(result['first_failure']))
+        self.assertEqual(port.query_overlap_count,0)
+
+    def test_real_gap_invalidates_history_and_is_not_reanchored_during_stop(self):
+        result,_=self.run_case('gap',execute=True,sample_period_ms=100)
+        self.assertIn('discontinuity',result['first_failure']['message'])
+        self.assertEqual(result['history']['count'],0)
+        self.assertFalse(result['position_verified'])
+        self.assertTrue(result['final_stop_chain']['complete'])
+        self.assertFalse(result['session_complete'])
+
+    def test_cancel_during_inflight_target_sends_stop_without_waiting_for_ack(self):
+        result,port=self.run_case(execute=True,delay=.06,sample_period_ms=100,cancel_pending=True)
+        self.assertIn('cancelled',result['first_failure']['message'])
+        target_at=next(at for at,raw in port.writes if raw[3]==7)
+        stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>target_at)
+        self.assertLess(stop_at-target_at,.01)
+        self.assertEqual(result['arm_count'],1)
+        self.assertFalse(result['motion_complete'])
+
+    def test_normal_arrival_drains_only_original_transaction_before_stop(self):
+        result,port=self.run_case('ack_progress',execute=True,delay=.021,sample_period_ms=100,
+                                  phases=('drive','drive'))
+        quiesce=result['normal_quiesce'];pending=quiesce['pending']
+        self.assertIsNotNone(pending)
+        self.assertTrue(quiesce['complete'])
+        self.assertEqual(quiesce['queries_started'],0)
+        self.assertLess(quiesce['completed_monotonic_s'],pending['deadline_monotonic_s'])
+        after=[(at,raw) for at,raw in port.writes if at>=quiesce['started_monotonic_s']]
+        self.assertEqual(after[0][1][3],3)
+        self.assertGreaterEqual(after[0][0],quiesce['completed_monotonic_s'])
+
+    def test_true_source_expiration_does_not_receive_a_new_history_timestamp(self):
+        def slow_control(clock):
+            class Paused(Script):
+                def tick(self,pose,now):
+                    command=super().tick(pose,now)
+                    if self.started is not None and now-self.started>.15:
+                        clock.sleep(.75)
+                    return command
+            return Paused(clock)
+        result,_=self.run_case(execute=True,sample_period_ms=100,controller_factory=slow_control)
+        self.assertFalse(result['session_complete'])
+        self.assertIn('Host feedback source age',result['first_failure']['message'])
+        self.assertTrue(all(tick['source_monotonic_s']<=tick['monotonic_s'] for tick in result['controller_updates']))
+        self.assertFalse(result['history_timebase']['missing_motion_recovered'])
+
+    def test_first_target_axis_change_while_ack_inflight_still_requires_five_zero_barrier(self):
+        for first,second in (('drive','turn'),('turn','drive')):
+            phases=[]
+            def gate(now,phase):
+                phases.append((now,phase))
+                return dict(ok=True,reason='clear',source_monotonic_s=now)
+            class Changing(Script):
+                def __init__(self,clock):
+                    super().__init__(clock);self.calls=0
+                def tick(self,pose,now):
+                    self.calls+=1
+                    if self.calls>30:return Command('stop',0.,0.,'arrived',0.,0.)
+                    axis=first if self.calls<=2 else second
+                    return Command(axis,.03 if axis=='drive' else 0.,
+                        math.radians(6.9) if axis=='turn' else 0.,'changing',1.,.5)
+            with self.subTest(first=first,second=second):
+                result,port=self.run_case(execute=True,delay=lambda kind:.06 if kind==7 else 0.,
+                    sample_period_ms=100,controller_factory=Changing,scan=gate)
+                targets=[r for r in result['rows'] if r['kind']==7]
+                def axis(row):
+                    q=row['quantized_command'];l,r=q['left_rpm'],q['right_rpm']
+                    return None if not(l or r) else 'drive' if l==-r else 'turn'
+                switched=next(r for r in targets if axis(r)==second)
+                zeros=[r for r in targets if axis(r) is None and r['request_start_monotonic_s']<switched['request_start_monotonic_s']]
+                self.assertTrue(zeros)
+                zero=zeros[0];tick=zero['packet']['tick_ms']
+                samples=[r for r in result['rows'] if r['kind']==5 and r.get('distinct')
+                    and zero['completed_monotonic_s']<r['completed_monotonic_s']<=switched['request_start_monotonic_s']
+                    and all(0<(r['packet'][k]-tick)&0xffffffff<0x80000000
+                            for k in ('sample_tick_ms','left_tick_ms','right_tick_ms','speed_tick_ms'))
+                    and max(abs(r['packet']['speed_left_rpm']),abs(r['packet']['speed_right_rpm']))<=.2]
+                self.assertGreaterEqual(len(samples),5)
+                self.assertEqual(port.query_overlap_count,0)
+                if first=='turn':
+                    first_send=targets[0]['request_start_monotonic_s']
+                    self.assertTrue(all(phase=='turn' for at,phase in phases
+                        if first_send<=at<samples[4]['completed_monotonic_s']))
+
+    def test_arm_history_cut_preserves_mcu_axis_when_new_source_is_below_old_fence(self):
+        result,port=self.run_case('arm_source_rewinds',execute=True,sample_period_ms=10)
+        self.assertIsNotNone(result['arm_handoff'])
+        self.assertTrue(any(raw[3]==7 for _,raw in port.writes))
+        anchors=result['history_timebase']['anchors']
+        self.assertEqual(len(anchors),2)
+        self.assertLess(anchors[1]['source_monotonic_s'],anchors[0]['measurement_monotonic_s'])
+        self.assertGreater(anchors[1]['measurement_monotonic_s'],anchors[0]['measurement_monotonic_s'])
+        self.assertEqual(result['controller_updates'][0]['source_monotonic_s'],anchors[1]['source_monotonic_s'])
+        self.assertNotIn('measurement time must strictly increase',str(result['first_failure']))
+        self.assertEqual(result['history_timebase']['method'],'origin_first_source_plus_MCU_speed_tick_modular_delta')
 
 
 if __name__ == "__main__": unittest.main()

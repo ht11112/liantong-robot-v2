@@ -19,6 +19,24 @@ DEFAULT_CONFIG = (HERE / 'config' / 'simple-p2p.json' if (HERE / 'config' / 'sim
                   else HERE.parent / 'config' / 'simple-p2p.json')
 
 
+def durable_json(path, value):
+    """Complete atomic snapshot. Call only off the serial/control thread."""
+    path = Path(path)
+    raw = json.dumps(value, indent=2, allow_nan=False)
+    temporary = path.with_name(path.name+'.durable-tmp')
+    with temporary.open('w', encoding='utf-8', newline='\n') as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(str(temporary), str(path))
+    if os.name != 'nt' and hasattr(os, 'O_DIRECTORY'):
+        descriptor = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 class LiveStatusWriter:
     """One latest RAM slot; only its worker touches disk, at most twice/sec."""
     def __init__(self, path, boot_id, clock=time.monotonic):
@@ -26,6 +44,7 @@ class LiveStatusWriter:
         self.lock, self.done = threading.Lock(), threading.Event()
         self.latest = dict(schema='simple-p2p-live-v1', boot_id=boot_id, phase='starting',
             pose=None, raw_packet=None, source_monotonic_s=None, finished=False,
+            pose_source_monotonic_s=None, pose_measurement_monotonic_s=None,
             position_verified=False)
         self.error = None
         self.thread = threading.Thread(target=self._run, name='live-status-writer', daemon=True)
@@ -37,7 +56,14 @@ class LiveStatusWriter:
             self.latest['event_monotonic_s'] = event['event_monotonic_s']
             if event['source_monotonic_s'] is not None:
                 self.latest.update(source_monotonic_s=event['source_monotonic_s'],
-                    raw_packet=event['raw_packet'], pose=event['pose'])
+                    raw_packet=event['raw_packet'])
+                if event['pose'] is not None:
+                    self.latest.update(pose=dict(event['pose']),
+                        pose_source_monotonic_s=event['source_monotonic_s'],
+                        pose_measurement_monotonic_s=event.get('measurement_monotonic_s'))
+            for key in ('history_summary', 'control_summary'):
+                if isinstance(event.get(key), dict):
+                    self.latest[key] = dict(event[key])
             if event['event'] == 'origin':
                 self.latest['origin'] = dict(pose=event['pose'], raw_packet=event['raw_packet'],
                     source_monotonic_s=event['source_monotonic_s'])
@@ -46,9 +72,7 @@ class LiveStatusWriter:
         with self.lock:
             snapshot = dict(self.latest)
         snapshot['written_monotonic_s'] = self.clock()  # Distinct from original source.
-        temporary = self.path.with_name(self.path.name+'.writer-tmp')
-        temporary.write_text(json.dumps(snapshot, allow_nan=False), encoding='utf-8')
-        os.replace(str(temporary), str(self.path))
+        durable_json(self.path, snapshot)
 
     def _run(self):
         try:
@@ -81,6 +105,8 @@ class LiveStatusWriter:
                 self.latest['raw_packet'] = packet
             if result.get('position_verified') and pose is not None:
                 self.latest['pose'] = {key:pose[key] for key in ('x','y','yaw')}
+                self.latest['pose_source_monotonic_s'] = pose.get('source_monotonic_s')
+                self.latest['pose_measurement_monotonic_s'] = pose.get('measurement_monotonic_s')
         try:
             self._write()
         except BaseException as exc:
@@ -313,11 +339,9 @@ def main(argv=None):
                   turn_area_operator_checked=args.turn_area_clear,
                   origin_valid_only_for_this_process=True, old_map_loaded=False, amcl_started=False)
     # All serial work has ended before filesystem serialization.
-    result_tmp = args.output_dir/'result.json.tmp'
-    result_tmp.write_text(json.dumps(result, indent=2, allow_nan=False), encoding='utf-8')
-    os.replace(str(result_tmp),str(args.output_dir/'result.json'))
+    durable_json(args.output_dir/'result.json', result)
     if result.get('origin') is not None:
-        (args.output_dir/'origin.json').write_text(json.dumps(result['origin'], indent=2, allow_nan=False), encoding='utf-8')
+        durable_json(args.output_dir/'origin.json', result['origin'])
     print(json.dumps({key: result.get(key) for key in ('schema', 'motion_requested', 'session_complete',
           'motion_complete', 'first_failure', 'origin', 'final_stop_chain', 'exclusive_port_closed_normally')},
           allow_nan=False))
