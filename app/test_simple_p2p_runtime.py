@@ -177,6 +177,28 @@ class ScanGateTests(unittest.TestCase):
                 durable_json(path,dict(invalid=float('nan')))
             self.assertEqual(json.loads(path.read_text(encoding='utf-8')),dict(complete=True))
 
+    def test_final_encoder_hold_keeps_sealed_pose_time_separate_from_stop_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer=LiveStatusWriter(Path(directory)/'live.json','boot',clock=lambda:12.)
+            writer.submit(dict(event='odometry',phase='arrival_settling',event_monotonic_s=10.,
+                source_monotonic_s=9.9,measurement_monotonic_s=9.95,
+                raw_packet=dict(sample_sequence=1),pose=dict(x=.5,y=0.,yaw=0.)))
+            final_packet=dict(sample_sequence=9,position_left_raw=100,position_right_raw=200)
+            writer.submit(dict(event='odometry',phase='final_stop',event_monotonic_s=11.,
+                source_monotonic_s=10.9,raw_packet=final_packet,pose=None))
+            writer.start()
+            self.assertTrue(writer.close(dict(session_complete=True,position_verified=True,
+                latest_odometry=dict(x=.5,y=0.,yaw=0.,source_monotonic_s=9.9,measurement_monotonic_s=9.95),
+                position_verification=dict(method='preSTOP_measured_zero_plus_unchanged_encoders'),
+                final_stop_chain=dict(complete=True,zero_samples=[final_packet]))))
+            state=json.loads(writer.path.read_text(encoding='utf-8'))
+            self.assertTrue(state['position_verified'])
+            self.assertEqual(state['raw_packet']['sample_sequence'],9)
+            self.assertEqual(state['source_monotonic_s'],10.9)
+            self.assertEqual(state['pose_source_monotonic_s'],9.9)
+            self.assertEqual(state['pose_measurement_monotonic_s'],9.95)
+            self.assertEqual(state['pose']['x'],.5)
+
 
 if __name__ == '__main__':
     unittest.main()

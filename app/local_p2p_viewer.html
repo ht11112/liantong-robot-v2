@@ -188,7 +188,7 @@
       const sourceAge=model.state && model.state.odometry_age_s, sourceLabel=$('odom-source-age');
       sourceLabel.textContent=finite(sourceAge) && sourceAge >= 0 ? sourceAge.toFixed(3)+' s'+(sourceAge >= .75 ? ' · 快照源' : '') : '待来源';
       sourceLabel.className='pill '+(finite(sourceAge) && sourceAge >= 0 && sourceAge < .75 ? 'good' : 'warn');
-      const labels={idle:'待命',preparing:'准备中',origin:'建立原点',arming:'准备驱动',turn:'原地对准',drive:'等速直行',stopping:'正在停车',stop:'停止',completed:'已完成',cancelled:'已取消',fault:'故障',failed:'失败'};
+      const labels={idle:'待命',preparing:'准备中',origin:'建立原点',arming:'准备驱动',turn:'原地对准',drive:'等速直行',arrival_zero:'到点停稳',stopping:'正在停车',stop:'停止',completed:'已完成',cancelled:'已取消',fault:'故障',failed:'失败'};
       $('task-phase').textContent=t.phase ? labels[t.phase] || String(t.phase) : '待命';
       $('task-phase').className='pill '+(t.first_failure ? 'bad' : t.active ? 'warn' : t.complete ? 'good' : '');
       $('task-id').textContent=t.id == null ? '—' : String(t.id);

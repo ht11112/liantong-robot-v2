@@ -81,7 +81,8 @@ def compact_result(result):
             'motion_complete','position_verified','final_distance_m','query_counts',
             'complete_write_counts','exclusive_port_closed_normally','elapsed_s','arm_count',
             'position_verification','cleanup_errors','live_status_writer_complete',
-            'history','history_timebase','control_metrics','odometry_continuity_validated')
+            'history','history_timebase','control_metrics','odometry_continuity_validated',
+            'motion_odometry_continuity_validated','arrival_zero_seal')
     compact = {key:result.get(key) for key in keys}
     proof = result.get('final_stop_chain') or {}
     samples = proof.get('zero_samples') or []
