@@ -2,7 +2,7 @@
 
 本轮只完成MCU及协议工具，没有打开实车串口、连接RK、刷写或执行实车动作。当前8766服务未响应，历史机器人位置和停车记录未作为本轮现场依据。RK规划、AMCL及网页接入仍是后续范围。
 
-最终统一构建：`python -B mcu/build.py --host-tests --firmware --name release-r1`。五套真实生产C测试包含35个场景，另有9项Python测试，全部通过、无跳过；Python实际消费C编码器生成的金样。保留应用178项回归通过，原12手推来源及9项r5身份保持，Python3.8 AST及GCC的`-Wall -Wextra -Werror`语法检查通过。完整源SHA、工具/SDK身份和输出在生成的`build/release-r1/receipt.json`，不将生成日志或固件提交Git。
+最终统一构建：`python -B mcu/build.py --host-tests --firmware --name release-r2`。五套真实生产C测试包含35个场景，另有9项Python测试，全部通过、无跳过；Python实际消费C编码器生成的金样。保留应用178项回归通过，原12手推来源及9项r5身份保持，Python3.8 AST及GCC的`-Wall -Wextra -Werror`语法检查通过。完整源SHA、工具/SDK身份和输出在生成的`build/release-r2/receipt.json`，不将生成日志或固件提交Git。
 
 生产BIN为**29,292字节**，32,768字节应用区内剩余3,476字节；静态RAM2,204字节，另预留4,096字节栈，余92,004字节。BIN SHA256：`820d0735b2ee43c4add6a1435532c4f9e2e1dab735cb5c9b54a846e50a0cf878`；ELF SHA256：`725b523e2746b6e0444305779ef4571de8172f8804ac765ff3f74948248a7f4b`。生产符号中没有旧mailbox、v9 ARM/SETPOINT或测试入口。
 
