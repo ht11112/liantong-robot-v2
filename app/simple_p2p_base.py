@@ -62,6 +62,41 @@ def finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def scan_policy_snapshot(value):
+    """Copy only bounded evidence; never grant or renew a scan/control permit."""
+    if not isinstance(value,dict):
+        return None
+    truncated = [False]
+    def scalars(mapping, limit):
+        copied = {}
+        for index,(key,item) in enumerate(mapping.items()):
+            if index >= limit:
+                truncated[0] = True
+                break
+            if type(key) is not str or len(key) > 64:
+                truncated[0] = True
+                continue
+            if key == 'filtered_near_examples' and limit == 64 and isinstance(item,(list,tuple)):
+                copied[key] = [scalars(ray,16) for ray in item[:4] if isinstance(ray,dict)]
+                if len(item) > 4 or any(not isinstance(ray,dict) for ray in item[:4]):
+                    truncated[0] = True
+            elif item is None or type(item) is bool or type(item) is int and item.bit_length() <= 64:
+                copied[key] = item
+            elif type(item) is float and math.isfinite(item):
+                copied[key] = item
+            elif type(item) is str:
+                copied[key] = item[:256]
+                if len(item) > 256:
+                    truncated[0] = True
+            else:
+                truncated[0] = True
+        return copied
+    snapshot = scalars(value,64)
+    if truncated[0]:
+        snapshot['base_snapshot_truncated'] = True
+    return snapshot
+
+
 def quantize(command, config):
     """Enumerate integer RPM; never round past either requested axis limit."""
     v, w = command.linear_m_s, command.angular_rad_s
@@ -224,7 +259,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
         geometry=dict(diameter_m=odom.diameter, separation_m=odom.separation),
         host_source_timeout_s=.75, CAN_source_timeout_s=.25, zero_speed_rpm=.2,
         max_setpoint_hz=20, MCU_lease_s=.5, arm_handoff=None, arrival_zero_seal=None,
-        first_scan_rejection=None,
+        first_scan_rejection=None, last_scan_check=None,
         encoder_unchanged_since_origin=True, first_origin_encoder_change=None,
         expected_start_encoders=expected_start_encoders, event_sink_errors=[])
     phase, latest, last_scan, scan_phase = "origin", None, None, None
@@ -282,15 +317,20 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             source.check_age(at)
         if execute:
             last_scan = scan_provider(at, scan_phase or phase)
-            if (not isinstance(last_scan, dict) or last_scan.get("ok") is not True
-                    or not finite(last_scan.get("source_monotonic_s"))
-                    or not 0 <= at-last_scan["source_monotonic_s"] < .75):
+            scan_valid = (isinstance(last_scan,dict) and last_scan.get('ok') is True
+                and finite(last_scan.get('source_monotonic_s'))
+                and 0 <= at-last_scan['source_monotonic_s'] < .75)
+            result['last_scan_check'] = dict(checked_monotonic_s=at,
+                phase=phase,scan_phase=scan_phase or phase,ok=scan_valid,
+                reason=str(last_scan.get('reason','invalid') if isinstance(last_scan,dict) else 'invalid')[:512],
+                source_monotonic_s=(last_scan.get('source_monotonic_s')
+                    if isinstance(last_scan,dict) and finite(last_scan.get('source_monotonic_s')) else None))
+            policy = scan_policy_snapshot(last_scan.get('scan_policy') if isinstance(last_scan,dict) else None)
+            if policy is not None:
+                result['last_scan_check']['scan_policy'] = policy
+            if not scan_valid:
                 if result['first_scan_rejection'] is None:
-                    result['first_scan_rejection'] = dict(checked_monotonic_s=at,
-                        phase=phase,scan_phase=scan_phase or phase,
-                        reason=str(last_scan.get('reason','invalid') if isinstance(last_scan,dict) else 'invalid')[:512],
-                        source_monotonic_s=(last_scan.get('source_monotonic_s')
-                            if isinstance(last_scan,dict) and finite(last_scan.get('source_monotonic_s')) else None))
+                    result['first_scan_rejection'] = copy.deepcopy(result['last_scan_check'])
                     if isinstance(last_scan,dict) and isinstance(last_scan.get('diagnostic'),dict):
                         # The reviewed ScanGate supplies only bounded scalar
                         # metadata, <=8 hits and <=5 neighbours. No serialization

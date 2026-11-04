@@ -160,6 +160,7 @@ class Broker:
         self.odometry_age_at_receipt = None
         self.odometry_reference_mono = None
         self.last_probe = None
+        self.scan_configuration = None
         self.discovery_needed, self.next_inventory = True, 0.
         if self.state_file and self.state_file.is_file():
             saved = json.loads(self.state_file.read_text(encoding="utf-8"))
@@ -188,6 +189,7 @@ class Broker:
                         saved_map=self.map, history=copy.deepcopy(self.history),
                         snapshot_age_s=age, boot_id=self.boot_id,
                         last_probe=copy.deepcopy(self.last_probe),
+                        scan_configuration=copy.deepcopy(self.scan_configuration),
                         odometry_age_s=(None if self.odometry_reference_mono is None else
                                         self.odometry_age_at_receipt+self.clock()-self.odometry_reference_mono),
                         limits=dict(linear_m_s=.03, angular_deg_s=6.9, arrival_m=.1,
@@ -290,6 +292,10 @@ class Broker:
                                  first_scan_rejection=None,
                                  first_failure="RK 已重启，旧任务不能证明当前位姿或停车状态")
             self.boot_id = current_boot
+            settings = inventory.get('navigation_scan_config')
+            minimum = settings.get('min_usable_range_m') if isinstance(settings, dict) else None
+            self.scan_configuration = (copy.deepcopy(settings)
+                if number(minimum) and minimum >= 0 else None)
             if active:
                 if self.task["id"] != active:
                     self.task_start = None

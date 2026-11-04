@@ -235,6 +235,25 @@ class BrokerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Broker(self.remote,self.map,"0"*64,.05)
 
+    def test_scan_minimum_shown_from_current_RK_inventory_without_renewing_odometry(self):
+        original = self.remote.request
+        settings = dict(min_usable_range_m=1.,body_front_m=.175,body_rear_m=.175,body_half_width_m=.2)
+        def configured(payload):
+            result = original(payload)
+            if payload == dict(op='poll'):
+                result['navigation_scan_config'] = settings
+            return result
+        self.remote.request = configured
+        source_time = self.broker.odometry_reference_mono
+        self.broker.discover()
+        self.assertEqual(self.broker.snapshot()['scan_configuration']['min_usable_range_m'],1.)
+        self.assertEqual(self.broker.odometry_reference_mono,source_time)
+        settings['min_usable_range_m']=2.
+        self.assertEqual(self.broker.snapshot()['scan_configuration']['min_usable_range_m'],1.)
+        self.remote.request = original
+        self.broker.discover()
+        self.assertIsNone(self.broker.snapshot()['scan_configuration'])
+
     def test_repeated_disconnect_does_not_increment_an_already_invalid_reference(self):
         self.reset()
         self.broker.invalidate('disconnected')

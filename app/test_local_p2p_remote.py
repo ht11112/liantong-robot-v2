@@ -121,8 +121,10 @@ class RemoteTests(unittest.TestCase):
             diagnostic=dict(schema='simple-p2p-scan-rejection-v1',header_ns=123,
                 hits=[dict(original_index=17,range_m=.15,x_body_m=.18,y_body_m=.14)]))
         pose=dict(x=.39,y=.002,yaw=.01,source_monotonic_s=99.,sample_sequence=3)
+        last_check=dict(checked_monotonic_s=99.2,source_monotonic_s=99.,ok=False,
+            scan_policy=dict(min_usable_range_m=1.,excluded_near_rays=8))
         result=dict(session_complete=False,motion_complete=False,position_verified=False,
-            first_failure=failure,first_scan_rejection=scan,latest_odometry=pose,
+            first_failure=failure,first_scan_rejection=scan,last_scan_check=last_check,latest_odometry=pose,
             final_stop_chain=dict(complete=False,error='Original zero proof failed',
                 position_verified=False,zero_samples=primary),
             final_stop_recovery=dict(complete=True,position_verified=False,zero_samples=newer),
@@ -139,10 +141,30 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(compact['latest_odometry']['source_monotonic_s'],99.)
         self.assertEqual(compact['first_failure'],failure)
         self.assertEqual(compact['first_scan_rejection'],scan)
+        self.assertEqual(compact['last_scan_check'],last_check)
+        self.assertEqual(compact['last_scan_check']['source_monotonic_s'],99.)
         self.assertNotIn('rows',compact)
         self.assertNotIn('raw_events',compact)
         self.assertTrue(compact['full_evidence_retained_on_RK'])
         self.assertEqual(result,unchanged)
+
+    def test_inventory_reports_actual_package_scan_config_without_probe_or_motion(self):
+        actual_obstacle=remote.load_config(remote.DEFAULT_CONFIG)[1]
+        status=self.service.handle(dict(op='poll'))
+        self.assertEqual(status['navigation_scan_config'],actual_obstacle)
+        self.assertEqual(self.probes,[])
+        self.assertEqual(self.starts,[])
+        # The path is this RK module's fixed package config, never a PC-supplied
+        # config or a hardcoded threshold. Returned dictionaries are detached.
+        obstacle=dict(min_usable_range_m=1.25,stop_clearance_m=0.)
+        with patch.object(remote,'load_config',return_value=(None,obstacle)) as loader:
+            status=self.service.handle(dict(op='poll'))
+        loader.assert_called_once_with(remote.DEFAULT_CONFIG)
+        self.assertEqual(status['navigation_scan_config']['min_usable_range_m'],1.25)
+        status['navigation_scan_config']['min_usable_range_m']=99.
+        self.assertEqual(obstacle['min_usable_range_m'],1.25)
+        self.assertEqual(self.probes,[])
+        self.assertEqual(self.starts,[])
 
     def test_compact_recovery_cannot_claim_original_position_or_task_success(self):
         result=dict(session_complete=True,motion_complete=True,position_verified=True,

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from simple_p2p_runtime import DEFAULT_CONFIG, ScanGate, load_config, LiveStatusWriter, durable_json
 
 
-SETTINGS = dict(stop_clearance_m=.2, body_front_m=.2, body_rear_m=.2, body_half_width_m=.25,
+SETTINGS = dict(stop_clearance_m=.2, min_usable_range_m=0., body_front_m=.2, body_rear_m=.2, body_half_width_m=.25,
                 laser_x_m=.13, laser_y_m=0., laser_yaw_rad=0., scan_timeout_s=.75)
 
 
@@ -86,6 +86,158 @@ class ScanGateTests(unittest.TestCase):
         controller, obstacle = load_config(DEFAULT_CONFIG)
         self.assertEqual(controller.max_linear_m_s, .03)
         self.assertEqual(obstacle['stop_clearance_m'], 0.)
+        self.assertEqual(obstacle['min_usable_range_m'], 1.)
+
+    def test_one_metre_floor_preserves_near_returns_as_unknown_without_clearance_claim(self):
+        settings=dict(SETTINGS,min_usable_range_m=1.,stop_clearance_m=0.,
+            body_front_m=.175,body_rear_m=.175,body_half_width_m=.2)
+        gate=ScanGate(settings,turn_area_clear=True)
+        sample=scan()
+        sample.header.frame_id='laser'
+        for index in range(175,181):sample.ranges[index]=.15
+        original_ranges=list(sample.ranges)
+        gate.accept(sample,100100000000,10.)
+        for phase in ('drive','turn'):
+            checked=gate(10.,phase)
+            self.assertTrue(checked['ok'])
+            self.assertIn('unknown',checked['reason'])
+            self.assertIn('clearance not proven',checked['reason'])
+            policy=checked['scan_policy']
+            self.assertEqual(policy['source_range_min_m'],.1)
+            self.assertEqual(policy['configured_min_usable_range_m'],1.)
+            self.assertEqual(policy['effective_min_usable_range_m'],1.)
+            self.assertEqual(policy['source_finite_rays'],181)
+            self.assertEqual(policy['usable_far_rays'],175)
+            self.assertEqual(policy['filtered_near_rays'],6)
+            self.assertEqual(len(policy['filtered_near_examples']),4)
+            self.assertTrue(policy['filtered_near_examples_truncated'])
+            self.assertTrue(policy['near_field_unknown'])
+            self.assertFalse(policy['filtered_near_points_are_clear'])
+            self.assertFalse(policy['coverage_is_complete'])
+            for prefix in ('body_collision','turn_sweep'):
+                self.assertTrue(policy[prefix+'_region_entirely_below_effective_min'])
+            self.assertFalse(policy['body_collision_check_has_possible_range'])
+            self.assertFalse(policy['turn_sweep_check_has_possible_range'])
+            self.assertLess(len(json.dumps(policy,allow_nan=False)),4096)
+        raw_ray=gate.latest['rays'][-1]
+        self.assertEqual(raw_ray[0],180)
+        self.assertEqual(raw_ray[2],.15)
+        self.assertEqual(raw_ray[3],'finite_below_configured_min_range')
+        self.assertAlmostEqual(raw_ray[4],.13)
+        self.assertAlmostEqual(raw_ray[5],.15)
+        self.assertEqual(sample.ranges,original_ranges)
+        self.assertEqual(sample.range_min,.1)
+        policy['filtered_near_examples'][0]['range_m']=999.
+        self.assertEqual(gate(10.,'drive')['scan_policy']['filtered_near_examples'][0]['range_m'],.15)
+
+    def test_exactly_one_metre_remains_collision_eligible_and_diagnostic_keeps_source_lower(self):
+        # A deliberately long footprint makes the retained 1 m boundary ray
+        # collide, so exclusion cannot accidentally make this test pass.
+        settings=dict(SETTINGS,min_usable_range_m=1.,stop_clearance_m=0.,body_front_m=1.13)
+        gate=ScanGate(settings,turn_area_clear=True)
+        gate.accept(scan(obstacle=.999999),100100000000,10.)
+        self.assertTrue(gate(10.,'drive')['ok'])
+        boundary=scan(stamp=101,obstacle=1.)
+        boundary.ranges[89]=.5
+        gate.accept(boundary,101100000000,11.)
+        checked=gate(11.,'drive')
+        self.assertFalse(checked['ok'])
+        diagnostic=checked['diagnostic']
+        self.assertEqual(diagnostic['hits'][0]['original_index'],90)
+        self.assertEqual(diagnostic['hits'][0]['range_m'],1.)
+        self.assertEqual(diagnostic['hits'][0]['range_classification'],'finite_valid')
+        self.assertEqual(diagnostic['scan_geometry']['range_min_m'],.1)
+        self.assertEqual(diagnostic['scan_geometry']['effective_min_usable_range_m'],1.)
+        self.assertEqual(diagnostic['scan_policy'],checked['scan_policy'])
+        near=[r for r in diagnostic['first_hit_neighbors'] if r['original_index']==89][0]
+        self.assertEqual(near['range_m'],.5)
+        self.assertEqual(near['range_classification'],'finite_below_configured_min_range')
+        self.assertTrue(checked['scan_policy']['body_collision_check_has_possible_range'])
+        self.assertFalse(checked['scan_policy']['coverage_is_complete'])
+        json.dumps(checked,allow_nan=False)
+
+    def test_minimum_range_floor_never_hides_invalid_physical_returns(self):
+        gate=ScanGate(dict(SETTINGS,min_usable_range_m=1.),turn_area_clear=True)
+        for stamp,value in enumerate((float('nan'),-math.inf,.099,50.001),start=100):
+            sample=scan(stamp=stamp)
+            sample.ranges[90]=value
+            gate.accept(sample,stamp*1000000000+100000000,float(stamp))
+            checked=gate(float(stamp),'drive')
+            self.assertFalse(checked['ok'])
+            self.assertIn('invalid measured obstacle rays',checked['reason'])
+        physically_bad=scan(stamp=105,obstacle=1.1)
+        physically_bad.range_min=1.2
+        gate.accept(physically_bad,105100000000,15.)
+        self.assertFalse(gate(15.,'drive')['ok'])
+        source_wins=scan(stamp=106,obstacle=1.2)
+        source_wins.range_min=1.2
+        gate.accept(source_wins,106100000000,16.)
+        checked=gate(16.,'drive')
+        self.assertTrue(checked['ok'])
+        self.assertEqual(checked['scan_policy']['effective_min_usable_range_m'],1.2)
+        self.assertEqual(checked['scan_policy']['filtered_near_rays'],0)
+
+    def test_near_returns_do_not_satisfy_ten_usable_points_or_refresh_original_source(self):
+        gate=ScanGate(dict(SETTINGS,min_usable_range_m=1.),turn_area_clear=True)
+        for stamp,count in ((100,0),(101,9),(102,10)):
+            sample=scan(stamp=stamp)
+            sample.ranges=[.2]*181
+            sample.ranges[:count]=[10.]*count
+            gate.accept(sample,stamp*1000000000+100000000,float(stamp))
+            self.assertEqual(gate(float(stamp),'drive')['ok'],count==10)
+        checked=gate(102.,'drive')
+        self.assertEqual(checked['scan_policy']['usable_far_rays'],10)
+        self.assertEqual(checked['scan_policy']['filtered_near_rays'],171)
+        duplicate=scan(stamp=102)
+        gate.accept(duplicate,102100000000,102.6)
+        duplicated=gate(102.6,'drive')
+        self.assertEqual(duplicated['scan_policy']['filtered_near_rays'],171)
+        self.assertAlmostEqual(duplicated['source_monotonic_s'],101.9)
+        expired=gate(102.7,'drive')
+        self.assertFalse(expired['ok'])
+        self.assertEqual(expired['reason'],'original scan source expired')
+        self.assertEqual(expired['scan_policy']['original_header_ns'],102000000000)
+
+    def test_usable_lower_at_or_above_source_upper_rejects_instead_of_claiming_empty_space(self):
+        gate=ScanGate(dict(SETTINGS,min_usable_range_m=1.),turn_area_clear=True)
+        for stamp,upper in ((100,1.),(101,.5)):
+            sample=scan(stamp=stamp)
+            sample.range_max=upper
+            sample.ranges=[.2]*181
+            gate.accept(sample,stamp*1000000000+100000000,float(stamp))
+            checked=gate(float(stamp),'drive')
+            self.assertFalse(checked['ok'])
+            self.assertEqual(checked['reason'],'minimum usable scan range leaves no source range')
+
+    def test_zero_and_legacy_omitted_floor_preserve_body_collision_checks(self):
+        legacy=dict(SETTINGS)
+        legacy.pop('min_usable_range_m')
+        for settings in (legacy,dict(SETTINGS,min_usable_range_m=0.)):
+            gate=ScanGate(settings,turn_area_clear=True)
+            gate.accept(scan(obstacle=.25),100100000000,10.)
+            checked=gate(10.,'drive')
+            self.assertFalse(checked['ok'])
+            self.assertEqual(checked['reason'],'obstacle within body clearance')
+            self.assertEqual(checked['scan_policy']['filtered_near_rays'],0)
+            self.assertEqual(checked['scan_policy']['effective_min_usable_range_m'],.1)
+            self.assertTrue(checked['scan_policy']['body_collision_check_has_possible_range'])
+
+    def test_config_requires_explicit_finite_nonnegative_usable_floor(self):
+        original=json.loads(DEFAULT_CONFIG.read_text(encoding='utf-8'))
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'config.json'
+            missing=json.loads(json.dumps(original))
+            missing['obstacle'].pop('min_usable_range_m')
+            path.write_text(json.dumps(missing),encoding='utf-8')
+            with self.assertRaises(ValueError):load_config(path)
+            for value in (-.1,float('nan'),math.inf,True):
+                changed=json.loads(json.dumps(original))
+                changed['obstacle']['min_usable_range_m']=value
+                path.write_text(json.dumps(changed),encoding='utf-8')
+                with self.subTest(value=value),self.assertRaises(ValueError):load_config(path)
+            original['obstacle']['min_usable_range_m']=0.
+            path.write_text(json.dumps(original),encoding='utf-8')
+            self.assertEqual(load_config(path)[1]['min_usable_range_m'],0.)
 
     def test_zero_extra_margin_allows_outside_rectangle_but_rejects_inside_and_boundary(self):
         gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)

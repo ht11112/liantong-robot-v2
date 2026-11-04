@@ -23,6 +23,7 @@
   <main>
     <div class="page-heading"><div><h1>从当前位置，走向局部目标</h1><p class="subtitle">先将当前车身位置和车头方向设为零点，再选目标。先转向，后直行。</p></div><span class="mode-note">局部坐标 · 不依赖地图定位</span></div>
     <div id="snapshot-banner" class="snapshot" hidden role="status">连接已中断。当前显示最近一次快照，不能代表机器人此刻状态；执行已禁用。</div>
+    <div id="scan-range-notice" class="reference-warning" hidden role="status"></div>
     <div class="layout">
       <section class="main-column" aria-label="局部目标控制">
         <article class="card">
@@ -174,6 +175,11 @@
     }
     function render() {
       const online=Boolean(connected()), r=reference(), p=pose(), t=task(), frozen=!online;
+      const scanSettings=model.state && model.state.scan_configuration;
+      const minimum=scanSettings && scanSettings.min_usable_range_m;
+      const rangeNotice=$('scan-range-notice');
+      rangeNotice.hidden=!(finite(minimum) && minimum>0);
+      rangeNotice.textContent=rangeNotice.hidden ? '' : '导航最小有效距离 '+fmt(minimum,2)+' m；'+fmt(minimum,2)+' m 内不提供测障。此数值不是停车距离。';
       const connection=$('connection-status'); connection.className='pill '+(online ? 'good' : model.lastResponse ? 'bad' : 'warn');
       $('connection-label').textContent=online ? 'RK 已连接' : model.lastResponse ? '连接中断 · 快照' : '等待本地后端';
       $('last-updated').textContent=model.lastResponse ? '页面响应 '+model.lastResponse.toLocaleTimeString('zh-CN',{hour12:false}) : '尚无响应';

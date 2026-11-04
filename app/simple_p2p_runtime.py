@@ -127,14 +127,17 @@ def load_config(path):
     if set(data) != {'controller', 'obstacle'}:
         raise ValueError('Expected controller and obstacle sections only')
     controller = Config(**data['controller'])
-    expected = {'stop_clearance_m', 'body_front_m', 'body_rear_m', 'body_half_width_m',
+    expected = {'stop_clearance_m', 'min_usable_range_m', 'body_front_m', 'body_rear_m', 'body_half_width_m',
                 'laser_x_m', 'laser_y_m', 'laser_yaw_rad', 'scan_timeout_s'}
     if set(data['obstacle']) != expected:
         raise ValueError('Obstacle configuration fields do not match')
-    obstacle = {name: finite(name, value, positive=name not in ('laser_x_m', 'laser_y_m', 'laser_yaw_rad','stop_clearance_m'))
+    obstacle = {name: finite(name, value, positive=name not in ('laser_x_m', 'laser_y_m', 'laser_yaw_rad',
+                                                             'stop_clearance_m', 'min_usable_range_m'))
                 for name, value in data['obstacle'].items()}
     if obstacle['stop_clearance_m'] < 0:
         raise ValueError('Extra stop clearance must be nonnegative; zero disables the extra margin')
+    if obstacle['min_usable_range_m'] < 0:
+        raise ValueError('Minimum usable scan range must be nonnegative')
     if obstacle['scan_timeout_s'] > .75:
         raise ValueError('Scan source timeout cannot exceed 750ms')
     return controller, obstacle
@@ -145,13 +148,22 @@ class ScanGate:
 
     Zero margin retains the body rectangle and uninflated turn sweep boundary.
     Never assert rear/whole-turn clearance from this scan alone.
+    The configurable usable-range floor excludes valid near returns only from
+    navigation checks. Excluded returns remain unknown, never clear space.
     """
     HIT_LIMIT = 8
     NEIGHBOR_RADIUS = 2
     FRAME_ID_LIMIT = 256
+    NEAR_SAMPLE_LIMIT = 4
 
     def __init__(self, settings, *, turn_area_clear=False):
         self.settings = dict(settings)
+        # Direct, older offline callers keep their original collision behavior.
+        # File configuration deliberately requires the field explicitly.
+        self.settings['min_usable_range_m'] = finite('min_usable_range_m',
+            self.settings.get('min_usable_range_m', 0.))
+        if self.settings['min_usable_range_m'] < 0:
+            raise ValueError('Minimum usable scan range must be nonnegative')
         self.turn_area_clear = bool(turn_area_clear)
         self.lock = threading.Lock()
         self.latest = None
@@ -178,6 +190,9 @@ class ScanGate:
             if (not 3 <= len(ranges) <= 20000 or lower < 0 or upper <= lower
                     or abs(amax-(amin+(len(ranges)-1)*inc)) > inc*.02+1e-6):
                 raise ValueError('invalid original scan layout')
+            effective_lower = max(lower, self.settings['min_usable_range_m'])
+            if effective_lower >= upper:
+                raise ValueError('minimum usable scan range leaves no source range')
             indices = [i for i in range(len(ranges)) if -math.pi/2-1e-6 <= amin+i*inc <= math.pi/2+1e-6]
             if (len(indices) < 3 or amin+indices[0]*inc > -math.pi/2+inc+1e-6
                     or amin+indices[-1]*inc < math.pi/2-inc-1e-6):
@@ -189,7 +204,8 @@ class ScanGate:
             front, rear = settings['body_front_m'], settings['body_rear_m']
             half, margin = settings['body_half_width_m'], settings['stop_clearance_m']
             sweep_limit = math.hypot(max(front, rear), half)+margin
-            points, rays, invalid, no_return = [], [], 0, 0
+            points, rays, invalid, no_return, filtered_near = [], [], 0, 0, 0
+            near_examples = []
             hit_positions = dict(body_rectangle_clearance=[], whole_body_turn_sweep_clearance=[])
             hit_counts = dict(body_rectangle_clearance=0, whole_body_turn_sweep_clearance=0)
             first_turn_rule = None
@@ -207,10 +223,18 @@ class ScanGate:
                 angle = laser_angle+settings['laser_yaw_rad']
                 x = settings['laser_x_m']+distance*math.cos(angle)
                 y = settings['laser_y_m']+distance*math.sin(angle)
-                points.append((x, y))
                 dx, dy = max(-rear-x, 0., x-front), max(abs(y)-half, 0.)
                 body_clearance, center_distance = math.hypot(dx, dy), math.hypot(x, y)
                 position = len(rays)
+                if distance < effective_lower:
+                    ray = (i, laser_angle, distance, 'finite_below_configured_min_range', x, y,
+                           body_clearance, center_distance)
+                    rays.append(ray)
+                    filtered_near += 1
+                    if len(near_examples) < self.NEAR_SAMPLE_LIMIT:
+                        near_examples.append(self._ray_snapshot(ray, settings))
+                    continue
+                points.append((x, y))
                 rays.append((i, laser_angle, distance, 'finite_valid', x, y,
                              body_clearance, center_distance))
                 body_hit, sweep_hit = body_clearance <= margin, center_distance <= sweep_limit
@@ -234,6 +258,34 @@ class ScanGate:
             sequence = getattr(message.header, 'seq', None)
             if type(sequence) is not int or not 0 <= sequence <= 0xffffffff:
                 sequence = None
+            # These radial extents establish when the configured near exclusion
+            # contains the ENTIRE forbidden geometry. A possible radial overlap
+            # is not a claim of complete front/rear angular or physical coverage.
+            laser_x, laser_y = settings['laser_x_m'], settings['laser_y_m']
+            body_max_range = max(math.hypot(x-laser_x, y-laser_y)
+                for x in (-rear, front) for y in (-half, half))+margin
+            body_min_range = max(0., math.hypot(max(-rear-laser_x, 0., laser_x-front),
+                max(abs(laser_y)-half, 0.))-margin)
+            laser_radius = math.hypot(laser_x, laser_y)
+            turn_max_range = laser_radius+sweep_limit
+            turn_min_range = max(0., laser_radius-sweep_limit)
+            policy = dict(schema='simple-p2p-scan-policy-v1', filtering_scope='navigation_read_side_only',
+                source_scan_unchanged=True, original_header_ns=header_ns, original_frame_id=frame_id,
+                frame_id_truncated=frame_id_truncated, source_range_min_m=lower, source_range_max_m=upper,
+                configured_min_usable_range_m=settings['min_usable_range_m'],
+                effective_min_usable_range_m=effective_lower,
+                source_finite_rays=len(points)+filtered_near, usable_far_rays=len(points),
+                filtered_near_rays=filtered_near, positive_infinity_no_return_rays=no_return,
+                filtered_near_points_are_clear=False, near_field_unknown=effective_lower > 0.,
+                body_collision_region_entirely_below_effective_min=body_max_range < effective_lower,
+                turn_sweep_region_entirely_below_effective_min=turn_max_range < effective_lower,
+                body_collision_check_has_possible_range=body_max_range >= effective_lower and body_min_range <= upper,
+                turn_sweep_check_has_possible_range=turn_max_range >= effective_lower and turn_min_range <= upper,
+                body_max_range_from_laser_m=self._evidence_number(body_max_range),
+                turn_sweep_max_range_from_laser_m=self._evidence_number(turn_max_range),
+                coverage_is_complete=False, coverage_scope='front180_retained_finite_rays_only',
+                filtered_near_examples=near_examples, filtered_near_example_limit=self.NEAR_SAMPLE_LIMIT,
+                filtered_near_examples_truncated=filtered_near > len(near_examples))
             with self.lock:
                 if self.last_header_ns is not None and header_ns < self.last_header_ns:
                     raise ValueError('original scan clock regressed')
@@ -241,16 +293,20 @@ class ScanGate:
                     return  # A duplicate cannot renew its original source time.
                 self.last_header_ns = header_ns
                 self.latest = dict(source_monotonic_s=received_mono-age, points=tuple(points),
-                    header_ns=header_ns, finite_rays=len(points), rays=tuple(rays),
+                    header_ns=header_ns, finite_rays=len(points)+filtered_near, rays=tuple(rays),
                     frame_id=frame_id, frame_id_truncated=frame_id_truncated,
                     header_sequence=sequence, settings=settings, sweep_limit_m=sweep_limit,
                     hit_positions={key: tuple(value) for key, value in hit_positions.items()},
                     hit_counts=hit_counts, first_turn_rule=first_turn_rule,
+                    scan_policy=policy,
                     scan_geometry=dict(angle_min_rad=amin, angle_max_rad=amax,
                         angle_increment_rad=inc, range_min_m=lower, range_max_m=upper,
+                        configured_min_usable_range_m=settings['min_usable_range_m'],
+                        effective_min_usable_range_m=effective_lower, filtered_near_rays=filtered_near,
+                        usable_far_rays=len(points),
                         original_ray_count=len(ranges), front_first_index=indices[0],
                         front_last_index=indices[-1], front_ray_count=len(indices),
-                        finite_rays=len(points), positive_infinity_rays=no_return,
+                        finite_rays=len(points)+filtered_near, positive_infinity_rays=no_return,
                         invalid_rays=invalid))
                 self.error = None
         except (ValueError, TypeError, OverflowError, AttributeError) as exc:
@@ -262,17 +318,27 @@ class ScanGate:
         # A missing/no-return coordinate is explicit JSON null, never NaN/Inf.
         return value if type(value) in (int, float) and math.isfinite(value) else None
 
+    @classmethod
+    def _ray_snapshot(cls, ray, settings):
+        index, angle, distance, classification, x, y, clearance, center = ray
+        return dict(original_index=index, range_m=cls._evidence_number(distance),
+            range_classification=classification, angle_laser_rad=angle,
+            angle_body_rad=cls._evidence_number(angle+settings['laser_yaw_rad']),
+            x_body_m=cls._evidence_number(x), y_body_m=cls._evidence_number(y),
+            body_clearance_m=cls._evidence_number(clearance),
+            turn_center_distance_m=cls._evidence_number(center))
+
+    @staticmethod
+    def _policy_snapshot(latest):
+        policy = dict(latest['scan_policy'])
+        policy['filtered_near_examples'] = [dict(ray) for ray in policy['filtered_near_examples']]
+        return policy
+
     def _rejection_diagnostic(self, latest, now, phase, rule):
         positions = latest['hit_positions'][rule]
         first = positions[0]
         def ray_snapshot(position):
-            index, angle, distance, classification, x, y, clearance, center = latest['rays'][position]
-            return dict(original_index=index, range_m=self._evidence_number(distance),
-                range_classification=classification, angle_laser_rad=angle,
-                angle_body_rad=self._evidence_number(angle+latest['settings']['laser_yaw_rad']),
-                x_body_m=self._evidence_number(x), y_body_m=self._evidence_number(y),
-                body_clearance_m=self._evidence_number(clearance),
-                turn_center_distance_m=self._evidence_number(center))
+            return self._ray_snapshot(latest['rays'][position], latest['settings'])
         return dict(schema='simple-p2p-scan-rejection-v1', hit_rule=rule,
             checked_phase=phase, check_monotonic_s=self._evidence_number(now),
             source_monotonic_s=self._evidence_number(latest['source_monotonic_s']),
@@ -280,6 +346,7 @@ class ScanGate:
             header_ns=latest['header_ns'], header_sequence=latest['header_sequence'],
             frame_id=latest['frame_id'], frame_id_truncated=latest['frame_id_truncated'],
             scan_geometry=dict(latest['scan_geometry']),
+            scan_policy=self._policy_snapshot(latest),
             geometry={key: self._evidence_number(value) for key, value in latest['settings'].items()},
             turn_sweep_limit_m=self._evidence_number(latest['sweep_limit_m']),
             hit_count=latest['hit_counts'][rule], hit_limit=self.HIT_LIMIT,
@@ -298,10 +365,11 @@ class ScanGate:
             return dict(ok=False, reason=error or 'scan unavailable', source_monotonic_s=None)
         source = latest['source_monotonic_s']
         if not 0 <= now-source < self.settings['scan_timeout_s']:
-            return dict(ok=False, reason='original scan source expired', source_monotonic_s=source)
+            return dict(ok=False, reason='original scan source expired', source_monotonic_s=source,
+                        scan_policy=self._policy_snapshot(latest))
         if phase == 'turn' and not self.turn_area_clear:
             return dict(ok=False, reason='front180 cannot prove rear turn clearance; operator turn-area check required',
-                        source_monotonic_s=source)
+                        source_monotonic_s=source, scan_policy=self._policy_snapshot(latest))
         rule = latest['first_turn_rule'] if phase == 'turn' else None
         if rule is None and latest['hit_counts']['body_rectangle_clearance']:
             rule = 'body_rectangle_clearance'
@@ -309,9 +377,13 @@ class ScanGate:
             reason = ('observed obstacle within whole-body turn sweep clearance'
                       if rule == 'whole_body_turn_sweep_clearance' else 'obstacle within body clearance')
             return dict(ok=False, reason=reason, source_monotonic_s=source,
+                        scan_policy=self._policy_snapshot(latest),
                         diagnostic=self._rejection_diagnostic(latest, now, phase, rule))
-        return dict(ok=True, reason='measured front sector clear; rear is operator-checked',
-                    source_monotonic_s=source)
+        reason = ('retained front-sector ranges valid; below-minimum region unknown; body/turn clearance not proven'
+                  if latest['settings']['min_usable_range_m'] > 0. else
+                  'measured front sector clear; rear is operator-checked')
+        return dict(ok=True, reason=reason, source_monotonic_s=source,
+                    scan_policy=self._policy_snapshot(latest))
 
 
 def main(argv=None):

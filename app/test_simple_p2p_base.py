@@ -223,6 +223,7 @@ class BaseTests(unittest.TestCase):
         self.assertEqual(result["arm_count"], 0)
         self.assertIsNone(result["final_stop_chain"])
         self.assertIsNone(result['final_stop_recovery'])
+        self.assertIsNone(result['last_scan_check'])
         self.assertEqual(len(result["raw_events"]), 4)
 
     def test_origin_nonzero_fault_can_crc_or_short_never_controls(self):
@@ -792,6 +793,74 @@ class BaseTests(unittest.TestCase):
         stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=rejected[0])
         self.assertLess(stop_at-rejected[0],.005)
         self.assertFalse(result['session_complete'])
+
+    def test_last_scan_policy_is_owned_and_keeps_last_original_scan_source_after_STOP(self):
+        policy=dict(schema='simple-p2p-scan-policy-v1',configured_min_usable_range_m=1.,
+            filtered_near_rays=8,near_field_unknown=True,coverage_is_complete=False,
+            original_header_ns=123456789,
+            filtered_near_examples=[dict(original_index=12,range_m=.2,classification='excluded_near')])
+        checks=[]
+        def gate(at,phase):
+            checks.append((at,at-.1,phase))
+            return dict(ok=True,reason='usable far rays; near field unknown',
+                        source_monotonic_s=at-.1,scan_policy=policy)
+        result,_=self.run_case(execute=True,scan=gate,sample_period_ms=100)
+        saved=result['last_scan_check']
+        self.assertTrue(result['session_complete'],result['first_failure'])
+        self.assertTrue(saved['ok'])
+        self.assertEqual(saved['checked_monotonic_s'],checks[-1][0])
+        self.assertEqual(saved['source_monotonic_s'],checks[-1][1])
+        self.assertEqual(saved['scan_phase'],checks[-1][2])
+        self.assertEqual(saved['scan_policy'],policy)
+        self.assertGreater(result['final_stop_chain']['ack']['completed_monotonic_s'],saved['checked_monotonic_s'])
+        policy['filtered_near_rays']=999
+        policy['filtered_near_examples'][0]['range_m']=9.
+        self.assertEqual(saved['scan_policy']['filtered_near_rays'],8)
+        self.assertEqual(saved['scan_policy']['filtered_near_examples'][0]['range_m'],.2)
+
+    def test_scan_rejection_without_point_diagnostic_still_retains_range_policy(self):
+        policy=dict(schema='simple-p2p-scan-policy-v1',configured_min_usable_range_m=1.,
+                    near_field_unknown=True,filtered_near_points_are_clear=False,usable_far_rays=3)
+        rejected=[]
+        def gate(at,phase):
+            if phase=='drive' and at>100.8:
+                rejected.append(at)
+                return dict(ok=False,reason='insufficient usable far rays',
+                            source_monotonic_s=at-.1,scan_policy=policy)
+            return dict(ok=True,source_monotonic_s=at-.1,scan_policy=policy)
+        result,port=self.run_case(execute=True,scan=gate,sample_period_ms=100)
+        first=result['first_scan_rejection']
+        self.assertNotIn('diagnostic',first)
+        self.assertEqual(first['scan_policy'],policy)
+        self.assertFalse(first['ok'])
+        self.assertEqual(first['source_monotonic_s'],rejected[0]-.1)
+        self.assertEqual(result['last_scan_check'],first)
+        policy['usable_far_rays']=999
+        self.assertEqual(first['scan_policy']['usable_far_rays'],3)
+        stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=rejected[0])
+        self.assertLess(stop_at-rejected[0],.005)
+        self.assertFalse(result['session_complete'])
+
+    def test_scan_policy_cannot_renew_expired_source_and_large_metadata_is_bounded(self):
+        policy=dict(schema='simple-p2p-scan-policy-v1',configured_min_usable_range_m=1.,
+                    original_header_ns=123456789,near_field_unknown=True)
+        result,_=self.run_case(execute=True,
+            scan=lambda at,phase:dict(ok=True,reason='far rays usable',source_monotonic_s=100.,scan_policy=policy))
+        saved=result['last_scan_check']
+        self.assertFalse(saved['ok'])
+        self.assertEqual(saved['source_monotonic_s'],100.)
+        self.assertGreaterEqual(saved['checked_monotonic_s']-saved['source_monotonic_s'],.75)
+        self.assertEqual(saved['scan_policy']['original_header_ns'],123456789)
+        self.assertFalse(result['session_complete'])
+        many=dict(schema='simple-p2p-scan-policy-v1',original_frame_id='x'*20000,
+                  filtered_near_examples=[dict(range_m=.2,index=i,untrusted=['x']*1000) for i in range(1000)])
+        many.update({'field_'+str(i):i for i in range(1000)})
+        bounded=base.scan_policy_snapshot(many)
+        self.assertLessEqual(len(bounded),65)
+        self.assertEqual(len(bounded['original_frame_id']),256)
+        self.assertEqual(len(bounded['filtered_near_examples']),4)
+        self.assertNotIn('untrusted',bounded['filtered_near_examples'][0])
+        self.assertTrue(bounded['base_snapshot_truncated'])
 
     def test_missing_final_STOP_ack_gets_one_new_STOP_and_separate_current_proof(self):
         for mode in ('final_stop_ack_lost','final_stop_ack_fragment'):

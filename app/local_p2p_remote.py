@@ -82,7 +82,8 @@ def compact_result(result):
             'complete_write_counts','exclusive_port_closed_normally','elapsed_s','arm_count',
             'position_verification','cleanup_errors','live_status_writer_complete',
             'history','history_timebase','control_metrics','odometry_continuity_validated',
-            'motion_odometry_continuity_validated','arrival_zero_seal','first_scan_rejection')
+            'motion_odometry_continuity_validated','arrival_zero_seal','first_scan_rejection',
+            'last_scan_check')
     compact = {key:result.get(key) for key in keys}
     proof = result.get('final_stop_chain') or {}
     recovery = result.get('final_stop_recovery') or {}
@@ -199,6 +200,7 @@ class Remote:
             and identity['start_ticks'] == record['start_ticks'])
 
     def inventory(self):
+        _, obstacle = load_config(DEFAULT_CONFIG)
         active, latest = [], None
         if self.jobs.exists():
             for entry in self.jobs.iterdir():
@@ -217,7 +219,8 @@ class Remote:
                     active.append(dict(task_id=entry.name,pid=record['pid'],start_ticks=record['start_ticks']))
         return dict(boot_id=self.boot(),active_jobs=active,
             active_task_id=active[0]['task_id'] if len(active) == 1 else None,
-            last_task_id=None if latest is None else latest['task_id'],now_monotonic_s=self.clock())
+            last_task_id=None if latest is None else latest['task_id'],now_monotonic_s=self.clock(),
+            navigation_scan_config=dict(obstacle))
 
     def status(self, task):
         path = self.paths(task)
