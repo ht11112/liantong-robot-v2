@@ -49,7 +49,7 @@
       </section>
       <aside class="side-column" aria-label="参考状态与保存地图">
         <article class="card"><div class="card-head"><h2><span class="section-step">1</span>建立局部零点</h2></div><div class="card-body"><p class="reset-note">小车停稳后，将当前位置和当前车头设为 <strong>(0, 0, 0)</strong>。可在任意位置建立新零点；旧目标和预览会清除。</p><button id="reset-button" type="button" class="reset-button" disabled>将当前位置 / 车头置零</button><p class="tiny" style="margin:10px 0 0">这是本次会话的软件参考，不重置 MCU 编码器，也不会启动移动。当前车头为局部 +X，并非原地图建图方向。</p></div></article>
-        <article class="card"><div class="card-head"><h2>任务与停车状态</h2><span id="task-phase" class="pill">待命</span></div><div class="card-body"><dl><div class="kv"><dt>任务编号</dt><dd id="task-id" class="mono">—</dd></div><div class="kv"><dt>到点结果</dt><dd id="task-complete">尚无任务</dd></div><div class="kv"><dt>实测停车确认</dt><dd id="stop-confirmed">尚无证据</dd></div><div class="kv"><dt>最终位置验证</dt><dd id="position-verified">尚无证据</dd></div></dl><div id="task-failure" class="task-note">取消请求和零速度命令不等于已经停稳；以实测停车确认结果为准。</div><hr><div class="limits"><span>速度 ≤ 0.03 m/s</span><span>转向 ≤ 6.9 °/s</span><span>到点误差 ≤ 0.10 m</span><span>额外净距已关闭</span><span>单次 ≤ 200 s</span><span>原始反馈 750 ms</span></div></div></article>
+        <article class="card"><div class="card-head"><h2>任务与停车状态</h2><span id="task-phase" class="pill">待命</span></div><div class="card-body"><dl><div class="kv"><dt>任务编号</dt><dd id="task-id" class="mono">—</dd></div><div class="kv"><dt>到点结果</dt><dd id="task-complete">尚无任务</dd></div><div class="kv"><dt>实测停车确认</dt><dd id="stop-confirmed">尚无证据</dd></div><div class="kv"><dt>最终位置验证</dt><dd id="position-verified">尚无证据</dd></div></dl><div id="task-failure" class="task-note">取消请求和零速度命令不等于已经停稳；以实测停车确认结果为准。</div><p id="task-scan-evidence" class="tiny" hidden></p><hr><div class="limits"><span>速度 ≤ 0.03 m/s</span><span>转向 ≤ 6.9 °/s</span><span>到点误差 ≤ 0.10 m</span><span>额外净距已关闭</span><span>单次 ≤ 200 s</span><span>原始反馈 750 ms</span></div></div></article>
         <article class="card map-card"><div class="card-head"><h2>已保存地图</h2><span class="pill warn">只读参考</span></div><div class="reference-warning"><strong>仅供查看 / 不是定位</strong><br>不能在此图选目标，也不叠加当前 odom。</div><div class="map-image-box"><img id="saved-map-image" alt="已保存的 r5 地图，仅供查看，不表示当前定位" draggable="false" hidden><div id="saved-map-empty" class="map-empty">等待已保存地图</div></div><div class="map-details"><div id="saved-map-metadata">地图尺寸与分辨率尚未提供</div><div id="saved-map-sha" class="mono" style="margin-top:4px">SHA —</div><p style="margin:8px 0 0">局部零点与这张地图没有已知坐标变换。图中方向不代表此刻车头方向。</p></div></article>
       </aside>
     </div>
@@ -193,13 +193,18 @@
       $('task-phase').className='pill '+(t.first_failure ? 'bad' : t.active ? 'warn' : t.complete ? 'good' : '');
       $('task-id').textContent=t.id == null ? '—' : String(t.id);
       $('task-complete').textContent=t.complete === true ? '已报告到点' : t.active ? '任务进行中' : t.id ? '未报告到点' : '尚无任务';
-      $('stop-confirmed').textContent=t.stop_confirmed === true ? '已实测确认' : t.id ? '尚未确认停稳' : '尚无证据';
+      $('stop-confirmed').textContent=t.stop_confirmed === true ? (t.stop_confirmation_method === 'supplemental' ? '补充停车已实测确认' : '已实测确认') : t.id ? '尚未确认停稳' : '尚无证据';
       $('stop-confirmed').className=t.stop_confirmed === true ? 'status-good' : 'status-warn';
       $('position-verified').textContent=t.position_verified === true ? '已验证' : t.id ? '尚未验证' : '尚无证据';
       $('position-verified').className=t.position_verified === true ? 'status-good' : 'muted';
       const fault=t.first_failure;
       $('task-failure').textContent=fault ? (typeof fault === 'string' ? fault : fault.message || JSON.stringify(fault)) : '取消请求和零速度命令不等于已经停稳；以实测停车确认结果为准。';
       $('task-failure').className='task-note'+(fault ? ' status-error' : '');
+      const scanDiagnostic=t.first_scan_rejection && t.first_scan_rejection.diagnostic;
+      const hit=scanDiagnostic && Array.isArray(scanDiagnostic.hits) && scanDiagnostic.hits[0];
+      const scanNote=$('task-scan-evidence');
+      scanNote.hidden=!(hit && finite(hit.range_m) && finite(hit.angle_body_rad));
+      scanNote.textContent=scanNote.hidden ? '' : '首个命中点：距雷达 '+(hit.range_m*100).toFixed(1)+' cm，车头'+(hit.angle_body_rad>=0 ? '左侧 ' : '右侧 ')+(Math.abs(hit.angle_body_rad)*180/Math.PI).toFixed(1)+'°。共 '+scanDiagnostic.hit_count+' 个命中；点的来源尚未判定。';
       const canEdit=Boolean(idle() && validReference() && token());
       ui.x.disabled=!canEdit; ui.y.disabled=!canEdit; ui.preview.disabled=!(canEdit && model.goal);
       ui.reset.disabled=!(idle() && token());

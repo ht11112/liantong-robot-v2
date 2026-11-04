@@ -82,14 +82,25 @@ def compact_result(result):
             'complete_write_counts','exclusive_port_closed_normally','elapsed_s','arm_count',
             'position_verification','cleanup_errors','live_status_writer_complete',
             'history','history_timebase','control_metrics','odometry_continuity_validated',
-            'motion_odometry_continuity_validated','arrival_zero_seal')
+            'motion_odometry_continuity_validated','arrival_zero_seal','first_scan_rejection')
     compact = {key:result.get(key) for key in keys}
     proof = result.get('final_stop_chain') or {}
-    samples = proof.get('zero_samples') or []
+    recovery = result.get('final_stop_recovery') or {}
+    supplemental = recovery.get('complete') is True
+    primary_samples = proof.get('zero_samples') or []
+    samples = (recovery.get('zero_samples') or []) if supplemental else primary_samples
     compact['latest_feedback'] = samples[-1] if samples else None
     compact['final_stop_chain'] = {key:proof.get(key) for key in
         ('complete','parking_position_error','position_verified','error')}
-    compact['final_stop_chain']['zero_sample_count'] = len(samples)
+    compact['final_stop_chain']['zero_sample_count'] = len(primary_samples)
+    compact['final_stop_recovery'] = {key:recovery.get(key) for key in
+        ('complete','error','parking_position_error','position_verified')}
+    compact['final_stop_recovery']['zero_sample_count'] = len(recovery.get('zero_samples') or [])
+    compact['final_stop_recovery']['position_verified'] = False
+    if supplemental:
+        # A separate current standstill proof never repairs the original task
+        # or its position evidence, even if a malformed caller sets old flags.
+        compact.update(session_complete=False,motion_complete=False,position_verified=False)
     compact['full_evidence_retained_on_RK'] = True
     return compact
 

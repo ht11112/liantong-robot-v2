@@ -1,5 +1,6 @@
 """RPC path/process/identity boundaries without ROS, SSH, serial or subprocesses."""
 from contextlib import nullcontext
+import copy
 import json
 import io
 from pathlib import Path
@@ -111,6 +112,69 @@ class RemoteTests(unittest.TestCase):
         status=self.service.handle(dict(op='poll',task_id=TASK))
         self.assertEqual(status['result']['first_failure'],first)
         self.assertFalse(status['result']['position_verified'])
+
+    def test_compact_separate_recovery_preserves_primary_count_scan_and_old_pose(self):
+        primary=[dict(sample_sequence=i,position_left_raw=i) for i in range(1,4)]
+        newer=[dict(sample_sequence=i,position_left_raw=i) for i in range(4,9)]
+        failure=dict(phase='arrival_zero',message='Scan/clearance rejected: obstacle within body clearance')
+        scan=dict(phase='arrival_zero',reason='obstacle within body clearance',
+            diagnostic=dict(schema='simple-p2p-scan-rejection-v1',header_ns=123,
+                hits=[dict(original_index=17,range_m=.15,x_body_m=.18,y_body_m=.14)]))
+        pose=dict(x=.39,y=.002,yaw=.01,source_monotonic_s=99.,sample_sequence=3)
+        result=dict(session_complete=False,motion_complete=False,position_verified=False,
+            first_failure=failure,first_scan_rejection=scan,latest_odometry=pose,
+            final_stop_chain=dict(complete=False,error='Original zero proof failed',
+                position_verified=False,zero_samples=primary),
+            final_stop_recovery=dict(complete=True,position_verified=False,zero_samples=newer),
+            rows=[{'large':'raw rows stay on RK'}],raw_events=[{'large':'raw stream stays on RK'}])
+        unchanged=copy.deepcopy(result)
+        compact=remote.compact_result(result)
+        self.assertEqual(compact['final_stop_chain']['zero_sample_count'],3)
+        self.assertFalse(compact['final_stop_chain']['complete'])
+        self.assertEqual(compact['final_stop_chain']['error'],'Original zero proof failed')
+        self.assertEqual(compact['final_stop_recovery']['zero_sample_count'],5)
+        self.assertTrue(compact['final_stop_recovery']['complete'])
+        self.assertEqual(compact['latest_feedback'],newer[-1])
+        self.assertEqual(compact['latest_odometry'],pose)
+        self.assertEqual(compact['latest_odometry']['source_monotonic_s'],99.)
+        self.assertEqual(compact['first_failure'],failure)
+        self.assertEqual(compact['first_scan_rejection'],scan)
+        self.assertNotIn('rows',compact)
+        self.assertNotIn('raw_events',compact)
+        self.assertTrue(compact['full_evidence_retained_on_RK'])
+        self.assertEqual(result,unchanged)
+
+    def test_compact_recovery_cannot_claim_original_position_or_task_success(self):
+        result=dict(session_complete=True,motion_complete=True,position_verified=True,
+            final_stop_chain=dict(complete=False,position_verified=False,zero_samples=[]),
+            final_stop_recovery=dict(complete=True,position_verified=True,
+                zero_samples=[dict(sample_sequence=i) for i in range(5)]))
+        compact=remote.compact_result(result)
+        for key in ('session_complete','motion_complete','position_verified'):
+            self.assertFalse(compact[key])
+            self.assertTrue(result[key])  # Compacting must not rewrite full evidence.
+        self.assertFalse(compact['final_stop_chain']['complete'])
+        self.assertFalse(compact['final_stop_recovery']['position_verified'])
+        self.assertTrue(result['final_stop_recovery']['position_verified'])
+
+    def test_incomplete_recovery_does_not_replace_primary_feedback_and_legacy_success_is_retained(self):
+        old=dict(sample_sequence=3)
+        result=dict(session_complete=False,motion_complete=False,position_verified=False,
+            final_stop_chain=dict(complete=False,zero_samples=[old]),
+            final_stop_recovery=dict(complete=False,error='No matching reply',
+                zero_samples=[dict(sample_sequence=9)]))
+        compact=remote.compact_result(result)
+        self.assertEqual(compact['latest_feedback'],old)
+        self.assertEqual(compact['final_stop_chain']['zero_sample_count'],1)
+        self.assertFalse(compact['final_stop_recovery']['complete'])
+        result=dict(session_complete=True,motion_complete=True,position_verified=True,
+            final_stop_chain=dict(complete=True,position_verified=True,zero_samples=[old]))
+        compact=remote.compact_result(result)
+        self.assertEqual(compact['latest_feedback'],old)
+        self.assertEqual(compact['final_stop_chain']['zero_sample_count'],1)
+        self.assertTrue(compact['session_complete'])
+        self.assertTrue(compact['motion_complete'])
+        self.assertTrue(compact['position_verified'])
 
     def test_bad_boot_missing_operator_flag_nonfinite_encoder_bool_and_path_injection_never_spawn(self):
         changes = [dict(expected_boot_id=TASK),dict(area_clear=False),dict(goal_x=float('nan')),

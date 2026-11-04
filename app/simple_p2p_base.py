@@ -4,6 +4,7 @@ The caller opens the precisely located device with exclusive_port on this same
 thread and writes the returned evidence only after closing it. Geometry is an
 uncalibrated estimate. ACKs acknowledge acceptance, never physical standstill.
 """
+import copy
 import math
 import secrets
 import struct
@@ -218,10 +219,12 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
     measurement_anchors = []
     result = dict(schema="simple-p2p-base-v1", boot_id=boot_id, execute=execute,
         origin=None, first_failure=None, initial_stop_chain=None, final_stop_chain=None,
+        final_stop_recovery=None,
         session_complete=False, motion_complete=False, geometry_calibrated=False,
         geometry=dict(diameter_m=odom.diameter, separation_m=odom.separation),
         host_source_timeout_s=.75, CAN_source_timeout_s=.25, zero_speed_rpm=.2,
         max_setpoint_hz=20, MCU_lease_s=.5, arm_handoff=None, arrival_zero_seal=None,
+        first_scan_rejection=None,
         encoder_unchanged_since_origin=True, first_origin_encoder_change=None,
         expected_start_encoders=expected_start_encoders, event_sink_errors=[])
     phase, latest, last_scan, scan_phase = "origin", None, None, None
@@ -282,6 +285,17 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             if (not isinstance(last_scan, dict) or last_scan.get("ok") is not True
                     or not finite(last_scan.get("source_monotonic_s"))
                     or not 0 <= at-last_scan["source_monotonic_s"] < .75):
+                if result['first_scan_rejection'] is None:
+                    result['first_scan_rejection'] = dict(checked_monotonic_s=at,
+                        phase=phase,scan_phase=scan_phase or phase,
+                        reason=str(last_scan.get('reason','invalid') if isinstance(last_scan,dict) else 'invalid')[:512],
+                        source_monotonic_s=(last_scan.get('source_monotonic_s')
+                            if isinstance(last_scan,dict) and finite(last_scan.get('source_monotonic_s')) else None))
+                    if isinstance(last_scan,dict) and isinstance(last_scan.get('diagnostic'),dict):
+                        # The reviewed ScanGate supplies only bounded scalar
+                        # metadata, <=8 hits and <=5 neighbours. No serialization
+                        # or filesystem work occurs before the immediate STOP.
+                        result['first_scan_rejection']['diagnostic'] = copy.deepcopy(last_scan['diagnostic'])
                 raise BaseFault("Scan/clearance rejected: " + str(last_scan.get("reason", "invalid") if isinstance(last_scan, dict) else "invalid"))
         if port.phase == "active" and at >= lease_deadline:
             raise BaseFault("Original MCU lease deadline reached")
@@ -378,8 +392,10 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
     def stop_chain(integrate_parking=False, position_hold=None):
         nonlocal phase, source, latest
         port.phase, port.permit, port.finishing = "stopping", None, True
-        client.cancel_for_stop()
+        cancelled_wait = client.cancel_for_stop()
+        preceding_failure = client.last_exchange_failure
         proof = dict(complete=False, ack=None, stopped_status=None, zero_samples=[],
+                     cancelled_wait=copy.deepcopy(cancelled_wait), failed_exchange=None,
                      parking_position_error=odometry_failure, position_verified=False,
                      settling_nonzero_samples=0, zero_run_restarts=0,
                      encoder_hold_samples=0, encoder_hold_motion_samples=0,
@@ -471,6 +487,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             return proof
         except BaseException as exc:
             proof["error"] = type(exc).__name__+": "+str(exc)
+            if client.last_exchange_failure is not preceding_failure:
+                proof['failed_exchange'] = copy.deepcopy(client.last_exchange_failure)
             return proof
 
     def seal_arrival(started, last_send, last_pair, next_feedback, next_status, last_starts):
@@ -845,6 +863,19 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             result["final_stop_chain"] = stop_chain(integrate_parking=port.arm_count > 0,position_hold=hold)
             if not result["final_stop_chain"]["complete"]:
                 fail(BaseFault(result["final_stop_chain"]["error"]), phase)
+                if result["final_stop_chain"]["ack"] is None:
+                    # The first physical STOP is still immediate. Its transaction
+                    # has now terminated, including the original 300 ms timeout
+                    # when no matching reply arrived. Make one NEW sequence STOP
+                    # attempt on this same owner/FD; never retry the old frame.
+                    # This independent present-time stop proof cannot repair the
+                    # original task, its position seal or missing motion evidence.
+                    phase = 'final_stop_recovery'
+                    recovery = stop_chain(integrate_parking=False,position_hold=None)
+                    recovery.update(trigger='primary_final_STOP_missing_ACK',attempt_count=1,
+                        independent_current_stop_only=True,position_verified=False)
+                    result['final_stop_recovery'] = recovery
+                    result['motion_complete'] = False
             if hold is not None:
                 proof = result['final_stop_chain']
                 final_sample = None if not proof['zero_samples'] else dict(proof['zero_samples'][-1])

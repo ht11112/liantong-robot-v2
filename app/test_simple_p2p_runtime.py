@@ -93,7 +93,14 @@ class ScanGateTests(unittest.TestCase):
             sample=scan(stamp=stamp)
             sample.ranges[180]=distance  # +90deg, x=.13; body side is y=.25.
             gate.accept(sample,stamp*1000000000+100000000,float(stamp))
-            self.assertEqual(gate(float(stamp),'drive')['ok'],allowed)
+            checked=gate(float(stamp),'drive')
+            self.assertEqual(checked['ok'],allowed)
+            if not allowed:
+                hit=checked['diagnostic']['hits'][0]
+                self.assertEqual(checked['diagnostic']['hit_rule'],'body_rectangle_clearance')
+                self.assertEqual(hit['original_index'],180)
+                self.assertAlmostEqual(hit['y_body_m'],distance)
+                self.assertEqual(hit['body_clearance_m'],0.)
 
     def test_zero_extra_margin_uses_uninflated_turn_sweep(self):
         gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
@@ -104,7 +111,113 @@ class ScanGateTests(unittest.TestCase):
         self.assertTrue(gate(11.,'turn')['ok'])
         radius=math.hypot(SETTINGS['body_front_m'],SETTINGS['body_half_width_m'])
         gate.accept(scan(stamp=102,obstacle=radius-SETTINGS['laser_x_m']),102100000000,12.)
-        self.assertFalse(gate(12.,'turn')['ok'])  # Exact uninflated sweep boundary remains blocked.
+        checked=gate(12.,'turn')
+        self.assertFalse(checked['ok'])  # Exact uninflated sweep boundary remains blocked.
+        self.assertEqual(checked['diagnostic']['hit_rule'],'whole_body_turn_sweep_clearance')
+        self.assertAlmostEqual(checked['diagnostic']['turn_sweep_limit_m'],radius)
+
+    def test_rejection_snapshot_preserves_original_ray_neighbors_header_and_source(self):
+        gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
+        sample=scan()
+        sample.header.seq=42
+        sample.header.frame_id='front_laser'
+        sample.ranges[150]=.12  # 60 degrees: body x=.19, y=.103923...
+        sample.ranges[148]=math.inf
+        gate.accept(sample,100100000000,10.)
+        with patch('simple_p2p_runtime.json.dumps',side_effect=AssertionError('no control-thread serialization')):
+            diagnostic=gate(10.1,'drive')['diagnostic']
+        self.assertEqual(diagnostic['header_ns'],100000000000)
+        self.assertEqual(diagnostic['header_sequence'],42)
+        self.assertEqual(diagnostic['frame_id'],'front_laser')
+        self.assertEqual(diagnostic['checked_phase'],'drive')
+        self.assertAlmostEqual(diagnostic['source_monotonic_s'],9.9)
+        self.assertAlmostEqual(diagnostic['source_age_s'],.2)
+        self.assertEqual(diagnostic['geometry']['stop_clearance_m'],0.)
+        self.assertEqual(diagnostic['scan_geometry']['positive_infinity_rays'],1)
+        self.assertEqual(diagnostic['scan_geometry']['front_ray_count'],181)
+        self.assertEqual(diagnostic['hit_count'],1)
+        self.assertEqual(diagnostic['return_identity'],'unclassified')
+        hit=diagnostic['hits'][0]
+        self.assertEqual(hit['original_index'],150)
+        self.assertAlmostEqual(hit['range_m'],.12)
+        self.assertAlmostEqual(hit['angle_laser_rad'],math.pi/3)
+        self.assertAlmostEqual(hit['x_body_m'],.19)
+        self.assertAlmostEqual(hit['y_body_m'],.12*math.sin(math.pi/3))
+        self.assertEqual([ray['original_index'] for ray in diagnostic['first_hit_neighbors']],list(range(148,153)))
+        neighbor=diagnostic['first_hit_neighbors'][0]
+        self.assertEqual(neighbor['range_classification'],'positive_infinity_no_return')
+        self.assertIsNone(neighbor['range_m'])
+        self.assertIsNone(neighbor['x_body_m'])
+        json.dumps(diagnostic,allow_nan=False)
+
+    def test_duplicate_scan_cannot_replace_rejection_point_or_renew_source(self):
+        gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
+        original=scan()
+        original.header.frame_id='original_frame'
+        original.ranges[180]=.2
+        gate.accept(original,100100000000,10.)
+        replacement=scan()
+        replacement.header.frame_id='duplicate_changed_frame'
+        gate.accept(replacement,100100000000,10.5)
+        diagnostic=gate(10.5,'drive')['diagnostic']
+        self.assertAlmostEqual(diagnostic['source_monotonic_s'],9.9)
+        self.assertAlmostEqual(diagnostic['source_age_s'],.6)
+        self.assertEqual(diagnostic['frame_id'],'original_frame')
+        self.assertEqual(diagnostic['hits'][0]['original_index'],180)
+        self.assertEqual(diagnostic['hits'][0]['range_m'],.2)
+        diagnostic['hits'][0]['range_m']=999.
+        diagnostic['geometry']['body_front_m']=999.
+        unchanged=gate(10.5,'drive')['diagnostic']
+        self.assertEqual(unchanged['hits'][0]['range_m'],.2)
+        self.assertEqual(unchanged['geometry']['body_front_m'],.2)
+        self.assertNotIn('diagnostic',gate(10.7,'drive'))  # Original source is now stale.
+
+    def test_snapshot_uses_actual_extrinsics_without_classifying_self_returns(self):
+        settings=dict(SETTINGS,stop_clearance_m=0.,laser_x_m=-.1,laser_y_m=.02,
+                      laser_yaw_rad=math.pi/2,body_front_m=.3,body_rear_m=.17,body_half_width_m=.23)
+        gate=ScanGate(settings,turn_area_clear=True)
+        gate.accept(scan(obstacle=.15),100100000000,10.)
+        diagnostic=gate(10.,'drive')['diagnostic']
+        self.assertEqual(diagnostic['geometry'],settings)
+        hit=diagnostic['hits'][0]
+        self.assertEqual(hit['original_index'],90)
+        self.assertEqual(hit['angle_laser_rad'],0.)
+        self.assertAlmostEqual(hit['angle_body_rad'],math.pi/2)
+        self.assertAlmostEqual(hit['x_body_m'],-.1)
+        self.assertAlmostEqual(hit['y_body_m'],.17)
+        self.assertEqual(diagnostic['return_identity'],'unclassified')
+
+    def test_maximum_scan_rejection_evidence_has_bounded_hits_neighbors_and_frame(self):
+        gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
+        sample=scan()
+        sample.ranges=[.1]*20000
+        sample.angle_increment=math.pi/(len(sample.ranges)-1)
+        sample.header.frame_id='x'*2000
+        gate.accept(sample,100100000000,10.)
+        diagnostic=gate(10.,'drive')['diagnostic']
+        self.assertGreater(diagnostic['hit_count'],8)
+        self.assertEqual(len(diagnostic['hits']),8)
+        self.assertTrue(diagnostic['hits_truncated'])
+        self.assertEqual(len(diagnostic['first_hit_neighbors']),3)  # First measured ray is the hit.
+        self.assertEqual(len(diagnostic['frame_id']),256)
+        self.assertTrue(diagnostic['frame_id_truncated'])
+        self.assertEqual(diagnostic['scan_geometry']['original_ray_count'],20000)
+        encoded=json.dumps(diagnostic,allow_nan=False)
+        self.assertLess(len(encoded),12000)
+
+    def test_invalid_rays_still_reject_and_clear_scan_avoids_snapshot_work(self):
+        gate=ScanGate(dict(SETTINGS,stop_clearance_m=0.),turn_area_clear=True)
+        gate.accept(scan(),100100000000,10.)
+        with patch.object(gate,'_rejection_diagnostic',side_effect=AssertionError('clear path snapshot')):
+            self.assertTrue(gate(10.,'drive')['ok'])
+        for stamp,value in enumerate((float('nan'),-math.inf,.01,51.),start=101):
+            bad=scan(stamp=stamp)
+            bad.ranges[180]=value
+            gate.accept(bad,stamp*1000000000+100000000,float(stamp))
+            checked=gate(float(stamp),'drive')
+            self.assertFalse(checked['ok'])
+            self.assertNotIn('diagnostic',checked)
+            json.dumps(checked,allow_nan=False)
 
     def test_config_accepts_zero_margin_rejects_negative_and_keeps_geometry_source_positive(self):
         original=json.loads(DEFAULT_CONFIG.read_text(encoding='utf-8'))
@@ -198,6 +311,26 @@ class ScanGateTests(unittest.TestCase):
             self.assertEqual(state['pose_source_monotonic_s'],9.9)
             self.assertEqual(state['pose_measurement_monotonic_s'],9.95)
             self.assertEqual(state['pose']['x'],.5)
+
+    def test_supplemental_stop_uses_new_raw_packet_without_renewing_failed_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer=LiveStatusWriter(Path(directory)/'live.json','boot',clock=lambda:30.)
+            writer.submit(dict(event='odometry',phase='drive',event_monotonic_s=10.,
+                source_monotonic_s=9.9,measurement_monotonic_s=9.95,
+                raw_packet=dict(sample_sequence=1),pose=dict(x=.39,y=0.,yaw=0.)))
+            writer.start()
+            final_packet=dict(sample_sequence=20,position_left_raw=100,position_right_raw=200)
+            self.assertTrue(writer.close(dict(session_complete=False,position_verified=False,
+                latest_odometry=dict(x=.39,y=0.,yaw=0.,source_monotonic_s=9.9,measurement_monotonic_s=9.95),
+                final_stop_chain=dict(complete=False,zero_samples=[]),
+                final_stop_recovery=dict(complete=True,zero_samples=[final_packet]))))
+            state=json.loads(writer.path.read_text(encoding='utf-8'))
+            self.assertEqual(state['raw_packet']['sample_sequence'],20)
+            self.assertFalse(state['session_complete'])
+            self.assertFalse(state['position_verified'])
+            self.assertEqual(state['pose_source_monotonic_s'],9.9)
+            self.assertEqual(state['pose_measurement_monotonic_s'],9.95)
+            self.assertEqual(state['pose']['x'],.39)
 
 
 if __name__ == '__main__':

@@ -94,6 +94,8 @@ class LiveStatusWriter:
             return False
         # The port has already closed. No background write can race this final one.
         proof = result.get('final_stop_chain') or {}
+        if (result.get('final_stop_recovery') or {}).get('complete') is True:
+            proof = result['final_stop_recovery']
         packet = (proof.get('zero_samples') or [None])[-1]
         pose = result.get('latest_odometry')
         with self.lock:
@@ -144,6 +146,10 @@ class ScanGate:
     Zero margin retains the body rectangle and uninflated turn sweep boundary.
     Never assert rear/whole-turn clearance from this scan alone.
     """
+    HIT_LIMIT = 8
+    NEIGHBOR_RADIUS = 2
+    FRAME_ID_LIMIT = 256
+
     def __init__(self, settings, *, turn_area_clear=False):
         self.settings = dict(settings)
         self.turn_area_clear = bool(turn_area_clear)
@@ -176,19 +182,58 @@ class ScanGate:
             if (len(indices) < 3 or amin+indices[0]*inc > -math.pi/2+inc+1e-6
                     or amin+indices[-1]*inc < math.pi/2-inc-1e-6):
                 raise ValueError('continuous measured front180 required')
-            points, invalid = [], 0
+            # The scan callback owns the bounded ray cache. Precompute the two
+            # unchanged collision predicates here so refusing a control permit
+            # only copies a small snapshot before the caller sends STOP.
+            settings = dict(self.settings)
+            front, rear = settings['body_front_m'], settings['body_rear_m']
+            half, margin = settings['body_half_width_m'], settings['stop_clearance_m']
+            sweep_limit = math.hypot(max(front, rear), half)+margin
+            points, rays, invalid, no_return = [], [], 0, 0
+            hit_positions = dict(body_rectangle_clearance=[], whole_body_turn_sweep_clearance=[])
+            hit_counts = dict(body_rectangle_clearance=0, whole_body_turn_sweep_clearance=0)
+            first_turn_rule = None
             for i in indices:
                 distance = float(ranges[i])
+                laser_angle = amin+i*inc
                 if distance == math.inf:
+                    rays.append((i, laser_angle, None, 'positive_infinity_no_return',
+                                 None, None, None, None))
+                    no_return += 1
                     continue
                 if not math.isfinite(distance) or not lower <= distance <= upper:
                     invalid += 1
                     continue
-                angle = amin+i*inc+self.settings['laser_yaw_rad']
-                points.append((self.settings['laser_x_m']+distance*math.cos(angle),
-                               self.settings['laser_y_m']+distance*math.sin(angle)))
+                angle = laser_angle+settings['laser_yaw_rad']
+                x = settings['laser_x_m']+distance*math.cos(angle)
+                y = settings['laser_y_m']+distance*math.sin(angle)
+                points.append((x, y))
+                dx, dy = max(-rear-x, 0., x-front), max(abs(y)-half, 0.)
+                body_clearance, center_distance = math.hypot(dx, dy), math.hypot(x, y)
+                position = len(rays)
+                rays.append((i, laser_angle, distance, 'finite_valid', x, y,
+                             body_clearance, center_distance))
+                body_hit, sweep_hit = body_clearance <= margin, center_distance <= sweep_limit
+                # Keep the previous per-ray precedence: turn sweep, then body.
+                if first_turn_rule is None:
+                    if sweep_hit:
+                        first_turn_rule = 'whole_body_turn_sweep_clearance'
+                    elif body_hit:
+                        first_turn_rule = 'body_rectangle_clearance'
+                for rule, hit in (('body_rectangle_clearance', body_hit),
+                                  ('whole_body_turn_sweep_clearance', sweep_hit)):
+                    if hit:
+                        hit_counts[rule] += 1
+                        if len(hit_positions[rule]) < self.HIT_LIMIT:
+                            hit_positions[rule].append(position)
             if len(points) < 10 or invalid:
                 raise ValueError('insufficient or invalid measured obstacle rays')
+            frame_id = getattr(message.header, 'frame_id', None)
+            frame_id_truncated = isinstance(frame_id, str) and len(frame_id) > self.FRAME_ID_LIMIT
+            frame_id = frame_id[:self.FRAME_ID_LIMIT] if isinstance(frame_id, str) else None
+            sequence = getattr(message.header, 'seq', None)
+            if type(sequence) is not int or not 0 <= sequence <= 0xffffffff:
+                sequence = None
             with self.lock:
                 if self.last_header_ns is not None and header_ns < self.last_header_ns:
                     raise ValueError('original scan clock regressed')
@@ -196,11 +241,55 @@ class ScanGate:
                     return  # A duplicate cannot renew its original source time.
                 self.last_header_ns = header_ns
                 self.latest = dict(source_monotonic_s=received_mono-age, points=tuple(points),
-                                   header_ns=header_ns, finite_rays=len(points))
+                    header_ns=header_ns, finite_rays=len(points), rays=tuple(rays),
+                    frame_id=frame_id, frame_id_truncated=frame_id_truncated,
+                    header_sequence=sequence, settings=settings, sweep_limit_m=sweep_limit,
+                    hit_positions={key: tuple(value) for key, value in hit_positions.items()},
+                    hit_counts=hit_counts, first_turn_rule=first_turn_rule,
+                    scan_geometry=dict(angle_min_rad=amin, angle_max_rad=amax,
+                        angle_increment_rad=inc, range_min_m=lower, range_max_m=upper,
+                        original_ray_count=len(ranges), front_first_index=indices[0],
+                        front_last_index=indices[-1], front_ray_count=len(indices),
+                        finite_rays=len(points), positive_infinity_rays=no_return,
+                        invalid_rays=invalid))
                 self.error = None
         except (ValueError, TypeError, OverflowError, AttributeError) as exc:
             with self.lock:
                 self.error = str(exc)
+
+    @staticmethod
+    def _evidence_number(value):
+        # A missing/no-return coordinate is explicit JSON null, never NaN/Inf.
+        return value if type(value) in (int, float) and math.isfinite(value) else None
+
+    def _rejection_diagnostic(self, latest, now, phase, rule):
+        positions = latest['hit_positions'][rule]
+        first = positions[0]
+        def ray_snapshot(position):
+            index, angle, distance, classification, x, y, clearance, center = latest['rays'][position]
+            return dict(original_index=index, range_m=self._evidence_number(distance),
+                range_classification=classification, angle_laser_rad=angle,
+                angle_body_rad=self._evidence_number(angle+latest['settings']['laser_yaw_rad']),
+                x_body_m=self._evidence_number(x), y_body_m=self._evidence_number(y),
+                body_clearance_m=self._evidence_number(clearance),
+                turn_center_distance_m=self._evidence_number(center))
+        return dict(schema='simple-p2p-scan-rejection-v1', hit_rule=rule,
+            checked_phase=phase, check_monotonic_s=self._evidence_number(now),
+            source_monotonic_s=self._evidence_number(latest['source_monotonic_s']),
+            source_age_s=self._evidence_number(now-latest['source_monotonic_s']),
+            header_ns=latest['header_ns'], header_sequence=latest['header_sequence'],
+            frame_id=latest['frame_id'], frame_id_truncated=latest['frame_id_truncated'],
+            scan_geometry=dict(latest['scan_geometry']),
+            geometry={key: self._evidence_number(value) for key, value in latest['settings'].items()},
+            turn_sweep_limit_m=self._evidence_number(latest['sweep_limit_m']),
+            hit_count=latest['hit_counts'][rule], hit_limit=self.HIT_LIMIT,
+            hits_truncated=latest['hit_counts'][rule] > len(positions),
+            hits=[ray_snapshot(position) for position in positions],
+            neighbor_radius=self.NEIGHBOR_RADIUS, neighbors_within_measured_front180=True,
+            first_hit_neighbors=[ray_snapshot(position) for position in
+                range(max(0, first-self.NEIGHBOR_RADIUS),
+                      min(len(latest['rays']), first+self.NEIGHBOR_RADIUS+1))],
+            return_identity='unclassified')
 
     def __call__(self, now, phase):
         with self.lock:
@@ -213,17 +302,14 @@ class ScanGate:
         if phase == 'turn' and not self.turn_area_clear:
             return dict(ok=False, reason='front180 cannot prove rear turn clearance; operator turn-area check required',
                         source_monotonic_s=source)
-        s = self.settings
-        front, rear, half, margin = s['body_front_m'], s['body_rear_m'], s['body_half_width_m'], s['stop_clearance_m']
-        for x, y in latest['points']:
-            if phase == 'turn' and math.hypot(x, y) <= math.hypot(max(front, rear), half)+margin:
-                return dict(ok=False, reason='observed obstacle within whole-body turn sweep clearance',
-                            source_monotonic_s=source)
-            # Rectangle distance measures clearance from the body, not laser origin.
-            dx = max(-rear-x, 0., x-front)
-            dy = max(abs(y)-half, 0.)
-            if math.hypot(dx, dy) <= margin:
-                return dict(ok=False, reason='obstacle within body clearance', source_monotonic_s=source)
+        rule = latest['first_turn_rule'] if phase == 'turn' else None
+        if rule is None and latest['hit_counts']['body_rectangle_clearance']:
+            rule = 'body_rectangle_clearance'
+        if rule is not None:
+            reason = ('observed obstacle within whole-body turn sweep clearance'
+                      if rule == 'whole_body_turn_sweep_clearance' else 'obstacle within body clearance')
+            return dict(ok=False, reason=reason, source_monotonic_s=source,
+                        diagnostic=self._rejection_diagnostic(latest, now, phase, rule))
         return dict(ok=True, reason='measured front sector clear; rear is operator-checked',
                     source_monotonic_s=source)
 

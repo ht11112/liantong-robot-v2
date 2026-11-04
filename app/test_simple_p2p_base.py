@@ -160,6 +160,17 @@ class MCU:
         if kind == 3:
             period=self.sample_period_ms/1000.
             ready_at = max(ready_at,(math.floor(at/period)+1)*period+.002)
+            if self.stop_count == 2 and self.mode == 'final_stop_short_write':
+                return 10
+            if self.stop_count >= 2 and self.mode == 'all_final_stop_acks_lost':
+                return 20
+            if self.stop_count == 2 and self.mode == 'final_stop_ack_lost':
+                return 20
+            if self.stop_count == 2 and self.mode == 'final_stop_ack_fragment':
+                # Incomplete old ACK is read before its transaction times out;
+                # its remaining tail reaches the SAME FD after the new STOP.
+                self.queue.extend(((ready_at,reply[:46]),(at+.31,reply[46:])))
+                return 20
         self.queue.append((ready_at, reply))
         return 20
 
@@ -211,6 +222,7 @@ class BaseTests(unittest.TestCase):
         self.assertFalse(result["origin"]["MCU_encoder_reset"])
         self.assertEqual(result["arm_count"], 0)
         self.assertIsNone(result["final_stop_chain"])
+        self.assertIsNone(result['final_stop_recovery'])
         self.assertEqual(len(result["raw_events"]), 4)
 
     def test_origin_nonzero_fault_can_crc_or_short_never_controls(self):
@@ -757,6 +769,123 @@ class BaseTests(unittest.TestCase):
                 self.assertIn(reason,result['first_failure']['message'])
                 self.assertIsNone(result['position_verification']['confirmed_monotonic_s'])
                 self.assertIsNone(result['position_verification']['pose'])
+
+    def test_first_scan_rejection_keeps_owned_diagnostic_without_delaying_stop(self):
+        diagnostic=dict(schema='simple-p2p-scan-rejection-v1',header_ns=123456789,
+            hits=[dict(original_index=17,range_m=.15,x_body_m=.18,y_body_m=.14)])
+        rejected=[]
+        def gate(at,phase):
+            if phase=='drive' and at>100.8:
+                rejected.append(at)
+                return dict(ok=False,reason='obstacle within body clearance',
+                    source_monotonic_s=at-.01,diagnostic=diagnostic)
+            return dict(ok=True,source_monotonic_s=at-.01)
+        result,port=self.run_case(execute=True,scan=gate,sample_period_ms=100)
+        saved=result['first_scan_rejection']
+        self.assertEqual(len(rejected),1)
+        self.assertEqual(saved['reason'],'obstacle within body clearance')
+        self.assertEqual(saved['scan_phase'],'drive')
+        self.assertEqual(saved['diagnostic']['header_ns'],123456789)
+        self.assertEqual(saved['diagnostic']['hits'][0]['original_index'],17)
+        diagnostic['hits'][0]['range_m']=9.
+        self.assertEqual(saved['diagnostic']['hits'][0]['range_m'],.15)
+        stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=rejected[0])
+        self.assertLess(stop_at-rejected[0],.005)
+        self.assertFalse(result['session_complete'])
+
+    def test_missing_final_STOP_ack_gets_one_new_STOP_and_separate_current_proof(self):
+        for mode in ('final_stop_ack_lost','final_stop_ack_fragment'):
+            with self.subTest(mode=mode):
+                result,port=self.run_case(mode,execute=True,cancel_pending=True,
+                    delay=.02,sample_period_ms=100)
+                original,recovery=result['final_stop_chain'],result['final_stop_recovery']
+                self.assertIn('Session cancelled',result['first_failure']['message'])
+                self.assertFalse(original['complete'])
+                self.assertIsNone(original['ack'])
+                self.assertIn('300ms',original['error'])
+                self.assertEqual(original['failed_exchange']['kind'],3)
+                self.assertEqual(original['failed_exchange']['bytes_accepted'],20)
+                self.assertEqual(original['cancelled_wait']['cancelled_ticket']['kind'],7)
+                self.assertTrue(recovery['complete'],recovery)
+                self.assertEqual(recovery['attempt_count'],1)
+                self.assertTrue(recovery['independent_current_stop_only'])
+                self.assertFalse(recovery['position_verified'])
+                self.assertEqual(len(recovery['zero_samples']),5)
+                self.assertEqual(len({p['sample_sequence'] for p in recovery['zero_samples']}),5)
+                status_tick=recovery['stopped_status']['packet']['tick_ms']
+                self.assertTrue(all(0<(p[key]-status_tick)&0xffffffff<0x80000000
+                    for p in recovery['zero_samples'] for key in
+                    ('sample_tick_ms','left_tick_ms','right_tick_ms','speed_tick_ms')))
+                stops=[(at,raw) for at,raw in port.writes if raw[3]==3]
+                self.assertEqual(len(stops),3)  # Initial, failed final, one new recovery.
+                failed=original['failed_exchange']
+                self.assertGreaterEqual(stops[-1][0],failed['deadline_monotonic_s'])
+                self.assertNotEqual(stops[-1][1],stops[-2][1])
+                self.assertNotEqual(stops[-1][1][4:6],stops[-2][1][4:6])
+                self.assertTrue(all(raw[3] in (2,3,5) for at,raw in port.writes if at>=stops[-2][0]))
+                self.assertFalse(result['position_verified'])
+                self.assertFalse(result['motion_complete'])
+                self.assertFalse(result['session_complete'])
+                self.assertEqual(result['arm_count'],1)
+                if mode=='final_stop_ack_fragment':
+                    fragments=[e for e in result['raw_events'] if e['direction']=='rx' and len(e['raw_hex'])<128]
+                    self.assertTrue(any(len(e['raw_hex'])==92 for e in fragments))
+                    self.assertTrue(any(len(e['raw_hex'])==36 for e in fragments))
+
+    def test_two_missing_final_STOP_acks_end_without_a_third_recovery_or_success(self):
+        result,port=self.run_case('all_final_stop_acks_lost',execute=True,cancel_pending=True,
+            delay=.02,sample_period_ms=100)
+        self.assertEqual(sum(raw[3]==3 for _,raw in port.writes),3)
+        self.assertIn('Session cancelled',result['first_failure']['message'])
+        for proof in (result['final_stop_chain'],result['final_stop_recovery']):
+            self.assertFalse(proof['complete'])
+            self.assertIsNone(proof['ack'])
+            self.assertIn('300ms',proof['error'])
+        self.assertFalse(result['position_verified'])
+        self.assertFalse(result['motion_complete'])
+        self.assertFalse(result['session_complete'])
+
+    def test_short_final_STOP_write_stays_original_evidence_and_new_STOP_is_distinct(self):
+        result,port=self.run_case('final_stop_short_write',execute=True,cancel_pending=True,
+            delay=.02,sample_period_ms=100)
+        original,recovery=result['final_stop_chain'],result['final_stop_recovery']
+        self.assertIsNone(original['ack'])
+        self.assertIn('Short/unknown physical write',original['error'])
+        self.assertTrue(recovery['complete'])
+        stop_events=[e for e in result['raw_events'] if e['direction']=='tx' and e['kind']==3]
+        self.assertEqual([e['bytes_accepted'] for e in stop_events],[20,10,20])
+        self.assertIn('Short/unknown',stop_events[1]['error'])
+        self.assertEqual(original['failed_exchange']['reason'],'begin_failed')
+        self.assertNotEqual(stop_events[1]['raw_hex'],stop_events[2]['raw_hex'])
+        self.assertFalse(result['position_verified'])
+        self.assertFalse(result['motion_complete'])
+        self.assertFalse(result['session_complete'])
+
+    def test_acknowledged_STOP_with_failed_zero_proof_never_gets_missing_ack_recovery(self):
+        result,port=self.run_case('continuous_moving',execute=True,cancel_pending=True,
+            delay=.02,sample_period_ms=100)
+        self.assertIsNotNone(result['final_stop_chain']['ack'])
+        self.assertFalse(result['final_stop_chain']['complete'])
+        self.assertIsNone(result['final_stop_chain']['failed_exchange'])
+        self.assertIsNone(result['final_stop_recovery'])
+        self.assertEqual(sum(raw[3]==3 for _,raw in port.writes),2)
+        self.assertFalse(result['session_complete'])
+
+    def test_recovery_cannot_certify_position_or_arrival_after_normal_zero_seal(self):
+        result,port=self.run_case('final_stop_ack_lost',execute=True,sample_period_ms=100)
+        self.assertTrue(result['arrival_zero_seal']['complete'])
+        self.assertEqual(result['termination_reason'],'arrived')
+        self.assertEqual(result['first_failure']['phase'],'final_stop')
+        self.assertIn('300ms',result['first_failure']['message'])
+        self.assertFalse(result['final_stop_chain']['complete'])
+        self.assertTrue(result['final_stop_recovery']['complete'])
+        self.assertFalse(result['final_stop_recovery']['position_verified'])
+        self.assertIsNone(result['position_verification']['pose'])
+        self.assertIsNone(result['position_verification']['confirmed_monotonic_s'])
+        self.assertFalse(result['position_verified'])
+        self.assertFalse(result['motion_complete'])
+        self.assertFalse(result['session_complete'])
+        self.assertEqual(result['latest_odometry'],result['arrival_zero_seal']['pose'])
 
 
 if __name__ == "__main__": unittest.main()

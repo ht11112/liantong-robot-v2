@@ -152,7 +152,8 @@ class Broker:
         self.reference = dict(epoch=None, valid=False, pose=dict(x=0., y=0., yaw=0.),
                               reason="请停稳后点击里程计置零", version=0)
         self.task = dict(id=None, phase="idle", active=False, complete=False,
-                         stop_confirmed=False, position_verified=False, first_failure=None, goal=None)
+                         stop_confirmed=False, stop_confirmation_method=None, position_verified=False,
+                         first_failure=None, first_scan_rejection=None, goal=None)
         self.anchor, self.boot_id, self.task_start = None, None, None
         self.history, self.preview, self.seen_requests = [], None, {}
         self.last_received, self.error, self.busy = None, "等待 RK 连接", False
@@ -284,12 +285,18 @@ class Broker:
             if self.boot_id is not None and current_boot != self.boot_id:
                 self.invalidate("RK 已重启，旧坐标只作历史参考，请重新置零")
                 self.task_start = None
+                self.task.update(phase="historical", complete=False, stop_confirmed=False,
+                                 stop_confirmation_method=None, position_verified=False,
+                                 first_scan_rejection=None,
+                                 first_failure="RK 已重启，旧任务不能证明当前位姿或停车状态")
             self.boot_id = current_boot
             if active:
                 if self.task["id"] != active:
                     self.task_start = None
                     self.invalidate("发现 RK 活动任务，本地坐标待任务结束后重新置零")
-                    self.task.update(id=active, goal=None)
+                    self.task.update(id=active, goal=None, complete=False, stop_confirmed=False,
+                                     stop_confirmation_method=None, position_verified=False,
+                                     first_failure=None, first_scan_rejection=None)
                 self.task.update(active=True, phase="reconnecting")
             elif self.task["active"]:
                 # A lost start response must be resolved before any new origin/job.
@@ -300,7 +307,9 @@ class Broker:
                 self.update_task(self.call(dict(op="poll", task_id=finished_task_id)))
             except Exception:
                 with self.lock:
-                    self.task.update(active=False, phase="unknown", first_failure="RK 无活动任务；上次启动结果未取到")
+                    self.task.update(active=False, phase="unknown", complete=False, stop_confirmed=False,
+                                     stop_confirmation_method=None, position_verified=False,
+                                     first_scan_rejection=None, first_failure="RK 无活动任务；上次启动结果未取到")
                     self.invalidate("上次任务位置未核实，请重新置零")
         with self.lock:
             self.discovery_needed = False
@@ -349,7 +358,8 @@ class Broker:
                                   reason="当前静止位置和车头已设为局部原点", version=0,
                                   origin=copy.deepcopy(result.get("origin")))
             self.task.update(phase="idle", complete=False, stop_confirmed=False,
-                             position_verified=False, first_failure=None, goal=None)
+                             stop_confirmation_method=None, position_verified=False,
+                             first_failure=None, first_scan_rejection=None, goal=None)
             self.history, self.preview = [dict(self.reference["pose"])], None
             self.persist()
 
@@ -366,7 +376,8 @@ class Broker:
             self.task_start = data["start"]
             self.task = dict(id=data["request_id"], phase="starting", active=True,
                              goal=data["goal"], complete=False, stop_confirmed=False,
-                             position_verified=False, first_failure=None)
+                             stop_confirmation_method=None, position_verified=False,
+                             first_failure=None, first_scan_rejection=None)
             self.preview = None
             self.persist()
         response = self.call(dict(op="start", request_id=data["request_id"],
@@ -396,14 +407,16 @@ class Broker:
                 self.invalidate("任务记录来自此前 RK 启动，只作历史参考，请重新置零")
                 self.task_start = None
                 self.task.update(active=active, phase="historical", complete=False,
-                                 stop_confirmed=False, position_verified=False,
+                                 stop_confirmed=False, stop_confirmation_method=None,
+                                 position_verified=False, first_scan_rejection=None,
                                  first_failure="旧启动的任务结果不能证明当前位姿或停车状态")
                 self.persist()
                 return
             self.task.update(active=active, phase=live.get("phase", "running" if active else "finished"))
             if not active and not result:
                 self.task.update(phase="failed", complete=False, stop_confirmed=False,
-                                 position_verified=False, first_failure=response.get("startup_error") or
+                                 stop_confirmation_method=None, position_verified=False,
+                                 first_scan_rejection=None, first_failure=response.get("startup_error") or
                                  "RK 进程已退出，但没有完整结果；请检查现场并重新置零")
             if response.get("result_file"):
                 self.task["result_file"] = response["result_file"]
@@ -418,11 +431,15 @@ class Broker:
                 if isinstance(local_pose, dict):
                     source = local_pose.get("source_monotonic_s", source)
                 stop = result.get("final_stop_chain") or {}
-                self.task.update(complete=result.get("session_complete") is True,
-                                 stop_confirmed=stop.get("complete") is True,
-                                 position_verified=result.get("position_verified") is True,
+                recovery = result.get('final_stop_recovery') or {}
+                supplemental = recovery.get('complete') is True
+                self.task.update(complete=result.get("session_complete") is True and not supplemental,
+                                 stop_confirmed=stop.get("complete") is True or supplemental,
+                                 stop_confirmation_method=('primary' if stop.get('complete') is True else 'supplemental' if supplemental else None),
+                                 position_verified=result.get("position_verified") is True and not supplemental,
                                  first_failure=result.get("first_failure"),
-                                 phase="completed" if result.get("session_complete") else "failed")
+                                 first_scan_rejection=copy.deepcopy(result.get('first_scan_rejection')),
+                                 phase="completed" if result.get("session_complete") and not supplemental else "failed")
             if number(source) and number(current) and current >= source:
                 self.odometry_age_at_receipt = current-source
                 self.odometry_reference_mono = response.get("_pc_request_started_monotonic_s", self.last_received)
