@@ -152,6 +152,7 @@ class RemoteTests(unittest.TestCase):
         actual_obstacle=remote.load_config(remote.DEFAULT_CONFIG)[1]
         status=self.service.handle(dict(op='poll'))
         self.assertEqual(status['navigation_scan_config'],actual_obstacle)
+        self.assertEqual(status['navigation_arrival_policy'],remote.ARRIVAL_STOP_POLICY)
         self.assertEqual(self.probes,[])
         self.assertEqual(self.starts,[])
         # The path is this RK module's fixed package config, never a PC-supplied
@@ -166,8 +167,23 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(self.probes,[])
         self.assertEqual(self.starts,[])
 
+    def test_inventory_arrival_policy_is_actual_RK_constant_and_is_detached(self):
+        policy=dict(method='independent_inventory_policy',preSTOP_zero_seal_required=False,
+            final_position_verification_required=False,physical_stop_proof_required=True)
+        with patch.object(remote,'ARRIVAL_STOP_POLICY',policy):
+            status=self.service.handle(dict(op='poll'))
+        self.assertEqual(status['navigation_arrival_policy'],policy)
+        status['navigation_arrival_policy']['method']='changed_in_response'
+        self.assertEqual(policy['method'],'independent_inventory_policy')
+        self.assertEqual(self.probes,[])
+        self.assertEqual(self.starts,[])
+
     def test_compact_recovery_cannot_claim_original_position_or_task_success(self):
+        observed=dict(decision_monotonic_s=10.,source_monotonic_s=9.9,
+            measurement_monotonic_s=9.95,sample_sequence=3,pose=dict(x=.4,y=0.,yaw=0.),
+            goal=dict(x=.5,y=0.),distance_m=.1,tolerance_m=.1,final_stopped_pose_verified=False)
         result=dict(session_complete=True,motion_complete=True,position_verified=True,
+            arrival_reached=True,arrival_observation=observed,arrival_stop_policy=dict(remote.ARRIVAL_STOP_POLICY),
             final_stop_chain=dict(complete=False,position_verified=False,zero_samples=[]),
             final_stop_recovery=dict(complete=True,position_verified=True,
                 zero_samples=[dict(sample_sequence=i) for i in range(5)]))
@@ -178,6 +194,31 @@ class RemoteTests(unittest.TestCase):
         self.assertFalse(compact['final_stop_chain']['complete'])
         self.assertFalse(compact['final_stop_recovery']['position_verified'])
         self.assertTrue(result['final_stop_recovery']['position_verified'])
+        self.assertTrue(compact['arrival_reached'])
+        self.assertEqual(compact['arrival_observation'],observed)
+        self.assertEqual(compact['arrival_observation']['source_monotonic_s'],9.9)
+        self.assertEqual(compact['arrival_stop_policy'],remote.ARRIVAL_STOP_POLICY)
+
+    def test_compact_direct_arrival_success_does_not_claim_final_position_or_retimestamp_pose(self):
+        observation=dict(decision_monotonic_s=10.,source_monotonic_s=9.9,
+            measurement_monotonic_s=9.95,sample_sequence=3,pose=dict(x=.4,y=0.,yaw=0.),
+            goal=dict(x=.5,y=0.),distance_m=.1,tolerance_m=.1,final_stopped_pose_verified=False)
+        pose=dict(x=.4,y=0.,yaw=0.,source_monotonic_s=9.9,measurement_monotonic_s=9.95)
+        result=dict(arrival_reached=True,arrival_observation=observation,
+            arrival_stop_policy=dict(remote.ARRIVAL_STOP_POLICY),session_complete=True,
+            motion_complete=True,position_verified=False,latest_odometry=pose,
+            final_stop_chain=dict(complete=True,position_verified=False,
+                zero_samples=[dict(sample_sequence=15)]))
+        original=copy.deepcopy(result)
+        compact=remote.compact_result(result)
+        self.assertTrue(compact['session_complete'])
+        self.assertTrue(compact['arrival_reached'])
+        self.assertFalse(compact['position_verified'])
+        self.assertEqual(compact['arrival_observation'],observation)
+        self.assertEqual(compact['latest_odometry'],pose)
+        self.assertEqual(compact['latest_feedback']['sample_sequence'],15)
+        self.assertEqual(compact['latest_odometry']['source_monotonic_s'],9.9)
+        self.assertEqual(result,original)
 
     def test_incomplete_recovery_does_not_replace_primary_feedback_and_legacy_success_is_retained(self):
         old=dict(sample_sequence=3)
@@ -197,6 +238,9 @@ class RemoteTests(unittest.TestCase):
         self.assertTrue(compact['session_complete'])
         self.assertTrue(compact['motion_complete'])
         self.assertTrue(compact['position_verified'])
+        self.assertIsNone(compact['arrival_reached'])  # Old evidence is not upgraded by inference.
+        self.assertIsNone(compact['arrival_observation'])
+        self.assertIsNone(compact['arrival_stop_policy'])
 
     def test_bad_boot_missing_operator_flag_nonfinite_encoder_bool_and_path_injection_never_spawn(self):
         changes = [dict(expected_boot_id=TASK),dict(area_clear=False),dict(goal_x=float('nan')),

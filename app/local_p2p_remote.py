@@ -18,7 +18,7 @@ import time
 import uuid
 
 from simple_p2p import SimplePointController
-from simple_p2p_base import run_session
+from simple_p2p_base import ARRIVAL_STOP_POLICY, run_session
 from simple_p2p_runtime import DEFAULT_CONFIG, load_config
 
 
@@ -78,7 +78,8 @@ def compact_result(result):
     if result is None:
         return None
     keys = ('schema','boot_id','origin','latest_odometry','first_failure','session_complete',
-            'motion_complete','position_verified','final_distance_m','query_counts',
+            'motion_complete','arrival_reached','arrival_observation','arrival_stop_policy',
+            'position_verified','final_distance_m','query_counts',
             'complete_write_counts','exclusive_port_closed_normally','elapsed_s','arm_count',
             'position_verification','cleanup_errors','live_status_writer_complete',
             'history','history_timebase','control_metrics','odometry_continuity_validated',
@@ -220,7 +221,7 @@ class Remote:
         return dict(boot_id=self.boot(),active_jobs=active,
             active_task_id=active[0]['task_id'] if len(active) == 1 else None,
             last_task_id=None if latest is None else latest['task_id'],now_monotonic_s=self.clock(),
-            navigation_scan_config=dict(obstacle))
+            navigation_scan_config=dict(obstacle), navigation_arrival_policy=dict(ARRIVAL_STOP_POLICY))
 
     def status(self, task):
         path = self.paths(task)

@@ -167,6 +167,32 @@ class BrokerTest(unittest.TestCase):
                         latest_odometry=dict(x=.3,y=0,yaw=0))))
         self.assertFalse(self.broker.reference["valid"])
 
+    def test_direct_arrival_can_complete_without_final_position_and_never_anchors_old_pose(self):
+        self.reset()
+        anchor = self.broker.anchor.copy()
+        self.broker.task.update(id=rid(),active=True)
+        self.broker.task_start = dict(x=0.,y=0.,yaw=0.)
+        observation = dict(pose=dict(x=.41,y=0.,yaw=0.),source_monotonic_s=90.,distance_m=.09)
+        self.broker.update_task(dict(boot_id=self.remote.boot,task_id=self.broker.task['id'],active=False,
+            result=dict(boot_id=self.remote.boot,session_complete=True,position_verified=False,
+                arrival_reached=True,arrival_observation=observation,
+                arrival_stop_policy=dict(preSTOP_zero_seal_required=False,final_position_verification_required=False),
+                final_stop_chain=dict(complete=True),latest_feedback=dict(position_left_raw=500,position_right_raw=600),
+                latest_odometry=dict(x=.41,y=0.,yaw=0.,source_monotonic_s=90.)),now_monotonic_s=100.))
+        self.assertTrue(self.broker.task['complete'])
+        self.assertTrue(self.broker.task['arrival_reached'])
+        self.assertTrue(self.broker.task['stop_confirmed'])
+        self.assertEqual(self.broker.task['phase'],'completed')
+        self.assertFalse(self.broker.task['position_verified'])
+        self.assertIsNone(self.broker.task['first_failure'])
+        self.assertEqual(self.broker.anchor,anchor)
+        self.assertFalse(self.broker.reference['valid'])
+        self.assertEqual(self.broker.odometry_age_at_receipt,10.)
+        observation['distance_m']=99.
+        self.assertEqual(self.broker.task['arrival_observation']['distance_m'],.09)
+        with self.assertRaises(RequestError):
+            self.broker.submit('preview',dict(epoch=self.broker.reference['epoch'],x=.5,y=0.))
+
     def test_supplemental_stop_keeps_failure_and_never_restores_position_or_anchor(self):
         self.reset()
         anchor = self.broker.anchor.copy()
@@ -175,11 +201,13 @@ class BrokerTest(unittest.TestCase):
         diagnostic = dict(diagnostic=dict(hit_count=1,hits=[dict(range_m=.23,angle_body_rad=-1.3)]))
         self.broker.update_task(dict(boot_id=self.remote.boot,task_id=self.broker.task['id'],active=False,
             result=dict(boot_id=self.remote.boot,session_complete=True,position_verified=True,
+                arrival_reached=True,arrival_observation=dict(source_monotonic_s=90.),
                 first_failure='original scan failure',first_scan_rejection=diagnostic,
                 final_stop_chain=dict(complete=False),final_stop_recovery=dict(complete=True),
                 latest_feedback=dict(position_left_raw=500,position_right_raw=600),
                 latest_odometry=dict(x=.39,y=0.,yaw=0.,source_monotonic_s=90.)),now_monotonic_s=100.))
         self.assertTrue(self.broker.task['stop_confirmed'])
+        self.assertTrue(self.broker.task['arrival_reached'])
         self.assertEqual(self.broker.task['stop_confirmation_method'],'supplemental')
         self.assertFalse(self.broker.task['complete'])
         self.assertFalse(self.broker.task['position_verified'])
@@ -192,22 +220,28 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(self.broker.task['first_scan_rejection']['diagnostic']['hits'][0]['range_m'],.23)
 
     def test_old_scan_and_supplemental_evidence_cleared_on_reset_and_new_task(self):
-        stale = dict(first_scan_rejection=dict(diagnostic=dict(hit_count=1)),stop_confirmation_method='supplemental')
+        stale = dict(first_scan_rejection=dict(diagnostic=dict(hit_count=1)),stop_confirmation_method='supplemental',
+                     arrival_reached=True,arrival_observation=dict(old=True),arrival_stop_policy=dict(old=True))
         self.broker.task.update(stale)
         self.reset()
         self.assertIsNone(self.broker.task['first_scan_rejection'])
         self.assertIsNone(self.broker.task['stop_confirmation_method'])
+        self.assertFalse(self.broker.task['arrival_reached'])
+        self.assertIsNone(self.broker.task['arrival_observation'])
         self.broker.task.update(stale)
         command = self.command()
         self.broker.submit('execute',command)
         self.broker.cycle(self.broker.queue.get_nowait())
         self.assertIsNone(self.broker.task['first_scan_rejection'])
         self.assertIsNone(self.broker.task['stop_confirmation_method'])
+        self.assertFalse(self.broker.task['arrival_reached'])
+        self.assertIsNone(self.broker.task['arrival_stop_policy'])
 
     def test_no_result_or_foreign_boot_cannot_reuse_old_scan_or_parking_evidence(self):
         for foreign in (False,True):
             with self.subTest(foreign=foreign):
                 self.broker.task.update(id=rid(),active=True,first_scan_rejection=dict(old=True),
+                                        arrival_reached=True,arrival_observation=dict(old=True),
                                         stop_confirmation_method='supplemental',stop_confirmed=True)
                 result = dict(boot_id=rid(),session_complete=True) if foreign else None
                 self.broker.update_task(dict(boot_id=self.remote.boot,task_id=self.broker.task['id'],
@@ -215,10 +249,13 @@ class BrokerTest(unittest.TestCase):
                 self.assertIsNone(self.broker.task['first_scan_rejection'])
                 self.assertIsNone(self.broker.task['stop_confirmation_method'])
                 self.assertFalse(self.broker.task['stop_confirmed'])
+                self.assertFalse(self.broker.task['arrival_reached'])
+                self.assertIsNone(self.broker.task['arrival_observation'])
 
     def test_reboot_without_active_task_clears_current_scan_and_stop_claims(self):
         self.reset()
         self.broker.task.update(id=rid(),active=False,complete=True,position_verified=True,
+            arrival_reached=True,arrival_observation=dict(old=True),
             first_scan_rejection=dict(old_boot=True),stop_confirmation_method='supplemental',stop_confirmed=True)
         old_id = self.broker.task['id']
         self.remote.boot = rid()
@@ -230,6 +267,8 @@ class BrokerTest(unittest.TestCase):
             self.assertFalse(self.broker.task[key])
         for key in ('first_scan_rejection','stop_confirmation_method'):
             self.assertIsNone(self.broker.task[key])
+        self.assertFalse(self.broker.task['arrival_reached'])
+        self.assertIsNone(self.broker.task['arrival_observation'])
 
     def test_map_hash_mismatch_refused(self):
         with self.assertRaises(ValueError):
@@ -253,6 +292,25 @@ class BrokerTest(unittest.TestCase):
         self.remote.request = original
         self.broker.discover()
         self.assertIsNone(self.broker.snapshot()['scan_configuration'])
+
+    def test_arrival_policy_is_read_from_RK_and_missing_metadata_is_unknown(self):
+        original = self.remote.request
+        policy = dict(method='direct_STOP_on_odom_tolerance',preSTOP_zero_seal_required=False)
+        def configured(payload):
+            result = original(payload)
+            if payload == dict(op='poll'):
+                result['navigation_arrival_policy'] = policy
+            return result
+        self.remote.request = configured
+        source_time = self.broker.odometry_reference_mono
+        self.broker.discover()
+        self.assertFalse(self.broker.snapshot()['arrival_configuration']['preSTOP_zero_seal_required'])
+        self.assertEqual(self.broker.odometry_reference_mono,source_time)
+        policy['preSTOP_zero_seal_required']=True
+        self.assertFalse(self.broker.snapshot()['arrival_configuration']['preSTOP_zero_seal_required'])
+        self.remote.request = original
+        self.broker.discover()
+        self.assertIsNone(self.broker.snapshot()['arrival_configuration'])
 
     def test_repeated_disconnect_does_not_increment_an_already_invalid_reference(self):
         self.reset()

@@ -484,6 +484,43 @@ class ScanGateTests(unittest.TestCase):
             self.assertEqual(state['pose_measurement_monotonic_s'],9.95)
             self.assertEqual(state['pose']['x'],.39)
 
+    def test_direct_arrival_fact_is_owned_and_parking_raw_does_not_verify_or_renew_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer=LiveStatusWriter(Path(directory)/'live.json','boot',clock=lambda:12.)
+            writer.submit(dict(event='odometry',phase='drive',event_monotonic_s=10.,
+                source_monotonic_s=9.9,measurement_monotonic_s=9.95,
+                raw_packet=dict(sample_sequence=3),pose=dict(x=.4,y=0.,yaw=0.)))
+            final_packet=dict(sample_sequence=15,position_left_raw=100,position_right_raw=200)
+            writer.submit(dict(event='odometry',phase='final_stop',event_monotonic_s=11.,
+                source_monotonic_s=10.9,raw_packet=final_packet,pose=None))
+            observation=dict(decision_monotonic_s=10.,source_monotonic_s=9.9,
+                measurement_monotonic_s=9.95,sample_sequence=3,pose=dict(x=.4,y=0.,yaw=0.),
+                goal=dict(x=.5,y=0.),distance_m=.1,tolerance_m=.1,final_stopped_pose_verified=False)
+            policy=dict(method='direct_STOP_on_odom_tolerance',preSTOP_zero_seal_required=False,
+                final_position_verification_required=False,physical_stop_proof_required=True)
+            result=dict(session_complete=True,position_verified=False,arrival_reached=True,
+                arrival_observation=observation,arrival_stop_policy=policy,
+                # A later raw packet cannot make an unverified pose trustworthy.
+                latest_odometry=dict(x=999.,y=0.,yaw=0.,source_monotonic_s=10.9),
+                final_stop_chain=dict(complete=True,position_verified=False,zero_samples=[final_packet]))
+            writer.start()
+            self.assertTrue(writer.close(result))
+            observation['pose']['x']=999.
+            policy['final_position_verification_required']=True
+            writer._write()
+            state=json.loads(writer.path.read_text(encoding='utf-8'))
+            self.assertTrue(state['session_complete'])
+            self.assertTrue(state['arrival_reached'])
+            self.assertFalse(state['position_verified'])
+            self.assertEqual(state['arrival_observation']['pose']['x'],.4)
+            self.assertEqual(state['arrival_observation']['source_monotonic_s'],9.9)
+            self.assertFalse(state['arrival_stop_policy']['final_position_verification_required'])
+            self.assertEqual(state['raw_packet']['sample_sequence'],15)
+            self.assertEqual(state['source_monotonic_s'],10.9)
+            self.assertEqual(state['pose']['x'],.4)
+            self.assertEqual(state['pose_source_monotonic_s'],9.9)
+            self.assertEqual(state['pose_measurement_monotonic_s'],9.95)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -152,6 +152,7 @@ class Broker:
         self.reference = dict(epoch=None, valid=False, pose=dict(x=0., y=0., yaw=0.),
                               reason="请停稳后点击里程计置零", version=0)
         self.task = dict(id=None, phase="idle", active=False, complete=False,
+                         arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                          stop_confirmed=False, stop_confirmation_method=None, position_verified=False,
                          first_failure=None, first_scan_rejection=None, goal=None)
         self.anchor, self.boot_id, self.task_start = None, None, None
@@ -161,6 +162,7 @@ class Broker:
         self.odometry_reference_mono = None
         self.last_probe = None
         self.scan_configuration = None
+        self.arrival_configuration = None
         self.discovery_needed, self.next_inventory = True, 0.
         if self.state_file and self.state_file.is_file():
             saved = json.loads(self.state_file.read_text(encoding="utf-8"))
@@ -190,6 +192,7 @@ class Broker:
                         snapshot_age_s=age, boot_id=self.boot_id,
                         last_probe=copy.deepcopy(self.last_probe),
                         scan_configuration=copy.deepcopy(self.scan_configuration),
+                        arrival_configuration=copy.deepcopy(self.arrival_configuration),
                         odometry_age_s=(None if self.odometry_reference_mono is None else
                                         self.odometry_age_at_receipt+self.clock()-self.odometry_reference_mono),
                         limits=dict(linear_m_s=.03, angular_deg_s=6.9, arrival_m=.1,
@@ -288,6 +291,7 @@ class Broker:
                 self.invalidate("RK 已重启，旧坐标只作历史参考，请重新置零")
                 self.task_start = None
                 self.task.update(phase="historical", complete=False, stop_confirmed=False,
+                                 arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                                  stop_confirmation_method=None, position_verified=False,
                                  first_scan_rejection=None,
                                  first_failure="RK 已重启，旧任务不能证明当前位姿或停车状态")
@@ -296,11 +300,15 @@ class Broker:
             minimum = settings.get('min_usable_range_m') if isinstance(settings, dict) else None
             self.scan_configuration = (copy.deepcopy(settings)
                 if number(minimum) and minimum >= 0 else None)
+            arrival_policy = inventory.get('navigation_arrival_policy')
+            self.arrival_configuration = (copy.deepcopy(arrival_policy)
+                if isinstance(arrival_policy, dict) else None)
             if active:
                 if self.task["id"] != active:
                     self.task_start = None
                     self.invalidate("发现 RK 活动任务，本地坐标待任务结束后重新置零")
                     self.task.update(id=active, goal=None, complete=False, stop_confirmed=False,
+                                     arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                                      stop_confirmation_method=None, position_verified=False,
                                      first_failure=None, first_scan_rejection=None)
                 self.task.update(active=True, phase="reconnecting")
@@ -314,6 +322,7 @@ class Broker:
             except Exception:
                 with self.lock:
                     self.task.update(active=False, phase="unknown", complete=False, stop_confirmed=False,
+                                     arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                                      stop_confirmation_method=None, position_verified=False,
                                      first_scan_rejection=None, first_failure="RK 无活动任务；上次启动结果未取到")
                     self.invalidate("上次任务位置未核实，请重新置零")
@@ -364,6 +373,7 @@ class Broker:
                                   reason="当前静止位置和车头已设为局部原点", version=0,
                                   origin=copy.deepcopy(result.get("origin")))
             self.task.update(phase="idle", complete=False, stop_confirmed=False,
+                             arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                              stop_confirmation_method=None, position_verified=False,
                              first_failure=None, first_scan_rejection=None, goal=None)
             self.history, self.preview = [dict(self.reference["pose"])], None
@@ -381,6 +391,7 @@ class Broker:
                 raise RuntimeError(self.reference["reason"])
             self.task_start = data["start"]
             self.task = dict(id=data["request_id"], phase="starting", active=True,
+                             arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                              goal=data["goal"], complete=False, stop_confirmed=False,
                              stop_confirmation_method=None, position_verified=False,
                              first_failure=None, first_scan_rejection=None)
@@ -413,6 +424,7 @@ class Broker:
                 self.invalidate("任务记录来自此前 RK 启动，只作历史参考，请重新置零")
                 self.task_start = None
                 self.task.update(active=active, phase="historical", complete=False,
+                                 arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                                  stop_confirmed=False, stop_confirmation_method=None,
                                  position_verified=False, first_scan_rejection=None,
                                  first_failure="旧启动的任务结果不能证明当前位姿或停车状态")
@@ -421,6 +433,7 @@ class Broker:
             self.task.update(active=active, phase=live.get("phase", "running" if active else "finished"))
             if not active and not result:
                 self.task.update(phase="failed", complete=False, stop_confirmed=False,
+                                 arrival_reached=False, arrival_observation=None, arrival_stop_policy=None,
                                  stop_confirmation_method=None, position_verified=False,
                                  first_scan_rejection=None, first_failure=response.get("startup_error") or
                                  "RK 进程已退出，但没有完整结果；请检查现场并重新置零")
@@ -440,6 +453,9 @@ class Broker:
                 recovery = result.get('final_stop_recovery') or {}
                 supplemental = recovery.get('complete') is True
                 self.task.update(complete=result.get("session_complete") is True and not supplemental,
+                                 arrival_reached=result.get('arrival_reached') is True,
+                                 arrival_observation=copy.deepcopy(result.get('arrival_observation')),
+                                 arrival_stop_policy=copy.deepcopy(result.get('arrival_stop_policy')),
                                  stop_confirmed=stop.get("complete") is True or supplemental,
                                  stop_confirmation_method=('primary' if stop.get('complete') is True else 'supplemental' if supplemental else None),
                                  position_verified=result.get("position_verified") is True and not supplemental,

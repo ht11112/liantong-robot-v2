@@ -42,10 +42,8 @@ class MCU:
         self.applied_target = (0,0)
         self.parking_sequence, self.parking_sources, self.parking_speed = None,0,(0,0)
         self.query_overlap_count = 0
-        self.arrival_zero_at = None
         self.blind_until = self.blind_sample_origin = self.blind_sequence = None
         self.last_feedback_sequence = self.last_feedback_speed_tick = None
-        self.seal_sequences = set()
 
     def write(self, raw):
         if raw[3] != 3 and self.queue:
@@ -71,9 +69,7 @@ class MCU:
             self.state, self.session, self.rx, self.arm_at = 2, session, sequence, at
         elif kind == 7:
             self.state, self.target, self.rx = 5, (left, right), sequence
-            if (left,right) == (0,0) and self.arrival_zero_at is None:
-                self.arrival_zero_at = at
-            if self.mode not in ("not_applied","ack_progress") and not (self.mode == 'seal_unapplied' and (left,right) == (0,0)):
+            if self.mode not in ("not_applied","ack_progress"):
                 self.applied, self.applied_target = sequence,(left,right)
         if self.state == 2 and at-self.arm_at >= (.8 if self.mode == "slow_arm" else .09):
             self.state = 10
@@ -87,8 +83,6 @@ class MCU:
                 sample_seq = self.blind_sequence+periods
             if self.mode == "gap" and self.arm_at is not None and self.target != (0, 0):
                 sample_seq += 2
-            if self.mode == 'seal_gap' and self.arrival_zero_at is not None:
-                sample_seq += 2
             if self.mode in ("parking_gap","settle_with_gap") and self.stop_count == 2:
                 sample_seq += 2
             if self.mode == "frozen": sample_tick, sample_seq = 100000, 2000
@@ -98,7 +92,6 @@ class MCU:
                 self.speed_sample, self.sampled_speed = sample_tick, (l, r)
             l, r = self.sampled_speed
             if self.mode == "origin_nonzero" and self.arm_at is None: l = 1
-            if self.mode == 'seal_nonzero' and self.arrival_zero_at is not None: l,r = .4,0.
             if self.first_old and (self.mode != "new_parking_nonzero" or tick > self.last_stopped_status_tick):
                 sample_tick = self.stop_tick-10 if self.mode == "old_parking" else self.last_stopped_status_tick+1
                 sample_seq, l, r = sample_tick//self.sample_period_ms, -.5, 0
@@ -129,9 +122,8 @@ class MCU:
                 words[4] = 1
             if self.mode == 'stop_blind_encoder_changed' and self.stop_count == 2:
                 words[4] = 1
-            if self.mode in ('seal_encoder_chatter','seal_encoder_once') and self.arrival_zero_at is not None:
-                self.seal_sequences.add(sample_seq)
-                words[4] = (sample_seq & 1) if self.mode == 'seal_encoder_chatter' else int(len(self.seal_sequences) >= 3)
+            if self.mode == 'parking_encoder_chatter' and self.stop_count == 2:
+                words[4] = sample_seq & 1
             self.last_feedback_sequence = sample_seq
             self.last_feedback_speed_tick = sample_tick
         else:
@@ -140,8 +132,6 @@ class MCU:
             target_pack = (self.target[0] & 65535) | ((self.target[1] & 65535)<<16)
             applied = self.applied
             if self.mode == "not_applied": target_pack = 0
-            if self.mode == 'seal_unapplied' and self.arrival_zero_at is not None:
-                target_pack = (self.applied_target[0]&65535)|((self.applied_target[1]&65535)<<16)
             if self.mode == 'ack_progress' and kind == 7:
                 target_pack = (self.applied_target[0]&65535)|((self.applied_target[1]&65535)<<16)
             flags = (self.state<<8) | (5 if self.state == 1 else 1)
@@ -262,7 +252,7 @@ class BaseTests(unittest.TestCase):
         targets = [(at, struct.unpack_from("<hh", raw, 6)) for at, raw in port.writes if raw[3] == 7]
         self.assertTrue(targets)
         self.assertTrue(all(pair in ((2,-2),(0,0)) for _, pair in targets))
-        self.assertEqual(targets[-1][1],(0,0))
+        self.assertEqual(targets[-1][1],(2,-2))  # No preSTOP zero target stage.
         self.assertTrue(all(b[0]-a[0] >= .05-1e-10 for a,b in zip(targets,targets[1:])))
         self.assertLess(result["arm_handoff"]["after"]["position_left_raw"]+0., 1.)
 
@@ -314,35 +304,43 @@ class BaseTests(unittest.TestCase):
         self.assertEqual(result["arm_count"],0)
         self.assertTrue(result["final_stop_chain"]["complete"])
 
-    def test_stopped_position_holds_measured_zero_pose_and_rejects_encoder_change_or_outside_tolerance(self):
+    def test_arrival_trigger_is_measured_and_does_not_claim_final_stopped_position(self):
         result, _ = self.run_case(execute=True)
-        self.assertTrue(result["position_verified"])
-        self.assertFalse(any("parking_odometry" in row for row in result["rows"]))
-        self.assertEqual(result["latest_odometry"]["sample_sequence"],
-                         result["arrival_zero_seal"]["raw_packet"]["sample_sequence"])
-        result, _ = self.run_case(execute=True, goal_x=1.)
-        self.assertFalse(result["session_complete"])
-        self.assertFalse(result["motion_complete"])
-        self.assertIn("outside arrival tolerance",result["first_failure"]["message"])
-        self.assertTrue(result["final_stop_chain"]["complete"])
-        result, _ = self.run_case("stop_blind_encoder_changed",execute=True,sample_period_ms=100)
-        self.assertTrue(result["final_stop_chain"]["complete"])
-        self.assertFalse(result["position_verified"])
-        self.assertFalse(result["motion_complete"])
-        self.assertIn("Post-STOP encoder changed",result["first_failure"]["message"])
+        self.assertTrue(result['arrival_reached'])
+        self.assertTrue(result['session_complete'],result['first_failure'])
+        observation=result['arrival_observation']
+        self.assertLessEqual(observation['distance_m'],observation['tolerance_m'])
+        self.assertEqual(observation['goal'],dict(x=0.,y=0.))
+        self.assertEqual(observation['sample_sequence'],result['latest_odometry']['sample_sequence'])
+        self.assertEqual(observation['source_monotonic_s'],result['latest_odometry']['source_monotonic_s'])
+        self.assertEqual(result['arrival_stop_policy'],base.ARRIVAL_STOP_POLICY)
+        self.assertFalse(result['position_verified'])
+        self.assertIsNone(result['arrival_zero_seal'])
+        self.assertNotIn('normal_quiesce',result)
+        self.assertNotIn('final_distance_m',result)
+        self.assertEqual(result['position_verification']['method'],'not_requested')
+        self.assertIsNone(result['position_verification']['pose'])
+        self.assertFalse(any('parking_odometry' in row for row in result['rows']))
+        result, _ = self.run_case(execute=True,goal_x=1.)
+        self.assertFalse(result['arrival_reached'])
+        self.assertIsNone(result['arrival_observation'])
+        self.assertFalse(result['session_complete'])
+        self.assertFalse(result['motion_complete'])
+        self.assertIn('outside measured odometry tolerance',result['first_failure']['message'])
+        self.assertTrue(result['final_stop_chain']['complete'])
 
-    def test_no_arm_arrived_boundary_has_final_encoder_bound_position_evidence(self):
-        result, port = self.run_case(execute=True, phases=(), goal_x=.1)
-        self.assertTrue(result["session_complete"],result["first_failure"])
-        self.assertTrue(result["position_verified"])
-        self.assertEqual(result["final_distance_m"],.1)
-        self.assertEqual(result["arm_count"],0)
+    def test_no_arm_arrival_boundary_is_triggered_without_final_position_claim(self):
+        result,port=self.run_case(execute=True,phases=(),goal_x=.1)
+        self.assertTrue(result['session_complete'],result['first_failure'])
+        self.assertTrue(result['arrival_reached'])
+        self.assertEqual(result['arrival_observation']['distance_m'],.1)
+        self.assertEqual(result['arrival_observation']['pose'],dict(x=0.,y=0.,yaw=0.))
+        self.assertEqual(result['arm_count'],0)
         self.assertFalse(any(raw[3] in (6,7) for _,raw in port.writes))
-        evidence=result["position_verification"]
-        self.assertEqual(evidence["method"],"encoder_unchanged_since_origin")
-        self.assertTrue(evidence["all_observed_encoders_unchanged"])
-        self.assertEqual(evidence["final_post_status_sample"],result["final_stop_chain"]["zero_samples"][-1])
-        self.assertEqual(evidence["pose"],dict(x=0.,y=0.,yaw=0.))
+        self.assertTrue(result['final_stop_chain']['complete'])
+        self.assertFalse(result['position_verified'])
+        self.assertEqual(result['position_verification']['method'],'not_requested')
+        self.assertIsNone(result['position_verification']['pose'])
 
     def test_no_arm_encoder_change_cannot_be_reported_as_arrived(self):
         result, port = self.run_case("encoder_changed",execute=True,phases=(),goal_x=.1)
@@ -354,7 +352,8 @@ class BaseTests(unittest.TestCase):
         self.assertFalse(result["position_verified"])
         self.assertFalse(result["encoder_unchanged_since_origin"])
         self.assertIsNotNone(result["first_origin_encoder_change"])
-        self.assertIsNone(result["position_verification"]["pose"])
+        self.assertFalse(result["arrival_reached"])
+        self.assertIsNone(result["arrival_observation"])
         self.assertIn("Encoder changed",result["first_failure"]["message"])
 
     def test_expected_encoder_mismatch_at_origin_or_during_preparation_never_arms(self):
@@ -578,20 +577,102 @@ class BaseTests(unittest.TestCase):
         self.assertEqual(result['arm_count'],1)
         self.assertFalse(result['motion_complete'])
 
-    def test_normal_arrival_drains_original_transaction_then_zero_seals_before_stop(self):
-        result,port=self.run_case('ack_progress',execute=True,delay=.021,sample_period_ms=100,
-                                  phases=('drive','drive'))
-        quiesce=result['normal_quiesce'];pending=quiesce['pending']
-        self.assertIsNotNone(pending)
-        self.assertTrue(quiesce['complete'])
-        self.assertEqual(quiesce['queries_started'],0)
-        self.assertLess(quiesce['completed_monotonic_s'],pending['deadline_monotonic_s'])
-        after=[(at,raw) for at,raw in port.writes if at>=quiesce['started_monotonic_s']]
-        zero_at=next(at for at,raw in after if raw[3]==7 and struct.unpack_from('<hh',raw,6)==(0,0))
-        self.assertGreaterEqual(zero_at,quiesce['completed_monotonic_s'])
-        stop_at=next(at for at,raw in after if raw[3]==3)
-        self.assertGreaterEqual(stop_at,result['arrival_zero_seal']['completed_monotonic_s'])
+    def test_arrival_during_inflight_setpoint_sends_immediate_STOP_without_drain_or_zero_targets(self):
+        class Quick(Script):
+            def __init__(self,clock):
+                super().__init__(clock);self.calls=0
+            def tick(self,pose,now):
+                self.calls+=1
+                if self.calls>=3:
+                    return Command('stop',0.,0.,'arrived',0.,0.)
+                return Command('drive',.03,0.,'moving',.5,0.)
+        result,port=self.run_case(execute=True,sample_period_ms=100,
+            delay=lambda kind:.08 if kind==7 else 0.,controller_factory=Quick)
+        self.assertTrue(result['session_complete'],result['first_failure'])
+        observation=result['arrival_observation']
+        cancelled=result['final_stop_chain']['cancelled_wait']['cancelled_ticket']
+        self.assertIsNotNone(cancelled)
+        self.assertEqual(cancelled['kind'],7)
+        at=observation['decision_monotonic_s']
+        after=[(time,raw) for time,raw in port.writes if time>=at]
+        self.assertEqual(after[0][1][3],3)
+        self.assertLess(after[0][0]-at,.005)
+        self.assertLess(after[0][0],cancelled['deadline_monotonic_s'])
+        self.assertTrue(all(raw[3] in (2,3,5) for _,raw in after))
+        self.assertIsNone(result['arrival_zero_seal'])
+        self.assertNotIn('normal_quiesce',result)
+        self.assertEqual(port.query_overlap_count,0)
 
+    def test_delayed_arrival_cannot_bypass_source_or_original_task_deadline(self):
+        class Delayed(Script):
+            def tick(self,pose,now):
+                command=super().tick(pose,now)
+                if command.reason=='arrived':
+                    self.clock.sleep(.75)
+                return command
+        result,_=self.run_case(execute=True,sample_period_ms=100,controller_factory=Delayed)
+        self.assertFalse(result['arrival_reached'])
+        self.assertIsNone(result['arrival_observation'])
+        self.assertIn('Host feedback source age',result['first_failure']['message'])
+        self.assertFalse(result['session_complete'])
+        self.assertTrue(result['final_stop_chain']['complete'])
+
+        class Short(Script):
+            config=Config(duration_s=1.)
+        result,_=self.run_case(execute=True,sample_period_ms=100,controller_factory=Short)
+        self.assertFalse(result['arrival_reached'])
+        self.assertIn('Task deadline',result['first_failure']['message'])
+        self.assertFalse(result['session_complete'])
+        class Pending(Script):
+            def __init__(self,clock):
+                super().__init__(clock);self.calls=0
+            def tick(self,pose,now):
+                self.calls+=1
+                if self.calls>=3:
+                    self.clock.sleep(.31)
+                    return Command('stop',0.,0.,'arrived',0.,0.)
+                return Command('drive',.03,0.,'moving',.5,0.)
+        result,_=self.run_case(execute=True,sample_period_ms=100,controller_factory=Pending,
+            delay=lambda kind:.29 if kind==7 else 0.)
+        self.assertFalse(result['arrival_reached'])
+        self.assertIn('300ms exchange response deadline',result['first_failure']['message'])
+        self.assertFalse(result['session_complete'])
+        self.assertTrue(result['final_stop_chain']['complete'])
+
+    def test_delayed_arrival_rechecks_cancel_and_cached_scan_before_latching(self):
+        for cause in ('cancel','scan'):
+            with self.subTest(cause=cause):
+                state=dict(delayed=False,source=None,finished_at=None)
+                class Quick(Script):
+                    def __init__(self,clock):
+                        super().__init__(clock);self.calls=0
+                    def tick(self,pose,now):
+                        self.calls+=1
+                        if self.calls>=3:
+                            self.clock.sleep(.02)
+                            state.update(delayed=True,finished_at=self.clock.value)
+                            return Command('stop',0.,0.,'arrived',0.,0.)
+                        return Command('drive',.03,0.,'moving',.5,0.)
+                def scan(at,phase):
+                    if not state['delayed']:
+                        state['source']=at-(.74 if cause=='scan' else .01)
+                    return dict(ok=True,reason='cached finite far rays',source_monotonic_s=state['source'])
+                result,port=self.run_case(execute=True,sample_period_ms=100,controller_factory=Quick,
+                    delay=lambda kind:.08 if kind==7 else 0.,scan=scan,
+                    cancelled=lambda:state['delayed'] and cause=='cancel')
+                self.assertTrue(state['delayed'])
+                self.assertFalse(result['arrival_reached'])
+                self.assertIsNone(result['arrival_observation'])
+                self.assertFalse(result['session_complete'])
+                self.assertIn('Session cancelled' if cause=='cancel' else 'Scan/clearance rejected',
+                              result['first_failure']['message'])
+                stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=state['finished_at'])
+                self.assertLess(stop_at-state['finished_at'],.005)
+                self.assertTrue(all(raw[3] in (2,3,5) for at,raw in port.writes if at>=state['finished_at']))
+                if cause=='scan':
+                    rejected=result['first_scan_rejection']
+                    self.assertFalse(rejected['ok'])
+                    self.assertGreaterEqual(rejected['checked_monotonic_s']-rejected['source_monotonic_s'],.75)
     def test_true_source_expiration_does_not_receive_a_new_history_timestamp(self):
         def slow_control(clock):
             class Paused(Script):
@@ -657,119 +738,53 @@ class BaseTests(unittest.TestCase):
         self.assertNotIn('measurement time must strictly increase',str(result['first_failure']))
         self.assertEqual(result['history_timebase']['method'],'origin_first_source_plus_MCU_speed_tick_modular_delta')
 
-    def test_normal_arrival_seals_before_realistic_STOP_blind_window_without_inventing_odom(self):
+    def test_direct_arrival_allows_real_STOP_sample_blind_window_without_inventing_position(self):
         events=[]
         result,port=self.run_case('stop_blind',execute=True,sample_period_ms=100,event_sink=events.append)
         self.assertTrue(result['session_complete'],result['first_failure'])
-        self.assertTrue(result['position_verified'])
-        seal=result['arrival_zero_seal'];proof=result['position_verification']
-        self.assertTrue(seal['complete'])
-        self.assertEqual(len(seal['zero_samples']),5)
-        applied=seal['applied_observation']
-        self.assertTrue(all(all(0<(p[key]-applied['tick_ms'])&0xffffffff<0x80000000
-            for key in ('sample_tick_ms','left_tick_ms','right_tick_ms','speed_tick_ms'))
-            for p in seal['zero_samples']))
-        self.assertEqual(len({(p['position_left_raw'],p['position_right_raw']) for p in seal['zero_samples']}),1)
+        self.assertTrue(result['arrival_reached'])
+        self.assertTrue(result['final_stop_chain']['complete'])
+        observation=result['arrival_observation']
         parking=[r for r in result['rows'] if r['phase']=='final_stop' and r['kind']==5]
-        first=parking[0]['packet'];before=seal['raw_packet']
+        first=parking[0]['packet'];before=result['latest_odometry']
         self.assertEqual((first['sample_sequence']-before['sample_sequence'])&0xffffffff,1)
-        self.assertEqual((first['speed_tick_ms']-before['speed_tick_ms'])&0xffffffff,432)
-        self.assertTrue(all('parking_odometry' not in r and 'odometry' not in r for r in parking))
-        self.assertEqual(result['latest_odometry'],seal['pose'])
-        self.assertEqual(result['final_stop_chain']['final_odometry'],seal['pose'])
-        self.assertEqual(proof['method'],'preSTOP_measured_zero_plus_unchanged_encoders')
-        self.assertEqual(proof['seal_source_monotonic_s'],seal['pose']['source_monotonic_s'])
-        self.assertEqual(proof['seal_measurement_monotonic_s'],seal['pose']['measurement_monotonic_s'])
-        self.assertGreater(proof['final_confirmation_source_monotonic_s'],proof['seal_source_monotonic_s'])
-        self.assertFalse(proof['STOP_blind_interval_integrated'])
+        self.assertEqual((first['speed_tick_ms']-before['mcu_speed_tick_ms'])&0xffffffff,432)
+        self.assertTrue(all('parking_odometry' not in row and 'odometry' not in row for row in parking))
+        self.assertEqual(observation['source_monotonic_s'],before['source_monotonic_s'])
+        self.assertEqual(observation['measurement_monotonic_s'],before['measurement_monotonic_s'])
+        self.assertFalse(result['position_verified'])
+        self.assertIsNone(result['position_verification']['pose'])
+        self.assertFalse(result['position_verification']['STOP_blind_interval_integrated'])
         self.assertFalse(result['odometry_continuity_validated'])
         self.assertTrue(result['motion_odometry_continuity_validated'])
         self.assertTrue(result['history_timebase']['STOP_history_cut'])
         self.assertEqual(result['history']['count'],0)
         self.assertFalse(result['history_timebase']['missing_motion_recovered'])
-        final_pose_events=[e for e in events if e['pose'] is not None]
-        self.assertEqual(final_pose_events[-1]['pose_sample_sequence'],seal['raw_packet']['sample_sequence'])
-        self.assertEqual(port.query_overlap_count,0)
+        final_pose_events=[event for event in events if event['pose'] is not None]
+        self.assertEqual(final_pose_events[-1]['pose_sample_sequence'],observation['sample_sequence'])
 
-    def test_zero_seal_requires_real_application_and_consecutive_encoder_stable_feedback(self):
-        result,_=self.run_case('seal_unapplied',execute=True,sample_period_ms=100)
-        self.assertIn('not observed applied within 300ms',result['first_failure']['message'])
-        self.assertFalse(result['arrival_zero_seal']['complete'])
-        self.assertIsNone(result['arrival_zero_seal']['applied_observation'])
-        self.assertNotIn('position_verification',result)
-        result,_=self.run_case('seal_encoder_once',execute=True,sample_period_ms=100)
-        self.assertTrue(result['session_complete'],result['first_failure'])
-        seal=result['arrival_zero_seal']
-        self.assertEqual(seal['encoder_run_restarts'],1)
-        self.assertEqual(len(seal['zero_samples']),5)
-        self.assertTrue(all(p['position_left_raw']==1 for p in seal['zero_samples']))
-        for mode in ('seal_encoder_chatter','seal_nonzero'):
-            with self.subTest(mode=mode):
-                result,port=self.run_case(mode,execute=True,sample_period_ms=100)
-                seal=result['arrival_zero_seal']
-                self.assertFalse(seal['complete'])
-                self.assertIn('measured-zero seal timed out',result['first_failure']['message'])
-                stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=seal['started_monotonic_s'])
-                self.assertLess(stop_at,seal['deadline_monotonic_s']+.002)
-                self.assertFalse(result['motion_complete'])
-                self.assertNotIn('position_verification',result)
 
-    def test_gap_during_zero_seal_cannot_be_recovered_by_parking_or_encoder_hold(self):
-        result,_=self.run_case('seal_gap',execute=True,sample_period_ms=100)
-        self.assertIn('Measured MCU odometry discontinuity',result['first_failure']['message'])
-        self.assertEqual(result['first_failure']['phase'],'arrival_zero')
-        self.assertFalse(result['arrival_zero_seal']['complete'])
-        self.assertFalse(result['position_verified'])
-        self.assertFalse(result['motion_odometry_continuity_validated'])
-        self.assertNotIn('position_verification',result)
 
-    def test_cancel_or_scan_failure_during_zero_seal_does_not_wait_for_five_samples(self):
-        for cause in ('cancel','scan'):
-            state=dict(tripped=False,at=None)
-            def event(event):
-                if event['phase']=='arrival_zero' and not state['tripped']:
-                    state.update(tripped=True,at=event['event_monotonic_s'])
-            def scan(at,phase):
-                return dict(ok=not(state['tripped'] and cause=='scan'),reason='seal scan lost',source_monotonic_s=at)
-            with self.subTest(cause=cause):
-                result,port=self.run_case(execute=True,sample_period_ms=100,event_sink=event,scan=scan,
-                    cancelled=lambda:state['tripped'] and cause=='cancel')
-                self.assertTrue(state['tripped'])
-                self.assertFalse(result['arrival_zero_seal']['complete'])
-                self.assertIn('cancelled' if cause=='cancel' else 'seal scan lost',result['first_failure']['message'])
-                stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=state['at'])
-                self.assertLess(stop_at-state['at'],.005)
-                self.assertEqual(result['arm_count'],1)
-                self.assertNotIn('position_verification',result)
 
-    def test_zero_seal_deadline_does_not_extend_the_total_task_boundary(self):
-        class Short(Script):
-            config=Config(duration_s=1.5)
-        result,port=self.run_case(execute=True,sample_period_ms=100,
-            controller_factory=lambda clock:Short(clock))
-        seal=result['arrival_zero_seal']
-        self.assertIsNotNone(seal)
-        self.assertEqual(seal['deadline_monotonic_s'],101.5)
-        self.assertFalse(seal['complete'])
-        stop_at=next(at for at,raw in port.writes if raw[3]==3 and at>=seal['started_monotonic_s'])
-        self.assertLess(stop_at,101.502)
-        self.assertFalse(result['session_complete'])
 
-    def test_any_postSTOP_encoder_change_or_real_motion_permanently_invalidates_hold(self):
-        for mode,reason in (('stop_blind_encoder_changed','Post-STOP encoder changed'),
-                            ('settle_then_zero','Post-STOP measured motion'),
-                            ('zero_interrupted','Post-STOP measured motion')):
+    def test_postSTOP_encoder_change_does_not_gate_arrival_but_actual_zero_proof_remains(self):
+        for mode in ('stop_blind_encoder_changed','parking_encoder_chatter','settle_then_zero','zero_interrupted'):
             with self.subTest(mode=mode):
                 result,_=self.run_case(mode,execute=True,sample_period_ms=100)
-                self.assertTrue(result['arrival_zero_seal']['complete'])
+                self.assertTrue(result['arrival_reached'])
                 self.assertTrue(result['final_stop_chain']['complete'])
                 self.assertEqual(len(result['final_stop_chain']['zero_samples']),5)
+                self.assertTrue(result['session_complete'],result['first_failure'])
+                self.assertTrue(result['motion_complete'])
                 self.assertFalse(result['position_verified'])
-                self.assertFalse(result['motion_complete'])
-                self.assertFalse(result['session_complete'])
-                self.assertIn(reason,result['first_failure']['message'])
-                self.assertIsNone(result['position_verification']['confirmed_monotonic_s'])
+                self.assertEqual(result['position_verification']['method'],'not_requested')
                 self.assertIsNone(result['position_verification']['pose'])
+        result,_=self.run_case('continuous_moving',execute=True,sample_period_ms=100)
+        self.assertTrue(result['arrival_reached'])
+        self.assertFalse(result['final_stop_chain']['complete'])
+        self.assertFalse(result['session_complete'])
+        self.assertFalse(result['motion_complete'])
+        self.assertEqual(result['first_failure']['phase'],'final_stop')
 
     def test_first_scan_rejection_keeps_owned_diagnostic_without_delaying_stop(self):
         diagnostic=dict(schema='simple-p2p-scan-rejection-v1',header_ns=123456789,
@@ -940,9 +955,11 @@ class BaseTests(unittest.TestCase):
         self.assertEqual(sum(raw[3]==3 for _,raw in port.writes),2)
         self.assertFalse(result['session_complete'])
 
-    def test_recovery_cannot_certify_position_or_arrival_after_normal_zero_seal(self):
-        result,port=self.run_case('final_stop_ack_lost',execute=True,sample_period_ms=100)
-        self.assertTrue(result['arrival_zero_seal']['complete'])
+    def test_recovery_retains_real_arrival_but_cannot_upgrade_task_or_position(self):
+        result,_=self.run_case('final_stop_ack_lost',execute=True,sample_period_ms=100)
+        self.assertTrue(result['arrival_reached'])
+        observation=result['arrival_observation']
+        self.assertLessEqual(observation['distance_m'],.1)
         self.assertEqual(result['termination_reason'],'arrived')
         self.assertEqual(result['first_failure']['phase'],'final_stop')
         self.assertIn('300ms',result['first_failure']['message'])
@@ -950,11 +967,10 @@ class BaseTests(unittest.TestCase):
         self.assertTrue(result['final_stop_recovery']['complete'])
         self.assertFalse(result['final_stop_recovery']['position_verified'])
         self.assertIsNone(result['position_verification']['pose'])
-        self.assertIsNone(result['position_verification']['confirmed_monotonic_s'])
         self.assertFalse(result['position_verified'])
         self.assertFalse(result['motion_complete'])
         self.assertFalse(result['session_complete'])
-        self.assertEqual(result['latest_odometry'],result['arrival_zero_seal']['pose'])
+        self.assertEqual(result['latest_odometry']['source_monotonic_s'],observation['source_monotonic_s'])
 
 
 if __name__ == "__main__": unittest.main()

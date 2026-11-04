@@ -15,6 +15,11 @@ from simple_p2p import Pose
 from simple_p2p_history import PoseHistory
 
 
+ARRIVAL_STOP_POLICY = dict(method='direct_STOP_on_odom_tolerance',
+    preSTOP_zero_seal_required=False,final_position_verification_required=False,
+    physical_stop_proof_required=True)
+
+
 class BaseFault(RuntimeError):
     pass
 
@@ -255,6 +260,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
     result = dict(schema="simple-p2p-base-v1", boot_id=boot_id, execute=execute,
         origin=None, first_failure=None, initial_stop_chain=None, final_stop_chain=None,
         final_stop_recovery=None,
+        arrival_reached=False,arrival_observation=None,arrival_stop_policy=dict(ARRIVAL_STOP_POLICY),
         session_complete=False, motion_complete=False, geometry_calibrated=False,
         geometry=dict(diameter_m=odom.diameter, separation_m=odom.separation),
         host_source_timeout_s=.75, CAN_source_timeout_s=.25, zero_speed_rpm=.2,
@@ -429,7 +435,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
              latest if latest is not None and latest["sample_sequence"] == packet["sample_sequence"] else None)
         return packet
 
-    def stop_chain(integrate_parking=False, position_hold=None):
+    def stop_chain(integrate_parking=False, cut_history=False):
         nonlocal phase, source, latest
         port.phase, port.permit, port.finishing = "stopping", None, True
         cancelled_wait = client.cancel_for_stop()
@@ -439,9 +445,9 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                      parking_position_error=odometry_failure, position_verified=False,
                      settling_nonzero_samples=0, zero_run_restarts=0,
                      encoder_hold_samples=0, encoder_hold_motion_samples=0,
-                     all_parking_encoders_unchanged=position_hold is not None)
+                     all_parking_encoders_unchanged=False)
         motion_source = source
-        if position_hold is not None:
+        if cut_history:
             history.invalidate()  # A declared STOP cut, never an interpolation segment across it.
             proof['history_cut_before_STOP'] = True
         try:
@@ -458,7 +464,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                     break
                 sleep(.01)
             source = SourceTracker(.75)
-            if not integrate_parking and position_hold is None:
+            if not integrate_parking:
                 odom.invalidate()
             deadline = now()+2.
             while len(proof["zero_samples"]) < 5:
@@ -467,24 +473,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 packet, row = exchange(5, guard=False)
                 if now() >= deadline:
                     raise BaseFault("Post-STATUS zero deadline reached")
-                if position_hold is not None:
-                    # STOPPING deliberately suspends complete MCU wheel samples.
-                    # Compare original counters; never integrate/reanchor that
-                    # blind interval or give the sealed pose a newer source.
-                    api.fresh(packet)
-                    unchanged = all(packet[key] == position_hold['raw_packet'][key]
-                        for key in ('position_left_raw','position_right_raw'))
-                    row['parking_encoder_hold'] = unchanged
-                    proof['encoder_hold_samples'] += 1
-                    if not unchanged:
-                        proof['all_parking_encoders_unchanged'] = False
-                        if proof['parking_position_error'] is None:
-                            proof['parking_position_error'] = 'Post-STOP encoder changed since measured-zero seal; final position unverified'
-                    if max(abs(packet['speed_left_rpm']),abs(packet['speed_right_rpm'])) > .2:
-                        proof['encoder_hold_motion_samples'] += 1
-                        if proof['parking_position_error'] is None:
-                            proof['parking_position_error'] = 'Post-STOP measured motion invalidated the zero seal; final position unverified'
-                elif integrate_parking and proof["parking_position_error"] is None:
+                if integrate_parking and proof["parking_position_error"] is None:
                     try:
                         api.fresh(packet)
                         # Live DISARMED flags may change on the last CAN sample.
@@ -518,10 +507,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                         proof["zero_samples"].append(dict(sample))
                 sleep(.005)
             proof["complete"] = True
-            proof["position_verified"] = bool(proof["parking_position_error"] is None and latest is not None
-                and (position_hold is not None and proof['all_parking_encoders_unchanged']
-                     and latest == position_hold['pose'] or integrate_parking and position_hold is None
-                     and latest["sample_sequence"] == proof["zero_samples"][-1]["sample_sequence"]))
+            proof["position_verified"] = bool(integrate_parking and proof["parking_position_error"] is None
+                and latest is not None and latest["sample_sequence"] == proof["zero_samples"][-1]["sample_sequence"])
             if integrate_parking:
                 proof["final_odometry"] = None if latest is None else dict(latest)
             return proof
@@ -531,105 +518,38 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 proof['failed_exchange'] = copy.deepcopy(client.last_exchange_failure)
             return proof
 
-    def seal_arrival(started, last_send, last_pair, next_feedback, next_status, last_starts):
-        """Measure standstill before STOP's known complete-feedback blind window.
-
-        Faults/cancellation escape directly to finally/STOP. This is only a
-        normal-arrival stage, under the same live source/scan/lease/apply gates.
-        """
-        nonlocal phase,lease_deadline
-        phase = 'arrival_zero'
-        proof = dict(complete=False,started_monotonic_s=started,
-            deadline_monotonic_s=min(started+2.,began+cfg.duration_s),
-            applied_observation=None,zero_samples=[],encoder_run_restarts=0,
-            nonzero_samples=0,missing_motion_integrated=False)
-        result['arrival_zero_seal'] = proof
-        pending,first_zero_order = None,None
-        send_due = now() if last_send is None else last_send+(.1 if last_pair == (0,0) else .05)
-        candidate_encoder = None
-        while True:
-            health()
-            at = now()
-            if at >= proof['deadline_monotonic_s']:
-                raise BaseFault('Normal-arrival measured-zero seal timed out; original task deadline unchanged')
-            if pending is not None:
-                packet = client.poll_exchange(pending['id'])
-                if packet is not None:
-                    kind = pending['kind']
-                    row = record(kind,packet)
-                    if now() >= proof['deadline_monotonic_s']:
-                        raise BaseFault('Normal-arrival measured-zero seal timed out; original task deadline unchanged')
-                    if kind in (2,7):
-                        if kind == 7:
-                            if packet['last_rx_seq'] != packet['sequence'] or packet['state'] not in (5,10):
-                                raise BaseFault('SETPOINT acceptance/state mismatch')
-                            applied.register(packet['sequence'],0,0,row['completed_monotonic_s'])
-                            if first_zero_order is None:
-                                first_zero_order = applied.targets[packet['sequence']]['order']
-                            row['quantized_command'] = dict(left_rpm=0,right_rpm=0,
-                                linear_m_s=0.,angular_rad_s=0.,requested_linear_m_s=0.,requested_angular_rad_s=0.)
-                            intents.append(dict(phase=phase,reason='normal_arrival_measured_zero',**row['quantized_command']))
-                        applied.observe(packet,row['completed_monotonic_s'])
-                        item = applied.targets.get(packet['last_applied_seq'])
-                        if (proof['applied_observation'] is None and first_zero_order is not None
-                                and item is not None and item['order'] >= first_zero_order and item['pack'] == 0):
-                            proof['applied_observation'] = dict(kind=kind,sequence=packet['sequence'],
-                                last_applied_seq=packet['last_applied_seq'],tick_ms=packet['tick_ms'],
-                                request_start_monotonic_s=row['request_start_monotonic_s'],
-                                completed_monotonic_s=row['completed_monotonic_s'])
-                    else:
-                        sample = feedback(packet,row)  # Every distinct real sample is integrated first.
-                        if sample is not None:
-                            control_metrics['feedback_distinct'] += 1
-                        observed = proof['applied_observation']
-                        if (sample is not None and observed is not None and
-                                all(0 < (sample[key]-observed['tick_ms'])&0xffffffff < 0x80000000
-                                    for key in ('sample_tick_ms','left_tick_ms','right_tick_ms','speed_tick_ms'))):
-                            if max(abs(sample['speed_left_rpm']),abs(sample['speed_right_rpm'])) > .2:
-                                proof['nonzero_samples'] += 1
-                                proof['zero_samples'].clear()
-                                candidate_encoder = None
-                            else:
-                                encoder = tuple(sample[key] for key in ('position_left_raw','position_right_raw'))
-                                if candidate_encoder is not None and encoder != candidate_encoder:
-                                    proof['encoder_run_restarts'] += 1
-                                    proof['zero_samples'].clear()
-                                candidate_encoder = encoder
-                                proof['zero_samples'].append(dict(sample))
-                                if len(proof['zero_samples']) == 5:
-                                    # Keep all clocks and counters exactly as measured.
-                                    proof.update(complete=True,pose=dict(latest),raw_packet=dict(sample),
-                                        completed_monotonic_s=now())
-                                    return proof
-                    pending = None
-            if pending is None:
-                at = now()
-                due = [(due_at,kind) for due_at,kind in
-                    ((send_due,7),(next_feedback,5),(next_status,2)) if at >= due_at]
-                if due:
-                    _,kind = min(due)
-                    health()
-                    if kind == 7:
-                        port.permit = dict(target=(0,0,client.session),command_source=now(),
-                            feedback_source=source.source,scan_source=last_scan['source_monotonic_s'],
-                            lease_deadline=lease_deadline)
-                        pending = client.begin_exchange(7,0,0,session=client.session)
-                        lease_deadline = pending['started_monotonic_s']+.5
-                        send_due = pending['started_monotonic_s']+.1
-                    else:
-                        pending = client.begin_exchange(kind)
-                        if kind == 5:
-                            next_feedback = pending['started_monotonic_s']+.04
-                        else:
-                            next_status = pending['started_monotonic_s']+.2
-                    count_key={2:'status_requests',5:'feedback_requests',7:'setpoint_requests'}[kind]
-                    control_metrics[count_key] += 1
-                    gap_key={2:'max_status_request_gap_s',5:'max_feedback_request_gap_s',7:'max_setpoint_request_gap_s'}[kind]
-                    if kind in last_starts:
-                        control_metrics[gap_key] = max(control_metrics[gap_key],pending['started_monotonic_s']-last_starts[kind])
-                    last_starts[kind] = pending['started_monotonic_s']
-            applied.check_deadline(now())
-            sleep(.001)
+    def reached_arrival(pose, at):
+        """Latch the measured trigger, independently of the later parking pose."""
+        health()  # Recheck cancellation and the short-RAM scan after controller.tick.
+        decision_at = now()  # A delayed control calculation cannot reuse old authority.
+        if not 0 <= decision_at-last_scan['source_monotonic_s'] < .75:
+            raise BaseFault('Original scan source expired before arrival decision')
+        if (not finite(pose.get('source_monotonic_s'))
+                or not 0 <= decision_at-pose['source_monotonic_s'] < .75):
+            raise BaseFault('Arrival decision requires original odometry source within 750ms')
+        if decision_at >= began+cfg.duration_s:
+            raise BaseFault('Task deadline reached before arrival decision')
+        if port.phase == 'active' and decision_at >= lease_deadline:
+            raise BaseFault('Original MCU lease deadline reached')
+        pending_exchange = client.pending_exchange
+        if pending_exchange is not None and decision_at >= pending_exchange['deadline_monotonic_s']:
+            raise BaseFault('Original 300ms exchange response deadline reached before arrival decision')
+        if applied is not None:
+            applied.check_deadline(decision_at)
+        distance = math.hypot(controller.goal_x-pose['x'],controller.goal_y-pose['y'])
+        if not finite(distance) or distance > cfg.arrival_tolerance_m:
+            raise BaseFault('Arrival intent is outside measured odometry tolerance')
+        if not port.arm_count and not result['encoder_unchanged_since_origin']:
+            raise BaseFault('Encoder changed since software origin; old zero cannot prove arrival')
+        result['arrival_observation'] = dict(decision_monotonic_s=decision_at,
+            controller_tick_monotonic_s=at,
+            source_monotonic_s=pose['source_monotonic_s'],
+            measurement_monotonic_s=pose.get('measurement_monotonic_s'),
+            sample_sequence=pose['sample_sequence'],
+            pose={key:pose[key] for key in ('x','y','yaw')},
+            goal=dict(x=controller.goal_x,y=controller.goal_y),distance_m=distance,
+            tolerance_m=cfg.arrival_tolerance_m,final_stopped_pose_verified=False)
+        result['arrival_reached'] = result['motion_complete'] = True
 
     def observe_origin():
         state, _ = exchange(2, guard=False)
@@ -669,7 +589,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                 raise BaseFault("Controller fault: "+preview.reason)
             if preview.phase == "stop" and preview.reason in ("arrived", "cancelled"):
                 result["termination_reason"] = preview.reason
-                result["motion_complete"] = preview.reason == "arrived"
+                if preview.reason == 'arrived':
+                    reached_arrival(latest,now())
                 return result
             phase, port.phase = "arming", "arming"
             health()
@@ -743,7 +664,7 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             next_control = now()
             next_feedback,next_status = next_control+.04,next_control+.2
             current_axis, barrier, barrier_count, barrier_zero_tick = None, None, 0, None
-            pending = desired = terminal = None
+            pending = desired = None
             last_send = last_pair = None
             last_starts = {}
             while True:
@@ -786,11 +707,8 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                         else:
                             applied.observe(packet,row['completed_monotonic_s'])
                         pending = None
-                        if terminal is not None:
-                            result['normal_quiesce']['complete'] = True
-                            result['normal_quiesce']['completed_monotonic_s'] = now()
                 at = now()
-                if terminal is None and at >= next_control:
+                if at >= next_control:
                     pose = history.latest(at,max_age=.75)
                     command = controller.tick(Pose(pose['x'],pose['y'],pose['yaw']),at)
                     control_metrics['skipped_control_ticks'] += int((at-next_control)/.05)
@@ -813,15 +731,9 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                         raise BaseFault("Controller fault: "+command.reason)
                     if command.phase == "stop" and command.reason in ("arrived", "cancelled"):
                         result["termination_reason"] = command.reason
-                        result["motion_complete"] = False  # Normal arrival still needs a measured-zero seal.
-                        terminal = command
-                        if command.reason == 'cancelled':
-                            break
-                        result['normal_quiesce'] = dict(pending=None if pending is None else pending['ticket'],
-                            started_monotonic_s=at,complete=pending is None,queries_started=0,
-                            deadline_basis='original_Client_transaction_only')
-                        if pending is None:
-                            result['normal_quiesce']['completed_monotonic_s'] = at
+                        if command.reason == 'arrived':
+                            reached_arrival(pose,at)
+                        break  # STOP immediately, including while an old ACK is in flight.
                     else:
                         phase = command.phase
                         target = quantize(command,cfg)
@@ -830,11 +742,6 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                             barrier,barrier_count,barrier_zero_tick = intended,0,None
                         scan_phase = 'turn' if 'turn' in (current_axis,intended,barrier) else command.phase
                         desired = dict(command=command,target=target,intended=intended,control_time=at,control_pose=pose)
-                if terminal is not None:
-                    if pending is None:
-                        break
-                    sleep(.001)
-                    continue
                 if pending is None:
                     at = now()
                     # A control tick may have changed desired while the prior
@@ -888,78 +795,31 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
                         control_metrics['max_inflight_transactions'] = 1
                 applied.check_deadline(now())
                 sleep(.001)
-            if terminal is not None and terminal.reason == 'arrived':
-                seal_arrival(result['normal_quiesce']['started_monotonic_s'],last_send,last_pair,
-                             next_feedback,next_status,last_starts)
-                result['motion_complete'] = True
     except BaseException as exc:
         fail(exc, phase)
     finally:
         if execute:
             phase = "final_stop"
-            seal = result['arrival_zero_seal']
-            hold = seal if (result['first_failure'] is None and result['motion_complete']
-                            and seal is not None and seal['complete']) else None
-            result["final_stop_chain"] = stop_chain(integrate_parking=port.arm_count > 0,position_hold=hold)
+            arrived = result['arrival_reached']
+            if arrived:
+                result['position_verification'] = dict(method='not_requested',pose=None,
+                    confirmed_monotonic_s=None,final_stopped_pose_verified=False,
+                    STOP_blind_interval_integrated=False,missing_motion_integrated=False)
+            result["final_stop_chain"] = stop_chain(
+                integrate_parking=port.arm_count > 0 and not arrived,cut_history=arrived)
             if not result["final_stop_chain"]["complete"]:
                 fail(BaseFault(result["final_stop_chain"]["error"]), phase)
+                result['motion_complete'] = False
                 if result["final_stop_chain"]["ack"] is None:
-                    # The first physical STOP is still immediate. Its transaction
-                    # has now terminated, including the original 300 ms timeout
-                    # when no matching reply arrived. Make one NEW sequence STOP
-                    # attempt on this same owner/FD; never retry the old frame.
-                    # This independent present-time stop proof cannot repair the
-                    # original task, its position seal or missing motion evidence.
+                    # The first physical STOP is immediate. Once its original
+                    # transaction ends, allow one NEW sequence STOP on this FD.
+                    # Its independent current-stop proof cannot repair the task.
                     phase = 'final_stop_recovery'
-                    recovery = stop_chain(integrate_parking=False,position_hold=None)
+                    recovery = stop_chain(integrate_parking=False)
                     recovery.update(trigger='primary_final_STOP_missing_ACK',attempt_count=1,
                         independent_current_stop_only=True,position_verified=False)
                     result['final_stop_recovery'] = recovery
-                    result['motion_complete'] = False
-            if hold is not None:
-                proof = result['final_stop_chain']
-                final_sample = None if not proof['zero_samples'] else dict(proof['zero_samples'][-1])
-                result['position_verification'] = dict(method='preSTOP_measured_zero_plus_unchanged_encoders',
-                    seal_pose=dict(hold['pose']),seal_raw_packet=dict(hold['raw_packet']),
-                    seal_source_monotonic_s=hold['pose']['source_monotonic_s'],
-                    seal_measurement_monotonic_s=hold['pose']['measurement_monotonic_s'],
-                    seal_sample_sequence=hold['pose']['sample_sequence'],
-                    applied_observation=dict(hold['applied_observation']),
-                    seal_zero_samples=[dict(packet) for packet in hold['zero_samples']],
-                    all_observed_encoders_unchanged=proof['all_parking_encoders_unchanged'],
-                    encoder_hold_samples=proof['encoder_hold_samples'],
-                    encoder_hold_motion_samples=proof['encoder_hold_motion_samples'],
-                    final_post_status_sample=final_sample,
-                    confirmed_monotonic_s=now() if proof['position_verified'] else None,
-                    final_confirmation_source_monotonic_s=source.source if proof['position_verified'] else None,
-                    pose=dict(hold['pose']) if proof['position_verified'] else None,
-                    STOP_blind_interval_integrated=False,missing_motion_integrated=False)
-            if result["motion_complete"] and not port.arm_count:
-                proof = result["final_stop_chain"]
-                unchanged = bool(result["origin"] and result["initial_stop_chain"]
-                    and result["initial_stop_chain"]["complete"] and proof["complete"]
-                    and result["encoder_unchanged_since_origin"])
-                result["position_verification"] = dict(method="encoder_unchanged_since_origin",
-                    all_observed_encoders_unchanged=unchanged,
-                    origin_sample_sequence=None if result["origin"] is None else result["origin"]["raw_packet"]["sample_sequence"],
-                    final_post_status_sample=None if not proof["zero_samples"] else dict(proof["zero_samples"][-1]),
-                    pose=dict(x=0., y=0., yaw=0.) if unchanged else None,
-                    missing_motion_integrated=False)
-                proof["position_verified"] = unchanged
-                if not unchanged:
-                    proof["parking_position_error"] = "Encoder changed since software origin or STOP evidence incomplete; no-ARM final pose unverified"
-            result["position_verified"] = result["final_stop_chain"]["position_verified"]
-            if result["motion_complete"]:
-                if result["position_verified"]:
-                    distance = math.hypot(controller.goal_x-latest["x"], controller.goal_y-latest["y"])
-                    result["final_distance_m"] = distance
-                    if distance > cfg.arrival_tolerance_m:
-                        fail(BaseFault("Final measured stopped pose is outside arrival tolerance"), phase)
-                        result["motion_complete"] = False
-                else:
-                    fail(BaseFault(result["final_stop_chain"]["parking_position_error"] or
-                        "Final parking position not verified"), phase)
-                    result["motion_complete"] = False
+            result['position_verified'] = False if arrived else result['final_stop_chain']['position_verified']
         if result["event_sink_errors"]:
             fail(BaseFault("RAM event callback failed: "+result["event_sink_errors"][0]), phase)
         result.update(rows=rows, raw_events=port.events, command_intents=intents,
@@ -975,5 +835,6 @@ def run_session(physical, api, core, controller, *, scan_provider, boot_id,
             and not (result.get('final_stop_chain') or {}).get('parking_position_error')
             and not (result.get('final_stop_chain') or {}).get('history_cut_before_STOP'))
         result["session_complete"] = bool(not result["first_failure"] and result["origin"]
-            and (not execute or result["motion_complete"] and result["final_stop_chain"]["complete"]))
+            and (not execute or result['arrival_reached'] and result["motion_complete"]
+                 and result["final_stop_chain"]["complete"]))
     return result

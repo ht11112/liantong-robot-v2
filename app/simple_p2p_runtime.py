@@ -1,5 +1,6 @@
 """One RK-local odometry goal: turn, drive straight, verify STOP. Import is inert."""
 import argparse
+import copy
 from dataclasses import asdict
 import json
 import math
@@ -45,7 +46,8 @@ class LiveStatusWriter:
         self.latest = dict(schema='simple-p2p-live-v1', boot_id=boot_id, phase='starting',
             pose=None, raw_packet=None, source_monotonic_s=None, finished=False,
             pose_source_monotonic_s=None, pose_measurement_monotonic_s=None,
-            position_verified=False)
+            position_verified=False, arrival_reached=False,
+            arrival_observation=None, arrival_stop_policy=None)
         self.error = None
         self.thread = threading.Thread(target=self._run, name='live-status-writer', daemon=True)
 
@@ -101,6 +103,9 @@ class LiveStatusWriter:
         with self.lock:
             self.latest.update(finished=True, phase='finished',
                 position_verified=result.get('position_verified',False),
+                arrival_reached=result.get('arrival_reached') is True,
+                arrival_observation=copy.deepcopy(result.get('arrival_observation')),
+                arrival_stop_policy=copy.deepcopy(result.get('arrival_stop_policy')),
                 first_failure=result.get('first_failure'),
                 session_complete=result.get('session_complete',False))
             if packet is not None:
@@ -472,7 +477,8 @@ def main(argv=None):
     except BaseException as exc:
         if result is None:
             result = dict(session_complete=False, motion_complete=False, origin=None,
-                          first_failure=None, final_stop_chain=None)
+                          first_failure=None, final_stop_chain=None,
+                          arrival_reached=False, arrival_observation=None)
         result['exclusive_port_closed_normally'] = False
         error = dict(phase='serial_owner_or_cleanup', error_type=type(exc).__name__, message=str(exc))
         result.setdefault('cleanup_errors', []).append(error)
@@ -501,7 +507,8 @@ def main(argv=None):
     if result.get('origin') is not None:
         durable_json(args.output_dir/'origin.json', result['origin'])
     print(json.dumps({key: result.get(key) for key in ('schema', 'motion_requested', 'session_complete',
-          'motion_complete', 'first_failure', 'origin', 'final_stop_chain', 'exclusive_port_closed_normally')},
+          'motion_complete', 'arrival_reached', 'arrival_observation', 'arrival_stop_policy',
+          'first_failure', 'origin', 'final_stop_chain', 'exclusive_port_closed_normally')},
           allow_nan=False))
     return 0 if result.get('session_complete') and result.get('first_failure') is None else 2
 
