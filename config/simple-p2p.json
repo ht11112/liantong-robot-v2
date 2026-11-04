@@ -15,9 +15,9 @@
   },
   "obstacle": {
     "stop_clearance_m": 0.0,
-    "body_front_m": 0.2,
-    "body_rear_m": 0.2,
-    "body_half_width_m": 0.25,
+    "body_front_m": 0.175,
+    "body_rear_m": 0.175,
+    "body_half_width_m": 0.2,
     "laser_x_m": 0.13,
     "laser_y_m": 0.0,
     "laser_yaw_rad": 0.0,
