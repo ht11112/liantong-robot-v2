@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from v11_map_plan import BODY_RADIUS_M, GridMap, PlanningError, _queue, load_map
+from v11_map_plan import BODY_RADIUS_M, GridMap, PlanningError, _pgm, _queue, load_map
 
 
 def pose(x, y, yaw=0.):
@@ -53,6 +53,20 @@ class MapPlanTests(unittest.TestCase):
             load_map(self.pgm,self.yaml,expected_yaml_sha256='0'*64)
         with self.assertRaisesRegex(PlanningError,'Goal footprint'):
             grid.plan(pose(2.05,2.),pose(2.05,4.05))
+
+    def test_costmap_image_marks_obstacles_and_cell_clearance_in_image_order(self):
+        grid = self.make_map(((7,46,0),(20,40,205)))
+        width, height, raster = _pgm(grid.costmap_pgm())
+        self.assertEqual((width, height), (60, 60))
+
+        def pixel(x, y):
+            return raster[(height-1-y)*width+x]
+
+        self.assertEqual(pixel(7, 46), 0)
+        self.assertEqual(pixel(20, 40), 175)
+        self.assertEqual(pixel(21, 40), 100)
+        self.assertEqual(pixel(1, 30), 100)
+        self.assertEqual(pixel(7, 13), 255)
 
     def test_reject_wrong_yaml_image_and_truncated_pixels(self):
         self.make_map()

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from local_p2p_server import ORIGIN, RequestError
 from manual_mapping_viewer import pgm_to_png
+from v11_map_plan import load_map
 
 
 HERE = Path(__file__).resolve().parent
@@ -88,13 +89,19 @@ class SSHHTTP:
 
 
 class MapGateway:
-    def __init__(self, remote, map_pgm, map_sha256):
+    def __init__(self, remote, map_pgm, map_sha256, *, costmap_grid=None):
         self.remote = remote
         raw = Path(map_pgm).read_bytes()
         self.sha256 = hashlib.sha256(raw).hexdigest()
         if self.sha256 != map_sha256.lower():
             raise ValueError('Saved map SHA-256 does not match')
         self.png, self.width, self.height = pgm_to_png(raw)
+        self.costmap_png = self.costmap_id = None
+        if costmap_grid is not None:
+            if costmap_grid.pgm_sha256 != self.sha256:
+                raise ValueError('Costmap PGM does not match the saved map')
+            self.costmap_png, _, _ = pgm_to_png(costmap_grid.costmap_pgm())
+            self.costmap_id = costmap_grid.map_id
         self.html = (HERE/'v11_map_viewer.html').read_bytes()
         self.csrf = secrets.token_urlsafe(32)
 
@@ -108,9 +115,11 @@ class MapGateway:
             return 502, dict(error='未收到 RK 操作应答。请查看最新状态后再操作。')
         if 'connected' in payload:
             metadata = payload.get('map') or {}
-            payload = dict(payload, csrf_token=self.csrf, map_image_available=(
-                metadata.get('pgm_sha256') == self.sha256 and metadata.get('width') == self.width
-                and metadata.get('height') == self.height))
+            map_matches = (metadata.get('pgm_sha256') == self.sha256 and metadata.get('width') == self.width
+                           and metadata.get('height') == self.height)
+            payload = dict(payload, csrf_token=self.csrf, map_image_available=map_matches,
+                           costmap_image_available=(map_matches and self.costmap_id is not None
+                                                    and metadata.get('map_id') == self.costmap_id))
         return status, payload
 
 
@@ -147,6 +156,11 @@ def handler_for(gateway):
                 return self.send(*gateway.request('GET', '/api/state'))
             if target.path == '/map.png' and target.query == 'v='+gateway.sha256:
                 return self.send(200, gateway.png, 'image/png')
+            if (target.path == '/costmap.png' and gateway.costmap_id is not None
+                    and target.query == 'v='+gateway.costmap_id):
+                _, state = gateway.request('GET', '/api/state')
+                if state.get('costmap_image_available'):
+                    return self.send(200, gateway.costmap_png, 'image/png')
             return self.send(404, dict(error='未找到'))
 
         def do_POST(self):
@@ -183,10 +197,16 @@ def main(argv=None):
     parser.add_argument('--host-key-alias')
     parser.add_argument('--map-pgm', required=True)
     parser.add_argument('--map-sha256', required=True)
+    parser.add_argument('--map-yaml', help='Saved map YAML for the costmap panel')
+    parser.add_argument('--yaml-sha256', help='Pinned SHA-256 of the saved map YAML')
     args = parser.parse_args(argv)
+    if (args.map_yaml is None) != (args.yaml_sha256 is None):
+        parser.error('--map-yaml and --yaml-sha256 must be specified together')
+    grid = (load_map(args.map_pgm, args.map_yaml, args.map_sha256, args.yaml_sha256)
+            if args.map_yaml is not None else None)
     remote = SSHHTTP(args.host, args.user, args.known_hosts, args.host_key_alias,
                      getpass.getpass('RK SSH password (memory only): '))
-    gateway = MapGateway(remote, args.map_pgm, args.map_sha256)
+    gateway = MapGateway(remote, args.map_pgm, args.map_sha256, costmap_grid=grid)
     server = ThreadingHTTPServer((HOST, PC_PORT), handler_for(gateway))
     print('V11 map console: '+ORIGIN+'/', flush=True)
     try:

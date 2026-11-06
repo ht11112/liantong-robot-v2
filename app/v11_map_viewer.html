@@ -18,11 +18,14 @@
     .pill{display:inline-block;border-radius:20px;background:#eef2f8;color:var(--muted);padding:4px 10px;font-size:12px;font-weight:650;white-space:nowrap}.pill.on{background:#e9f7f0;color:var(--green)}
     main{max-width:1440px;margin:auto;padding:22px 20px 34px}.heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}h1{margin:0 0 5px;font-size:24px}h2{margin:0;font-size:15px}p{margin:6px 0}
     .notice{padding:9px 12px;border:1px solid #e9d7af;background:#fff7e8;color:#7c531b;border-radius:8px;margin-bottom:12px}
-    .layout{display:grid;grid-template-columns:minmax(0,1fr) 350px;gap:16px;align-items:start}.side{display:grid;gap:12px}.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+    .layout{display:grid;grid-template-columns:minmax(0,1fr) 350px;grid-template-areas:"map side" "costmap side";gap:16px;align-items:start}.navigation-map{grid-area:map}.costmap{grid-area:costmap}.side{grid-area:side;display:grid;gap:12px}.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden}
     .cardhead{display:flex;align-items:center;justify-content:space-between;gap:9px;border-bottom:1px solid var(--line);padding:12px 15px}.body{padding:12px 15px}.map-controls,.actions,.legend{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.map-controls button{padding:5px 9px;font-size:12px}.map-controls button[aria-pressed="true"]{background:#eaf0ff;border-color:#cbd9fd;color:#254ba8}
     .canvas-box{position:relative;height:clamp(430px,64vh,680px);background:#e8edf4}.canvas-box canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.map-help{position:absolute;top:9px;left:10px;right:10px;width:fit-content;max-width:calc(100% - 20px);padding:5px 8px;border-radius:6px;background:#fffffff2;color:var(--muted);font-size:12px;pointer-events:none}.map-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;padding:10px 13px;color:var(--muted)}.legend span{display:inline-flex;align-items:center;gap:5px}.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--blue)}.legend .trail{background:var(--green)}.legend .goal{background:#d58626}.legend .seed{background:var(--violet)}
     .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 10px}.fields.two{grid-template-columns:repeat(2,minmax(0,1fr))}.fields label{font-size:12px;color:var(--muted)}input{width:100%;min-width:0;background:white;color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 8px;margin-top:3px}.actions button{flex:1}.summary,.message{margin:9px 0 0;background:#f4f7fc;padding:7px 9px;border-radius:7px;font-size:12px;overflow-wrap:anywhere}.message.error{color:var(--red);background:#ffeff1}.body small{display:block;color:var(--muted);line-height:1.55}.body dl{margin:0}.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #eef2f7;font-size:12px}.kv dt{color:var(--muted)}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}progress{width:100%;height:8px;margin-top:9px;accent-color:var(--blue)}
-    @media(max-width:850px){.layout{grid-template-columns:1fr}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
+    .costmap-content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.costmap-box{display:grid;place-items:center;height:148px;background:#e8edf4}.costmap-box img{display:block;width:100%;height:100%;min-height:0;object-fit:contain;image-rendering:pixelated}.costmap-box p{margin:12px;color:var(--muted);text-align:center}
+    .costmap-content .map-foot{display:grid;align-content:center;justify-content:start}.costmap .cardhead a{color:var(--blue);font-size:12px;white-space:nowrap}
+    .costmap-legend i{width:11px;height:11px;border-radius:2px;border:1px solid #c4cfdd}.costmap-legend .occupied{background:#000}.costmap-legend .inflated{background:#646464}.costmap-legend .unknown{background:#afafaf}.costmap-legend .free{background:#fff}
+    @media(max-width:850px){.layout{grid-template-columns:1fr;grid-template-areas:"map" "side" "costmap"}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
     @media(max-width:540px){main{padding:16px 12px}.heading{align-items:flex-start}.side{grid-template-columns:1fr}.canvas-box{height:390px}.cardhead{align-items:flex-start}.map-controls{justify-content:flex-end}h1{font-size:21px}}
   </style>
 </head>
@@ -35,7 +38,7 @@
     <div class="heading"><div><h1>地图点到点导航</h1><p class="muted">在保存地图上选点，先预览队列，再按当前模式提交。</p></div><span class="pill" id="run-mode">模式待确认</span></div>
     <p id="offline" class="notice" role="status" hidden></p>
     <div class="layout">
-      <section class="card" aria-label="保存地图与轨迹">
+      <section class="card navigation-map" aria-label="保存地图与轨迹">
         <div class="cardhead"><h2>保存地图</h2><div class="map-controls" aria-label="地图选点模式"><button id="pick-goal" type="button" aria-pressed="true">选目标</button><button id="pick-seed" type="button" aria-pressed="false">设起点与车头</button></div></div>
         <div class="canvas-box"><canvas id="map" aria-label="保存地图、预览路径与车辆轨迹；可使用右侧坐标输入替代选点"></canvas><div class="map-help" id="map-help">等待地图信息</div></div>
         <div class="map-foot"><div class="legend"><span><i></i>车辆 / 预览</span><span><i class="trail"></i>轨迹</span><span><i class="goal"></i>目标</span><span><i class="seed"></i>定位起点</span></div><span id="map-details">等待已校验地图</span></div>
@@ -70,6 +73,19 @@
           <p class="message error" id="task-error" hidden></p><div class="actions" style="margin-top:10px"><button id="stop" type="button" class="stop" disabled>停车</button></div></div>
         </section>
       </aside>
+      <section class="card costmap" aria-labelledby="costmap-title">
+        <div class="cardhead"><h2 id="costmap-title">导航代价地图</h2><a id="costmap-open" target="_blank" rel="noopener" hidden>查看原图</a></div>
+        <div class="costmap-content">
+          <div class="costmap-box" id="costmap-box"><p id="costmap-note">等待代价地图</p></div>
+          <div class="map-foot">
+            <div class="legend costmap-legend" aria-label="代价地图图例">
+              <span><i class="occupied"></i>障碍</span><span><i class="inflated"></i>车体净空</span>
+              <span><i class="unknown"></i>未知区</span><span><i class="free"></i>可通行</span>
+            </div>
+            <span>显示基础净空，规划时可能使用额外边距</span>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
   <script>
@@ -77,11 +93,13 @@
     'use strict';
     const $ = id => document.getElementById(id);
     const canvas = $('map'), ctx = canvas.getContext('2d');
+    const costmapBox = $('costmap-box'), costmapNote = $('costmap-note'), costmapOpen = $('costmap-open');
     const seedFields = ['seed-x','seed-y','seed-yaw'].map($);
     const goalFields = ['goal-x','goal-y'].map($);
     const phaseNames = {idle:'待命',uploading:'上传队列',ready:'READY',starting:'启动中',arming:'使能中',move:'直行',turn:'转向',barrier:'段间停车',stopping:'停车中',complete:'已完成',failed:'失败',unknown:'未知'};
     const locNames = {amcl:'AMCL 已定位',manual:'手动位姿',unlocalized:'未定位'};
     let state = {connected:false}, image = null, imageKey = '', view = null;
+    let costmapImage = null, costmapKey = '', costmapError = false;
     let selectionMode = 'goal', drag = null, prepared = null, action = null, stopping = false;
     const finite = Number.isFinite;
     const angle = n => Math.atan2(Math.sin(n),Math.cos(n));
@@ -156,6 +174,34 @@
       next.onerror=() => { if(imageKey===map.pgm_sha256){imageKey='';render();} };
       next.src='/map.png?v='+encodeURIComponent(map.pgm_sha256);
     }
+    function loadCostmap() {
+      const map = state.map;
+      if (!map || state.connected!==true || state.costmap_image_available!==true || costmapKey===map.map_id) return;
+      costmapKey=map.map_id;
+      costmapError=false;
+      costmapImage?.remove();
+      costmapImage=null;
+      const next=new Image();
+      next.alt='导航代价地图，标出障碍、净空范围、未知区和可通行区域';
+      next.onload=() => {
+        if (costmapKey!==map.map_id) return;
+        if (next.naturalWidth===map.width && next.naturalHeight===map.height) {
+          costmapImage=next;
+          costmapBox.prepend(next);
+          costmapOpen.href=next.src;
+        } else {
+          costmapError=true;
+        }
+        render();
+      };
+      next.onerror=() => {
+        if (costmapKey!==map.map_id) return;
+        costmapKey='';
+        costmapError=true;
+        render();
+      };
+      next.src='/costmap.png?v='+encodeURIComponent(map.map_id);
+    }
     function note(text,error=false) {
       const node=$('action-note');node.hidden=!text;node.textContent=text;
       node.className='message'+(error?' error':'');
@@ -163,6 +209,12 @@
     function render() {
       const online=state.connected===true, map=state.map, ready=state.mode==='ready';
       const matched=state.map_image_available===true && image && map && imageKey===map.pgm_sha256;
+      const costmapAvailable=state.costmap_image_available===true && map;
+      const costmapVisible=Boolean(costmapAvailable && costmapImage && costmapKey===map.map_id);
+      if(costmapImage) costmapImage.hidden=!costmapVisible;
+      costmapOpen.hidden=!costmapVisible;
+      costmapNote.hidden=costmapVisible;
+      costmapNote.textContent=!costmapAvailable?'等待代价地图':costmapError?'代价地图加载失败':'正在加载代价地图';
       const editable=online && matched && Boolean(state.csrf_token) && !action && !stopping;
       const loc=state.localization||{}, task=state.task||{}, preview=state.preview, route=preview||state.route;
       const canPrepare=editable && state.can_prepare===true;
@@ -205,6 +257,7 @@
         if(!response.ok) throw new Error(next.error||'无法读取 RK 状态');
         state=next.connected===false && !next.map ? {...state,...next} : next;
         loadMap();
+        loadCostmap();
       } catch(error) {
         state={...state,connected:false,error:error.message};
       } finally {

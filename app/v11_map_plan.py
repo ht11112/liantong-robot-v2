@@ -344,6 +344,24 @@ class GridMap:
                     map_id=self.map_id, occupied_thresh=self.occupied_thresh,
                     free_thresh=self.free_thresh, negate=self.negate)
 
+    def costmap_pgm(self):
+        """Draw the baseline footprint's cell-center clearances in PGM row order."""
+        width, height, pixels = _pgm(self.pgm_bytes)
+        costmap = _Costmap(self)
+        raster = bytearray(width * height)
+        for row in range(height):
+            y = height - 1 - row
+            blocked = self.blocked_rows[y]
+            for x in range(width):
+                index = row * width + x
+                if blocked & (1 << x):
+                    gray = pixels[index]
+                    probability = (gray if self.negate else 255 - gray) / 255.
+                    raster[index] = 0 if probability > self.occupied_thresh else 175
+                else:
+                    raster[index] = 255 if costmap.center_clear(x, y) else 100
+        return ('P5\n{} {}\n255\n'.format(width, height)).encode('ascii') + raster
+
     def _to_grid(self, x, y):
         dx, dy = x-self.origin[0], y-self.origin[1]
         return ((self._cos*dx+self._sin*dy)/self.resolution,

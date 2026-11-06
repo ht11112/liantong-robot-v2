@@ -27,7 +27,9 @@ python3 -B app/v11_map_runtime.py --port CURRENT_RK_PORT --map-pgm map/final.pgm
 PC 使用仓库现有的 `requirements-pc.txt`，启动网页入口后在本机浏览器打开 8766。已知主机键按别名保存时，另传 `--host-key-alias`。
 
 ```text
-python -B scripts/run_v11_map_web.py --host RK_HOST --user cat --known-hosts KNOWN_HOSTS --map-pgm FINAL_PGM --map-sha256 PGM_SHA256
+python -B scripts/run_v11_map_web.py --host RK_HOST --user cat --known-hosts KNOWN_HOSTS --map-pgm FINAL_PGM --map-sha256 PGM_SHA256 --map-yaml FINAL_YAML --yaml-sha256 YAML_SHA256
 ```
+
+提供同一份已校验的地图 YAML 后，网页会显示与 RK 地图对应的基础代价地图，标出障碍、未知区和车体净空。规划器在部分路线中会尝试额外净空，预览仍以保存地图上的路线为准。
 
 置零和 AMCL 对齐均绑定当前 MCU 会话和地图。MCU 会话变化或有效里程计中断后重新定位。首轮实车验收依次核对新队列 READY、约 0.5 m 直行、实测停稳与尺量 10 cm 到点标准，再做转向接直行和取消停车。
