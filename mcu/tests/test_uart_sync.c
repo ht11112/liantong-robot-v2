@@ -53,41 +53,46 @@ static void p16(uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}
 static void p32(uint8_t*p,uint32_t v){p16(p,(uint16_t)v);p16(p+2,(uint16_t)(v>>16));}
 static void p64(uint8_t*p,uint64_t v){p32(p,(uint32_t)v);p32(p+4,(uint32_t)(v>>32));}
 static void command(Sim*s,uint8_t*b,uint8_t op,uint32_t request){
-  memset(b,0,36);b[0]=0xa5;b[1]=0x5a;b[2]=10;b[3]=op;p16(b+4,28);
+  memset(b,0,36);b[0]=0xa5;b[1]=0x5a;b[2]=WIRE_VERSION;b[3]=op;p16(b+4,28);
   p64(b+6,s->q.boot_id);p32(b+14,op==WIRE_STOP?999:1);p32(b+18,request);
-  p32(b+22,s->w.pub_sequence);p64(b+26,s->q.task_id);
+  p64(b+26,s->q.task_id);
   p16(b+34,wire_crc16(b+2,32));
 }
 static void receive(Sim*s,const uint8_t*b,unsigned n){for(unsigned i=0;i<n;i++)wire_rx_byte(&s->w,b[i],s->clock);}
 static void poll(Sim*s,uint32_t at){s->clock=at;wire_poll(&s->w,at);assert(s->enters==s->exits);}
 static void crc_valid(const uint8_t*b){assert(wire_crc16(b+2,106)==(uint16_t)(b[108]|((uint16_t)b[109]<<8)));}
+static void discovery(Sim*s){
+  uint8_t b[36]={0xa5,0x5a,WIRE_VERSION,WIRE_QUERY,28};p16(b+34,wire_crc16(b+2,32));
+  receive(s,b,sizeof(b));poll(s,s->clock);assert(s->w.reply_pending&&!s->tx_count);
+}
 static void rx_commit_schedules(void){
-  Sim s;init(&s);s.rx_at_enter=true;poll(&s,50);
-  assert(!s.tx_count&&s.w.rx_write==1&&!s.w.has_published);
-  init(&s);s.raw_pending=true;poll(&s,50);assert(!s.tx_count&&!s.w.transport_fault);
-  s.raw_pending=false;poll(&s,51);assert(s.tx_count==1);crc_valid(s.tx);
-  init(&s);s.mask=1;poll(&s,50);assert(s.tx_count==1&&s.mask==1);
-  init(&s);s.receive_after_exit=true;poll(&s,50);
-  assert(s.tx_count==1&&s.w.rx_write==1&&s.busy); /* retained after claim */
+  Sim s;init(&s);discovery(&s);s.rx_at_enter=true;poll(&s,52);
+  assert(!s.tx_count&&s.w.rx_write-s.w.rx_read==1&&s.w.reply_pending);
+  init(&s);discovery(&s);s.raw_pending=true;poll(&s,52);assert(!s.tx_count&&!s.w.transport_fault);
+  s.raw_pending=false;poll(&s,53);assert(s.tx_count==1);crc_valid(s.tx);
+  init(&s);discovery(&s);s.mask=1;poll(&s,52);assert(s.tx_count==1&&s.mask==1);
+  init(&s);discovery(&s);s.receive_after_exit=true;poll(&s,52);
+  assert(s.tx_count==1&&s.w.rx_write-s.w.rx_read==1&&s.busy); /* retained after claim */
   puts("PASS sync RX before claim/raw pending blocks TX, saved mask restores, post-claim RX retained");
 }
 static void fault_snapshot_and_stop(void){
-  Sim s;uint8_t b[36];init(&s);s.fault_at_enter=true;poll(&s,50);
-  assert(!s.tx_count&&!s.w.has_published&&s.q.first_error==MQ_ERR_UART&&s.stops==1);
-  poll(&s,51);assert(s.tx_count==1&&(s.tx[48]&WIRE_RX_FAULT));
+  Sim s;uint8_t b[36];init(&s);discovery(&s);s.fault_at_enter=true;poll(&s,52);
+  assert(!s.tx_count&&s.w.reply_pending&&s.q.first_error==MQ_ERR_UART&&s.stops==1);
+  poll(&s,53);assert(s.tx_count==1&&(s.tx[48]&WIRE_RX_FAULT));
   assert(s.tx[90]==MQ_ERR_UART&&s.tx[47]==MQ_STOPPING);crc_valid(s.tx);
   /* Fault was already latched at construction, but MQ had not yet seen it. */
-  init(&s);s.fault_at_ready=true;poll(&s,50);assert(!s.tx_count&&s.q.first_error==MQ_ERR_UART);
-  poll(&s,51);assert(s.tx_count==1&&s.tx[90]==MQ_ERR_UART);crc_valid(s.tx);
+  init(&s);discovery(&s);s.fault_at_ready=true;poll(&s,52);assert(!s.tx_count&&s.q.first_error==MQ_ERR_UART);
+  poll(&s,53);assert(s.tx_count==1&&s.tx[90]==MQ_ERR_UART);crc_valid(s.tx);
   init(&s);wire_transport_error(&s.w);command(&s,b,WIRE_STOP,1);receive(&s,b,36);
   poll(&s,50);assert(s.w.has_request&&s.w.ack_result==MQ_OK&&s.w.last_request==1);
   assert(s.q.first_error==MQ_ERR_UART&&s.stops==2&&s.w.rx_read==s.w.rx_write);
-  puts("PASS new fault rejects stale telemetry, next frame has fault state and CRC, buffered STOP survives");
+  poll(&s,52);assert(s.tx_count==1&&s.tx[42]==1&&s.tx[46]==MQ_OK);crc_valid(s.tx);
+  puts("PASS new fault rejects stale reply, rebuilt reply has fault state and CRC, buffered STOP survives");
 }
 static void start_fault_schedules(void){
   Sim s;uint8_t b[36];
   for(unsigned mode=0;mode<2;mode++){
-    init(&s);poll(&s,50);s.busy=false;
+    init(&s);
     s.q.task_id=1;s.q.committed=true;s.q.state=MQ_READY;s.q.epoch_at_upload=1;
     s.q.duration_ms=1000;s.q.count=1;
     command(&s,b,WIRE_START,1);s.clock=64;receive(&s,b,36);
@@ -97,17 +102,24 @@ static void start_fault_schedules(void){
     assert(s.q.state==MQ_STOPPING&&s.w.transport_fault&&s.w.last_request==(mode?1u:0u));
     assert(mode?s.arms==1:s.arms==0);
   }
-  init(&s);poll(&s,50);s.busy=false;
+  init(&s);
   s.q.task_id=1;s.q.committed=true;s.q.state=MQ_READY;s.q.epoch_at_upload=1;
   s.q.duration_ms=1000;s.q.count=1;command(&s,b,WIRE_START,1);
   s.clock=64;receive(&s,b,36);poll(&s,64);assert(s.arms==1&&s.w.ack_result==MQ_OK);
-  s.clock=65;receive(&s,b,36);s.fault_on_enter=s.enters+2u;poll(&s,65);
+  poll(&s,66);assert(s.tx_count==1&&s.tx[46]==MQ_OK);
+  s.busy=false;s.clock=67;receive(&s,b,36);s.fault_on_enter=s.enters+2u;poll(&s,67);
   assert(s.arms==1&&s.w.ack_result==MQ_UNHEALTHY&&s.q.first_error==MQ_ERR_UART);
+  init(&s);
+  s.q.task_id=1;s.q.committed=true;s.q.state=MQ_READY;s.q.epoch_at_upload=1;
+  s.q.duration_ms=1000;s.q.count=1;command(&s,b,WIRE_START,1);
+  receive(&s,b,36);poll(&s,50);assert(s.w.ack_result==MQ_OK&&s.w.reply_pending);
+  wire_transport_error(&s.w);poll(&s,52);
+  assert(s.tx_count==1&&s.tx[46]==MQ_UNHEALTHY&&s.tx[90]==MQ_ERR_UART&&s.stops==1);
   puts("PASS START rejects pre-claim fault and raw hardware error observed after memory-only arm");
 }
 static void echo_and_stop_frames(void){
   Sim s;uint8_t b[36],echo[110];init(&s);command(&s,b,WIRE_STOP,1);
-  wire_telemetry(&s.q,echo,1,50,0,0,false,false,14,38,0);
+  wire_telemetry(&s.q,echo,1,50,0,0,false,false,0);
   memcpy(echo+30,b,36);p16(echo+108,wire_crc16(echo+2,106));
   receive(&s,echo,110);poll(&s,50);assert(!s.stops&&!s.w.has_request&&!s.w.used);
   /* A STOP is allowed to span the TX claim/TC boundary if its bytes arrive. */
@@ -116,10 +128,16 @@ static void echo_and_stop_frames(void){
   assert(s.stops==1&&s.w.has_request&&s.w.ack_result==MQ_OK);
   /* Replay remains idempotent despite arrival across busy boundaries. */
   s.clock=62;receive(&s,b,36);poll(&s,62);assert(s.stops==1);
+  poll(&s,64);assert(s.tx_count==1&&s.tx[42]==1&&s.tx[46]==MQ_OK);
+  init(&s);discovery(&s);poll(&s,52);assert(s.busy);
+  memcpy(echo,s.w.tx,sizeof(echo));command(&s,b,WIRE_STOP,1);
+  s.clock=60;receive(&s,b,36);poll(&s,60);
+  assert(s.stops==1&&s.w.reply_pending&&!memcmp(s.w.tx,echo,sizeof(echo)));
+  s.busy=false;poll(&s,62);assert(s.tx_count==2&&s.tx[42]==1&&s.tx[46]==MQ_OK);
   puts("PASS 110B echo envelope suppresses embedded command, intact STOP spans TX/TC, replay unchanged");
 }
 static void long_operation_fault(void){
-  Sim s;uint8_t b[46]={0};init(&s);poll(&s,50);s.busy=false;
+  Sim s;uint8_t b[46]={0};init(&s);
   command(&s,b,WIRE_BEGIN,1);p16(b+4,38);p64(b+26,1);
   p16(b+34,1);p32(b+36,123);p32(b+40,1000);p16(b+44,wire_crc16(b+2,42));
   s.clock=64;receive(&s,b,46);s.error_at_view=s.expect_view_unmasked=true;poll(&s,64);

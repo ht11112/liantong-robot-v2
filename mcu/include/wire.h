@@ -3,9 +3,8 @@
 #include "mq.h"
 #include <stddef.h>
 
-#define WIRE_VERSION 10u
+#define WIRE_VERSION 11u
 #define WIRE_BAUD 115200u
-#define WIRE_PERIOD_MS 50u
 #define WIRE_TELEMETRY_SIZE 110u
 #define WIRE_COMMAND_MAX 64u
 #define WIRE_RING_SIZE 128u
@@ -39,11 +38,10 @@ typedef struct {
   volatile uint16_t rx_write,rx_read;
   volatile uint32_t last_rx_ms;
   volatile bool transport_fault;
-  uint32_t origin_ms,attempted_frame,pub_sequence,pub_tick_ms;
-  uint32_t grant_frame_start,last_used_grant,ack_request,last_request;
+  uint32_t pub_sequence,pub_tick_ms,reply_queued_ms,ack_request,last_request;
   uint16_t used,wanted,previous_length;
-  uint8_t ack_result;
-  bool has_published,ack_valid,has_request,fault_reported;
+  uint8_t ack_result,previous_result;
+  bool reply_pending,reply_requires_healthy,has_request,fault_reported;
 } Wire;
 
 uint16_t wire_crc16(const uint8_t *data,size_t length);
@@ -57,6 +55,5 @@ void wire_poll(Wire *w,uint32_t now);
 /* Portable codec also used by native/WASM tests; no packed C structs. */
 size_t wire_telemetry(const MQ *q,uint8_t *out,uint32_t pub_sequence,
                       uint32_t pub_tick_ms,uint32_t ack_request,uint8_t ack_result,
-                      bool ack_valid,bool rx_fault,uint16_t open_ms,uint16_t close_ms,
-                      uint32_t accepted_request_watermark);
+                      bool ack_valid,bool rx_fault,uint32_t accepted_request_watermark);
 #endif

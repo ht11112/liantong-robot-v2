@@ -66,7 +66,7 @@ def host_tests(args, out):
                           compiler=native or compiler[0]))
     if not cases:
         raise RuntimeError('No C production-code tests found')
-    py_env = dict(os.environ, MQ_CODEC_GOLDEN_LOG=str(out/'test_wire.log'))
+    py_env = dict(os.environ, MQ_V11_CODEC_GOLDEN_LOG=str(out/'test_wire.log'))
     py = run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', str(ROOT/'tests'),
               '-p', 'test_*.py', '-v'], out/'python_tests.log', py_env)
     return dict(C_suites=cases, Python_summary=py.strip().splitlines()[-5:])
@@ -104,7 +104,7 @@ def firmware(args, out):
         obj = out/(source.name+'.o')
         run([gcc]+flags+['-c', str(source), '-o', str(obj)], out/(source.name+'.compile.log'))
         objects.append(obj)
-    elf, binary, mapping = (out/('mcu-v10.'+s) for s in ('elf', 'bin', 'map'))
+    elf, binary, mapping = (out/('mcu-v11.'+s) for s in ('elf', 'bin', 'map'))
     run([gcc]+flags+['-nostartfiles', '--specs=nano.specs', '--specs=nosys.specs']+objects+
         ['-T'+str(ROOT/'flash.ld'), '-Wl,--gc-sections', '-Wl,-Map='+str(mapping),
          '-Wl,--start-group', '-lc', '-lm', '-Wl,--end-group', '-o', elf], out/'link.log')
@@ -141,7 +141,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host-tests', action='store_true')
     parser.add_argument('--firmware', action='store_true')
-    parser.add_argument('--name', default='mcu-v10-offline')
+    parser.add_argument('--name', default='mcu-v11-offline')
     parser.add_argument('--emscripten', type=Path, default=UNITY)
     parser.add_argument('--sdk', type=Path, default=SDK)
     parser.add_argument('--compiler-dir', type=Path, default=ARM if os.name=='nt' else None)

@@ -1,12 +1,10 @@
-# MCU v10：累计里程计与独立动作队列
+# 第三分支：RK 主站与 STM32 从站
 
-本目录是第二分支`feature/mcu-odom-queue`的独立交付，从第一分支`f86ab2b`及操作者提供的G474 v9源码派生。已提供默认离线的部署和静止采集工具；首次隔离部署因独立读回异常中止，尚未完成静止或运动验收。RK costmap/A*、一次AMCL和8766网页接入留到下一阶段。
-
-2026-11-05 新增[UART 收发交接加固候选](docs/UART_HARDENING.md)，处理离线模拟发现的同步、故障发布和 STOP 接收边界。候选仅在本地验证，未刷入设备，现场 FE 原因仍未定位；旧部署工具的固件身份不能直接用于新候选。
+`feature/rk-master-stm-slave` 在第二分支的累计 odom 与 MCU 独立队列基础上，改用 V11 问答。RK 发起请求，STM32 收到后回复。旧 V10 工具保留供对应固件和历史记录使用。详见[第三分支线协议](docs/PROTOCOL_V11.md)。
 
 ## 运行方式
 
-MCU基于真实0.1RPM轮速及自身时间持续积分odom，以名义20Hz主动发布累计结果。轮径0.20m、轮距0.30m仍未标定；不是用目标速度估计位移，也未把未标定编码器计数换成米。CAN的真实采样缺失会使odom失效；主机丢失遥测只会少看到几帧，不使MCU漏积分。
+MCU基于真实0.1RPM轮速及自身时间持续积分odom，以名义20Hz读取CAN轮速并在RK查询时返回累计结果。轮径0.20m、轮距0.30m仍未标定；不是用目标速度估计位移，也未把未标定编码器计数换成米。CAN的真实采样缺失会使odom失效；主机丢失遥测只会少看到几帧，不使MCU漏积分。
 
 `measurement_tick_ms`实际记录MCU收到CAN读速响应的完成时刻，序号也是本机采纳序号；驱动器没有在此SDO中提供内部测量时间，不能把接收时刻称为驱动内部传感器时间。
 
@@ -27,30 +25,24 @@ CANopen SDO没有事务编号，任何超时之后的同对象迟到ACK无法可
 从仓库根目录运行：
 
 ```text
-python -B mcu/build.py --host-tests --name v10-host-check
-python -B mcu/build.py --firmware --name v10-production
+python -B mcu/build.py --host-tests --name v11-host-check
+python -B mcu/build.py --firmware --name v11-production
 ```
 
-输出目录必须是新名字，结果在`build/名字/`，含测试日志或生产`mcu-v10.bin`、`.elf`、`.map`及SHA/内存报告`receipt.json`。构建脚本没有连接设备、烧录或启动功能。32KB超限即失败，不扩大应用区。
+输出目录必须是新名字，结果在`build/名字/`，含测试日志或生产`mcu-v11.bin`、`.elf`、`.map`及SHA/内存报告`receipt.json`。构建脚本没有连接设备、烧录或启动功能。32KB超限即失败，不扩大应用区。
 
 Linux主机测试使用`cc/gcc/clang`；Windows默认使用本机Unity的Emscripten/Node，路径可由`--emscripten`指定。生产构建使用STM32CubeG4 1.6.3及ARM GCC，路径通过`--sdk`、`--compiler-dir`指定；保持Cortex-M4、16MHz HSI、soft-float，与原硬件引脚及CAN500kbit/s配置一致。SDK不复制入仓库，构建报告记录实际SDK源与工具SHA。
 
-## PC工具
+## RK 工具
 
-安装PC端`pyserial==3.5`后，监听命令如下；端口必须显式填写，模块导入和默认监听均不发送命令：
-
-```text
-python -B mcu/tools/mcu_v10.py --port COM_PORT
-```
-
-串口是半双工。写命令需提供有测量来源的USB/调度延时预算，工具建立MCU/主机时钟偏移区间后，只在可容纳整帧的授权窗口发送。具体字段、单位、CRC及预算文件见[线协议](docs/PROTOCOL.md)。这不是桌面USB硬实时时序保证，后续必须静止测量真实链路；不要把示例值当已测上界。
+RK 使用 pyserial。真实通信需显式指定端口与 `--execute`。按[静止验证顺序](docs/PROTOCOL_V11.md#静止验证顺序)先验证 QUERY、上传到 READY 和 50 Hz 基准。
 
 ```text
-python -B mcu/tools/mcu_v10.py upload --port COM_PORT --timing-budget measured.json --queue mcu/examples/queue.json
-python -B mcu/tools/mcu_v10.py start --port COM_PORT --timing-budget measured.json --task-id TASK_ID
-python -B mcu/tools/mcu_v10.py stop --port COM_PORT --timing-budget measured.json
+python3 -B mcu/tools/mcu_v11.py query --execute --port /dev/ttyUSBn
+python3 -B mcu/tools/mcu_v11.py upload --execute --port /dev/ttyUSBn --queue mcu/examples/queue.json
+python3 -B mcu/tools/mcu_v11.py benchmark --execute --port /dev/ttyUSBn --duration 65
 ```
 
-`queue.json`只是协议示例，构建、监听、上传都不执行它。`reset`是停稳后的显式MCU odom置零，会增加odom代次并撤销旧队列；下一阶段AMCL只建立map→odom关系，不需要每个目标都把MCU置零。
+上传只提交队列，独立的 `start --task-id` 才能启动车辆。`stop` 分别报告命令 ACK 和实测停稳，具体含义见[协议说明](docs/PROTOCOL_V11.md#队列和停车)。
 
-新固件仅接受v10，不能配第一分支的v9程序控制。原RAR、第一分支及旧固件作为回退基线保留，来源身份见`provenance.json`。部署流程及实际中止结果见[隔离部署](docs/DEPLOYMENT.md)，零发送采集与判定范围见[静止验收](docs/STATIC_CAPTURE.md)。静止通过后才单独安排架空动作和低速地面验收。
+旧 V10 的部署身份和零发送静止采集流程不能验收 V11。实机使用 V11 前需核实本次固件身份、接线与驱动状态。仓库历史 V10 设备记录保留在对应分支和项目记录中。
