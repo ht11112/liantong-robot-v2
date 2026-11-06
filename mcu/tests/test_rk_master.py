@@ -215,6 +215,76 @@ class MasterTests(unittest.TestCase):
                     master.discover()
                 self.assertEqual(len(port.writes), 1)
 
+    def test_regular_query_retries_same_request_after_a_lost_or_delayed_exchange(self):
+        for loss in ('request', 'reply', 'delayed_reply'):
+            with self.subTest(loss=loss):
+                accepted = []
+
+                def response(index, kind, request, task):
+                    if index == 0:
+                        return [(.014, telemetry(accepted_request_watermark=31))]
+                    if index == 1 and loss == 'request':
+                        return []
+                    if not accepted or accepted[-1] != request:
+                        accepted.append(request)
+                    if (index == 1 and loss == 'reply') or (index == 2 and loss == 'delayed_reply'):
+                        return []
+                    delay = .115 if index == 1 else .014
+                    return [(delay, telemetry(publication_sequence=index + 1,
+                                              publication_tick_ms=1000 + 20 * index,
+                                              ack_request=request, accepted_request_watermark=request))]
+
+                master, port = self.make_master(response)
+                master.discover()
+                reply = master.query()
+                self.assertEqual(reply.request, 32)
+                self.assertEqual(reply.sent_at, port.writes[1][0])
+                self.assertEqual(port.writes[2][1], port.writes[1][1])
+                self.assertGreater(reply.received_at, port.writes[2][0])
+                self.assertEqual(master.query_retries, 1)
+                self.assertEqual(master.last_query_retry['details']['request'], 32)
+                self.assertFalse(master.failed)
+                self.assertEqual(master.query().request, 33)
+                self.assertEqual(accepted, [32, 33])
+
+    def test_two_regular_query_timeouts_close_the_owner(self):
+        master, port = self.make_master(lambda index, *unused: [(.014, telemetry())] if not index else [])
+        master.discover()
+        with self.assertRaises(v11.ReplyTimeout) as timed_out:
+            master.query()
+        details = timed_out.exception.details
+        self.assertEqual(details['request'], details['first_query_attempt']['details']['request'])
+        self.assertEqual(master.query_retries, 1)
+        self.assertTrue(master.failed)
+        with self.assertRaises(v11.LinkError):
+            master.query()
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.QUERY, v11.QUERY])
+
+    def test_short_regular_query_write_closes_without_retry(self):
+        master, port = self.make_master()
+        master.discover()
+        port.short_write = True
+        with self.assertRaisesRegex(v11.LinkError, 'Partial serial write'):
+            master.query()
+        self.assertEqual(len(port.writes), 2)
+        self.assertEqual(master.query_retries, 0)
+        self.assertTrue(master.failed)
+
+    def test_start_and_stop_timeouts_close_without_retry(self):
+        discovery = telemetry(task=TASK, state=v11.READY, flags=v11.ACK_VALID | 3 | v11.COMMITTED)
+        for opcode in (v11.START, v11.STOP):
+            with self.subTest(opcode=opcode):
+                master, port = self.make_master(lambda index, *unused: [(.014, discovery)] if not index else [])
+                master.discover()
+                with self.assertRaises(v11.ReplyTimeout):
+                    if opcode == v11.START:
+                        master.start(TASK)
+                    else:
+                        master.stop()
+                self.assertTrue(master.failed)
+                self.assertEqual(master.query_retries, 0)
+                self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, opcode])
+
     def test_stale_ack_is_ignored_but_boot_change_poisoned(self):
         def response(index, kind, request, task):
             if index == 0:

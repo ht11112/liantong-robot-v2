@@ -13,7 +13,8 @@ import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
-from mcu_v11 import EXECUTING, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, RkMaster, open_port
+from mcu_v11 import (EXECUTING, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, RkMaster,
+                     error_record, open_port)
 from v11_map_plan import load_map
 
 
@@ -266,7 +267,15 @@ class Navigation:
                         elif plan is not None:
                             self._upload(master, plan)
                         else:
-                            self.observe(master.query())
+                            retries = master.query_retries
+                            reply = master.query()
+                            self.observe(reply)
+                            if master.query_retries != retries:
+                                print(json.dumps(dict(event='v11_query_recovered',
+                                                      task=reply.status.task, request=reply.request,
+                                                      first_attempt=master.last_query_retry,
+                                                      parser_errors=dict(master.parser.errors),
+                                                      ignored_replies=dict(master.ignored))), flush=True)
                         if master.failed:
                             raise LinkError(self.error or 'V11 会话已失效')
                     except (ValueError, LinkError) as exc:
@@ -287,6 +296,9 @@ class Navigation:
         except Exception as exc:
             with self.lock:
                 self.error = str(exc)
+                task = self.latest.status.task if self.latest is not None else None
+            print(json.dumps(dict(event='v11_owner_closed', task=task, error=error_record(exc))),
+                  flush=True)
         finally:
             with self.lock:
                 self.connected = False

@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -177,8 +177,12 @@ class Rejected(LinkError):
     pass
 
 
+class ReplyTimeout(LinkError):
+    pass
+
+
 class RkMaster:
-    """One serial owner, one transaction at a time, no automatic retransmission."""
+    """One serial owner, one transaction at a time. Only regular queries may retry."""
 
     def __init__(self, port, *, reply_timeout=.100, clock=time.monotonic, sleep=time.sleep):
         if not math.isfinite(reply_timeout) or reply_timeout <= 0:
@@ -191,6 +195,8 @@ class RkMaster:
         self.latest = None
         self.last_sent = None
         self.sent = 0
+        self.query_retries = 0
+        self.last_query_retry = None
         self.ignored = Counter(unmatched_ack=0, stale_reply=0)
         self.failed = False
 
@@ -255,7 +261,7 @@ class RkMaster:
                         raise Rejected('MCU rejected opcode {} with result {}'.format(kind, value.ack_result),
                                        exchange, details=details)
                     return exchange
-            raise LinkError('Timed out without a matching V11 reply', exchange, details=details)
+            raise ReplyTimeout('Timed out without a matching V11 reply', exchange, details=details)
         except Rejected:
             if discover:
                 self.failed = True
@@ -275,7 +281,21 @@ class RkMaster:
 
     def query(self):
         with self.lock:
-            return self._exchange(QUERY)
+            try:
+                return self._exchange(QUERY)
+            except ReplyTimeout as first:
+                self.query_retries += 1
+                self.last_query_retry = error_record(first)
+                self.failed = False
+                try:
+                    reply = self._exchange(QUERY)
+                except LinkError as exc:
+                    exc.details['first_query_attempt'] = self.last_query_retry
+                    raise
+                # The same request can still match its first reply. Keep the
+                # earlier send time so a delayed sample cannot appear newer.
+                self.latest = replace(reply, sent_at=first.details['sent_at'])
+                return self.latest
 
     def upload(self, document, task=None, *, on_ack=None):
         plan = document if isinstance(document, QueuePlan) else QueuePlan.from_document(document)
