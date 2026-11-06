@@ -1,4 +1,4 @@
-"""Loopback map console and fixed HTTP tunnel to the V11 RK daemon."""
+"""Loopback map console and fixed HTTP tunnel to the RK navigation daemon."""
 import argparse
 import getpass
 import hashlib
@@ -208,7 +208,7 @@ def main(argv=None):
                      getpass.getpass('RK SSH password (memory only): '))
     gateway = MapGateway(remote, args.map_pgm, args.map_sha256, costmap_grid=grid)
     server = ThreadingHTTPServer((HOST, PC_PORT), handler_for(gateway))
-    print('V11 map console: '+ORIGIN+'/', flush=True)
+    print('V12 map console: '+ORIGIN+'/', flush=True)
     try:
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:

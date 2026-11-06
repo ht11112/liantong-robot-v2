@@ -31,7 +31,7 @@
 </head>
 <body>
   <header>
-    <div class="brand"><span class="mark" aria-hidden="true">V11</span><div><strong>联通机器人</strong><small>本地地图控制台</small></div></div>
+    <div class="brand"><span class="mark" aria-hidden="true">V12</span><div><strong>联通机器人</strong><small>本地地图控制台</small></div></div>
     <span id="connection" class="pill" role="status">正在连接 RK</span>
   </header>
   <main>
@@ -66,6 +66,7 @@
             <div class="kv"><dt>任务编号</dt><dd class="mono" id="task-id">—</dd></div>
             <div class="kv"><dt>段序</dt><dd id="task-index">—</dd></div>
             <div class="kv"><dt>段内进度</dt><dd id="task-progress">—</dd></div>
+            <div class="kv"><dt>任务授权剩余</dt><dd id="task-lease">—</dd></div>
             <div class="kv"><dt>到点</dt><dd id="arrival">未报告</dd></div>
             <div class="kv"><dt>STOP 回应</dt><dd id="stop-ack">—</dd></div>
             <div class="kv"><dt>实测停稳</dt><dd id="stop-proof">—</dd></div>
@@ -239,7 +240,7 @@
       [...seedFields,...goalFields].forEach(input=>{input.disabled=Boolean(action);});
       const crc=route && typeof route.queue_crc32==='number'?route.queue_crc32.toString(16).padStart(8,'0'):route?.queue_crc32;
       $('plan').textContent=!route?'尚无预览':route.no_motion?'目标已在容差内，无需上传动作':
-        `${preview?'预览':'已提交路线'} · ${route.segments.length} 段 · ${(route.nominal_duration_s ?? route.duration_s).toFixed(1)} s · CRC32 ${crc ?? '—'}`;
+        `${preview?'预览':'已提交路线'} · ${route.segments.length} 段 · 预计 ${route.nominal_duration_s.toFixed(1)} s · CRC32 ${crc ?? '—'}`;
       $('task-phase').textContent=phaseNames[task.phase]||task.phase||'待命';$('task-id').textContent=task.id??'—';
       $('task-index').textContent=task.count?`${Math.min(task.index+1,task.count)} / ${task.count}`:'—';
       $('arrival').textContent=task.arrival?'已报告到点':'未报告';
@@ -247,6 +248,7 @@
       $('stop-proof').textContent=task.stop_verified==null?'—':task.stop_verified?'已确认':'尚未确认';
       $('task-progress').textContent=!finite(task.progress)?'—':task.phase==='move'?`${task.progress.toFixed(3)} m`:
         task.phase==='turn'?`${(task.progress*180/Math.PI).toFixed(1)}°`:'—';
+      $('task-lease').textContent=finite(task.lease_remaining_s)?`${task.lease_remaining_s.toFixed(1)} s`:'—';
       $('task-error').textContent=task.error||'';$('task-error').hidden=!task.error;
       draw();
     }

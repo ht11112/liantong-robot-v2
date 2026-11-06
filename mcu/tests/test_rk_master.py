@@ -1,4 +1,4 @@
-"""Offline tests for V11 codec, sequencing, polling and operator boundaries."""
+"""Offline tests for V12 codec, sequencing, polling and operator boundaries."""
 
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -21,7 +21,7 @@ TASK = 0x0102030405060708
 PAYLOAD = ('boot epoch publication_sequence publication_tick_ms sample_sequence measurement_tick_ms '
            'task ack_request ack_result state flags index count progress x y yaw v w position_left '
            'position_right left_tenths_rpm right_tenths_rpm first_error first_drive_error first_error_tick_ms '
-           'reserved_100 reserved_102 accepted_request_watermark').split()
+           'lease_remaining_ms accepted_request_watermark').split()
 
 
 def telemetry(**changes):
@@ -29,7 +29,7 @@ def telemetry(**changes):
     values.update(boot=BOOT, epoch=7, publication_sequence=1, publication_tick_ms=1000,
                   sample_sequence=1, measurement_tick_ms=995, flags=v11.ACK_VALID | 3)
     values.update(changes)
-    body = v11.HEADER[2:] + struct.pack('<QIIIIIQIBBHHHffffffIIhhHIIHHI', *(values[key] for key in PAYLOAD))
+    body = v11.HEADER[2:] + struct.pack('<QIIIIIQIBBHHHffffffIIhhHIIII', *(values[key] for key in PAYLOAD))
     return b'\xa5\x5a' + body + struct.pack('<H', v11.crc16(body))
 
 
@@ -39,7 +39,8 @@ def golden_reply():
                      state=5, flags=455, index=1, count=2, progress=.25, x=1.25, y=-.5,
                      yaw=-1., v=.02, w=-.05, position_left=0xFFFFFFFE, position_right=1234,
                      left_tenths_rpm=7, right_tenths_rpm=-9, first_error=3,
-                     first_drive_error=0x12345678, first_error_tick_ms=9000, accepted_request_watermark=32)
+                     first_drive_error=0x12345678, first_error_tick_ms=9000,
+                     lease_remaining_ms=29500, accepted_request_watermark=32)
 
 
 class FakeClock:
@@ -96,11 +97,11 @@ class FakePort:
 class CodecTests(unittest.TestCase):
     def test_discovery_and_regular_wire_layout(self):
         discovery = v11.command(v11.QUERY)
-        self.assertEqual(discovery[:6], b'\xa5\x5a\x0b\x07\x1c\x00')
+        self.assertEqual(discovery[:6], b'\xa5\x5a\x0c\x07\x1c\x00')
         self.assertEqual(discovery[6:34], bytes(28))
         self.assertEqual(len(discovery), 36)
         self.assertEqual(v11.crc16(discovery[2:-2]), int.from_bytes(discovery[-2:], 'little'))
-        request = v11.command(v11.BEGIN, BOOT, 7, 33, TASK, struct.pack('<HII', 2, 0x615AABE9, 1200000))
+        request = v11.command(v11.BEGIN, BOOT, 7, 33, TASK, struct.pack('<HII', 2, 0x615AABE9, 30000))
         self.assertEqual(len(request), 46)
         self.assertEqual(struct.unpack_from('<QIIIQ', request, 6), (BOOT, 7, 33, 0, TASK))
         with self.assertRaises(ValueError):
@@ -111,7 +112,7 @@ class CodecTests(unittest.TestCase):
     def test_real_c_golden(self):
         log = os.environ.get('MQ_V11_CODEC_GOLDEN_LOG')
         if not log:
-            self.skipTest('Run the host C build to compare the actual V11 golden vector')
+            self.skipTest('Run the host C build to compare the actual V12 golden vector')
         lines = Path(log).read_text(encoding='utf-8').splitlines()
         line = next(line for line in lines if line.startswith('GOLDEN'))
         golden = json.loads(line.partition(' ')[2] if line.startswith('GOLDEN ') else line[line.index('{'):])
@@ -119,7 +120,7 @@ class CodecTests(unittest.TestCase):
         status = v11.decode_telemetry(bytes.fromhex(golden['telemetry']))
         self.assertEqual(golden['query'], v11.command(v11.QUERY).hex())
         self.assertEqual(golden['begin'], v11.command(v11.BEGIN, status.boot, 7, 33, status.task + 1,
-                                                    struct.pack('<HII', 2, 0x615AABE9, 1200000)).hex())
+                                                    struct.pack('<HII', 2, 0x615AABE9, 30000)).hex())
         self.assertEqual(golden['append'], v11.command(v11.APPEND, status.boot, 7, 34, status.task + 1,
                                                       struct.pack('<HIf', 1, 2, -1.5)).hex())
         self.assertEqual(golden['queue_crc32'], 0x615AABE9)
@@ -128,10 +129,10 @@ class CodecTests(unittest.TestCase):
         valid = telemetry()
         bad_crc = bytearray(valid)
         bad_crc[50] ^= 1
-        old = bytearray(valid)
-        old[2] = 10
+        old_body = b'\x0b' + valid[3:-2]
+        old = valid[:2] + old_body + struct.pack('<H', v11.crc16(old_body))
         parser = v11.ReplyParser()
-        self.assertEqual(list(parser.feed(b'noise' + old + bad_crc + telemetry(reserved_102=1) + valid[:50])), [])
+        self.assertEqual(list(parser.feed(b'noise' + old + bad_crc + telemetry(lease_remaining_ms=1) + valid[:50])), [])
         outputs = list(parser.feed(valid[50:]))
         self.assertEqual(outputs, [(v11.decode_telemetry(valid), valid)])
         self.assertEqual(parser.errors['invalid_headers'], 1)
@@ -139,6 +140,20 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(parser.errors['invalid_metadata'], 1)
         with self.assertRaises(ValueError):
             v11.decode_telemetry(telemetry(measurement_tick_ms=750))
+
+    def test_lease_field_is_bounded_and_only_active_states_report_it(self):
+        flags = v11.ACK_VALID | 3 | v11.EXECUTING | v11.STARTED | v11.COMMITTED
+        for state, remaining in ((5, 30000), (5, 0), (7, 0)):
+            raw = telemetry(state=state, flags=flags, lease_remaining_ms=remaining)
+            self.assertEqual(struct.unpack_from('<I', raw, 100)[0], remaining)
+            self.assertEqual(v11.decode_telemetry(raw).lease_remaining_ms, remaining)
+        for state, remaining in ((5, 30001), (7, 1), (9, 30000)):
+            with self.assertRaises(ValueError):
+                v11.decode_telemetry(telemetry(state=state, flags=flags, lease_remaining_ms=remaining))
+
+    def test_old_total_duration_is_not_implicitly_dropped(self):
+        with self.assertRaisesRegex(ValueError, 'Remove duration_s'):
+            v11.QueuePlan.from_document({'segments': [{'kind': 'move', 'distance_m': .5}], 'duration_s': 1200})
 
 
 class MasterTests(unittest.TestCase):
@@ -425,7 +440,7 @@ class MasterTests(unittest.TestCase):
         self.assertEqual([packet[3] for _, packet in port.writes],
                          [v11.QUERY, v11.BEGIN, v11.APPEND, v11.APPEND, v11.COMMIT, v11.QUERY])
         self.assertEqual(len(poll_result), 1)
-        self.assertEqual(struct.unpack_from('<HII', port.writes[1][1], 34), (2, 0x615AABE9, 1200000))
+        self.assertEqual(struct.unpack_from('<HII', port.writes[1][1], 34), (2, 0x615AABE9, 30000))
 
     def test_upload_failure_preserves_prior_ack_and_never_sends_commit(self):
         def response(index, kind, request, task):
@@ -455,6 +470,37 @@ class MasterTests(unittest.TestCase):
             master.start(TASK + 1)
         self.assertEqual(master.start(TASK).opcode, v11.START)
         self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.START])
+
+    def test_renew_names_current_active_task_and_accepts_the_ack(self):
+        def response(index, kind, request, task):
+            return [(.014, telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
+                                     task=TASK, ack_request=request, accepted_request_watermark=request, state=4,
+                                     flags=v11.ACK_VALID | 3 | v11.EXECUTING | v11.STARTED,
+                                     lease_remaining_ms=30000 if index else 4990))]
+
+        master, port = self.make_master(response)
+        master.discover()
+        with self.assertRaisesRegex(ValueError, 'exact active task'):
+            master.renew(TASK + 1)
+        reply = master.renew(TASK)
+        self.assertEqual(reply.status.lease_remaining_ms, 30000)
+        packet = port.writes[-1][1]
+        self.assertEqual(packet[:6], b'\xa5\x5a\x0c\x08\x1c\x00')
+        self.assertEqual(len(packet), 36)
+        self.assertEqual(struct.unpack_from('<QIIIQ', packet, 6), (BOOT, 7, 1, 0, TASK))
+        self.assertEqual([frame[3] for _, frame in port.writes], [v11.QUERY, v11.RENEW])
+
+    def test_renew_is_never_retried_after_an_uncertain_ack(self):
+        active = telemetry(task=TASK, state=4, flags=v11.ACK_VALID | 3 | v11.EXECUTING,
+                           lease_remaining_ms=5000)
+        master, port = self.make_master(lambda index, *unused: [(.014, active)] if not index else [])
+        master.discover()
+        with self.assertRaises(v11.ReplyTimeout):
+            master.renew(TASK)
+        with self.assertRaises(v11.LinkError):
+            master.renew(TASK)
+        self.assertTrue(master.failed)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.RENEW])
 
     def test_stop_ack_and_new_zero_sample_proof_in_cancelled_terminal_state(self):
         def response(index, kind, request, task):

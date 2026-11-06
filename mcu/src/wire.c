@@ -1,7 +1,7 @@
 #include "wire.h"
 #include <string.h>
 
-enum { RX_QUIET_MS=2, RX_FRAGMENT_TIMEOUT_MS=12, REPLY_TIMEOUT_MS=50, LEGACY_WIRE_VERSION=10 };
+enum { RX_QUIET_MS=2, RX_FRAGMENT_TIMEOUT_MS=12, REPLY_TIMEOUT_MS=50 };
 
 static uint16_t r16(const uint8_t *p){return (uint16_t)(p[0]|((uint16_t)p[1]<<8));}
 static uint32_t r32(const uint8_t *p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
@@ -47,7 +47,7 @@ size_t wire_telemetry(const MQ *q,uint8_t *o,uint32_t seq,uint32_t pub,
   p32(o+78,q->odom.position_left);p32(o+82,q->odom.position_right);
   p16(o+86,(uint16_t)q->odom.left_tenths_rpm);p16(o+88,(uint16_t)q->odom.right_tenths_rpm);
   p16(o+90,(uint16_t)q->first_error);p32(o+92,q->first_drive_error);p32(o+96,q->first_error_tick_ms);
-  p32(o+100,0);p32(o+104,watermark);
+  p32(o+100,mq_lease_remaining_ms(q,pub));p32(o+104,watermark);
   finish(o,WIRE_TELEMETRY_SIZE,WIRE_TELEMETRY);return WIRE_TELEMETRY_SIZE;
 }
 void wire_init(Wire *w,MQ *q,const WireOps *io,void *user,uint32_t now){
@@ -89,7 +89,7 @@ static void reject(Wire *w,uint32_t req,MQResult result,uint32_t now){
 }
 static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
   MQ *q=w->queue;uint8_t op=f[3];bool stop=op==WIRE_STOP;MQResult r;
-  if(n<36u||op<WIRE_BEGIN||op>WIRE_QUERY)return;
+  if(n<36u||op<WIRE_BEGIN||op>WIRE_RENEW)return;
   /* The master waits for a reply before sending another ordinary request.
      STOP still runs while a reply waits or its transmit is in flight. */
   if(!stop&&(w->reply_pending||!w->io.tx_ready(w->user)))return;
@@ -138,6 +138,7 @@ static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
     }
     case WIRE_STOP:mq_stop(q,now);r=MQ_OK;break;
     case WIRE_RESET:r=mq_reset_odom(q,now);break;
+    case WIRE_RENEW:r=mq_renew(q,task,now);break;
     default:r=MQ_OK;break;
   }
   /* Long operations (queue CRC/reset) remain outside the IRQ mask. If an IRQ
@@ -154,7 +155,7 @@ static void consume(Wire *w,uint8_t byte,uint32_t now){
   if(w->used==6u){
     uint16_t len=r16(w->frame+4);
     bool telemetry=w->frame[3]==WIRE_TELEMETRY&&len==WIRE_TELEMETRY_SIZE-8u;
-    bool known_version=w->frame[2]==WIRE_VERSION||w->frame[2]==LEGACY_WIRE_VERSION;
+    bool known_version=w->frame[2]==WIRE_VERSION||w->frame[2]==11u||w->frame[2]==10u;
     if(!known_version||(!telemetry&&(len<28u||len>WIRE_COMMAND_MAX-8u))){w->used=0;return;}
     w->wanted=(uint16_t)(len+8u);
   }

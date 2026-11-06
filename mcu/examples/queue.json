@@ -1,5 +1,4 @@
 {
-  "duration_s": 1200,
   "segments": [
     {"kind": "move", "distance_m": 0.5},
     {"kind": "turn", "angle_rad": 1.5707963267948966},

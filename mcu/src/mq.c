@@ -29,6 +29,13 @@ bool mq_is_executing(const MQ *q) {
   return q->state==MQ_ARMING || q->state==MQ_MOVE || q->state==MQ_TURN ||
          q->state==MQ_BARRIER || q->state==MQ_STOPPING;
 }
+static bool lease_active(const MQ *q) {
+  return mq_is_executing(q) && q->state!=MQ_STOPPING;
+}
+uint32_t mq_lease_remaining_ms(const MQ *q,uint32_t now) {
+  uint32_t elapsed=now-q->lease_started_ms;
+  return lease_active(q) && elapsed<MQ_LEASE_MS ? MQ_LEASE_MS-elapsed : 0;
+}
 void mq_init(MQ *q,uint64_t boot_id,const MQDriveOps *ops,void *user) {
   memset(q,0,sizeof(*q));q->boot_id=boot_id;q->drive=*ops;q->drive_user=user;
   q->odom.epoch=1;q->state=MQ_IDLE;
@@ -93,17 +100,17 @@ static bool segment_valid(MQSegment s) {
     s.kind==MQ_KIND_TURN && absf(s.value)>0.f && absf(s.value)<=2.f*MQ_PI);
 }
 MQResult mq_begin(MQ *q,uint64_t task,uint32_t epoch,uint16_t count,
-                  uint32_t crc,uint32_t duration_ms) {
-  if(!task || !count || count>MQ_CAPACITY || !duration_ms || duration_ms>MQ_MAX_DURATION_MS)return MQ_INVALID;
+                  uint32_t crc,uint32_t lease_ms) {
+  if(!task || !count || count>MQ_CAPACITY || lease_ms!=MQ_LEASE_MS)return MQ_INVALID;
   if(epoch!=q->odom.epoch)return MQ_IDENTITY;
   if(task<q->task_id)return MQ_ORDER; /* Monotonic boot-local replay watermark. */
   if(task==q->task_id) {
-    return q->count==count && q->expected_crc==crc && q->duration_ms==duration_ms ? MQ_OK:MQ_ORDER;
+    return q->count==count && q->expected_crc==crc ? MQ_OK:MQ_ORDER;
   }
   if(mq_is_executing(q))return MQ_BUSY;
   MQDriveView d=view(q);
   if(d.state!=MQ_DRIVE_STOPPED || !d.stop_verified || !d.guard_valid || d.error || !q->odom.valid || q->critical_latched)return MQ_UNHEALTHY;
-  q->task_id=task;q->count=count;q->expected_crc=crc;q->duration_ms=duration_ms;
+  q->task_id=task;q->count=count;q->expected_crc=crc;
   q->received=q->index=0;q->epoch_at_upload=epoch;q->state=MQ_LOADING;
   q->committed=q->has_started=q->arrival_reached=q->physical_stop_confirmed=false;
   q->first_error=q->first_drive_error=q->first_error_tick_ms=0;
@@ -136,8 +143,22 @@ MQResult mq_start(MQ *q,uint64_t task,uint32_t now) {
   MQDriveView d=view(q);
   if(d.state!=MQ_DRIVE_STOPPED || !d.stop_verified || !d.guard_valid || d.error || q->first_error || !q->boot_id)return MQ_UNHEALTHY;
   if(!q->odom.valid || !q->odom.initialized || now-q->odom.measurement_tick_ms>=MQ_SAMPLE_TIMEOUT_MS || !zero_sample(&q->odom))return MQ_STALE;
-  q->has_started=true;q->started_ms=now;q->index=0;q->state=MQ_ARMING;
+  q->has_started=true;q->started_ms=q->lease_started_ms=now;q->index=0;q->state=MQ_ARMING;
   q->drive.arm(q->drive_user,now);return MQ_OK;
+}
+MQResult mq_renew(MQ *q,uint64_t task,uint32_t now) {
+  if(task!=q->task_id || q->epoch_at_upload!=q->odom.epoch)return MQ_IDENTITY;
+  if(!lease_active(q))return MQ_ORDER;
+  if(!mq_lease_remaining_ms(q,now)){
+    mq_fault(q,MQ_ERR_DEADLINE,now);return MQ_EXPIRED;
+  }
+  MQDriveView d=view(q);
+  if(q->critical_latched || q->first_error || d.error || !d.guard_valid ||
+     (d.state!=MQ_DRIVE_ENABLED && !(q->state==MQ_ARMING && d.state==MQ_DRIVE_ARMING)))
+    return MQ_UNHEALTHY;
+  if(!q->odom.valid || now-q->odom.measurement_tick_ms>=MQ_SAMPLE_TIMEOUT_MS)return MQ_STALE;
+  q->lease_started_ms=now;
+  return MQ_OK;
 }
 void mq_stop(MQ *q,uint32_t now) {
   if(q->has_started && q->state!=MQ_COMPLETE && q->state!=MQ_FAILED)mq_fault(q,MQ_ERR_CANCEL,now);
@@ -196,7 +217,7 @@ void mq_tick(MQ *q,uint32_t now) {
   if(!mq_is_executing(q))return;
   if(d.error || d.state==MQ_DRIVE_FAILED){mq_fault(q,MQ_ERR_DRIVE,now);return;}
   if(!q->odom.valid || now-q->odom.measurement_tick_ms>=MQ_SAMPLE_TIMEOUT_MS){mq_fault(q,MQ_ERR_ODOM,now);return;}
-  if(now-q->started_ms>=q->duration_ms){mq_fault(q,MQ_ERR_DEADLINE,now);return;}
+  if(!mq_lease_remaining_ms(q,now)){mq_fault(q,MQ_ERR_DEADLINE,now);return;}
   if(q->target_pending) {
     if(d.applied_generation==q->target_generation) {
       if(now-q->target_requested_ms>=300u){mq_fault(q,MQ_ERR_APPLY,now);return;}

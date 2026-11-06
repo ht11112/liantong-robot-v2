@@ -109,7 +109,7 @@ static void boot(void){
   assert(p.d.view.state==MQ_DRIVE_STOPPED&&p.d.view.stop_verified&&p.q.odom.valid);
 }
 static void upload_start(const MQSegment *s,uint16_t count){
-  assert(mq_begin(&p.q,1u,p.q.odom.epoch,count,mq_segments_crc(s,count),MQ_MAX_DURATION_MS)==MQ_OK);
+  assert(mq_begin(&p.q,1u,p.q.odom.epoch,count,mq_segments_crc(s,count),MQ_LEASE_MS)==MQ_OK);
   for(uint16_t i=0;i<count;i++)assert(mq_append(&p.q,1u,i,s[i])==MQ_OK);
   assert(mq_commit(&p.q,1u)==MQ_OK);assert(!p.motion_writes);
   assert(mq_start(&p.q,1u,p.now)==MQ_OK);
@@ -120,8 +120,10 @@ static void to_moving(void){
 }
 static void closed_queue(float angle){
   boot();MQSegment s[3]={{MQ_KIND_MOVE,.5f},{MQ_KIND_TURN,angle},{MQ_KIND_MOVE,.5f}};upload_start(s,3);
-  /* No host API, RX byte, renewal, or new path is sent after this START. */
-  for(unsigned i=0;i<200000u&&p.q.state!=MQ_COMPLETE&&p.q.state!=MQ_FAILED;i++)tick();
+  for(unsigned i=0;i<200000u&&p.q.state!=MQ_COMPLETE&&p.q.state!=MQ_FAILED;i++){
+    tick();
+    if(mq_lease_remaining_ms(&p.q,p.now)==5000u)assert(mq_renew(&p.q,1u,p.now)==MQ_OK);
+  }
   if(p.q.state!=MQ_COMPLETE)printf("INTEGRATION DIAG tick=%u q=%u err=%u drive=%u derr=%u flow=%u step=%u sample=%u odo_valid=%u progress=%f target_gen=%u applied_gen=%u\n",(unsigned)p.now,(unsigned)p.q.state,(unsigned)p.q.first_error,(unsigned)p.d.view.state,(unsigned)p.d.view.error,(unsigned)p.d.flow,(unsigned)p.d.flow_step,(unsigned)p.q.odom.sample_sequence,(unsigned)p.q.odom.valid,p.q.progress,(unsigned)p.q.target_generation,(unsigned)p.d.view.applied_generation);
   assert(p.q.state==MQ_COMPLETE && p.q.arrival_reached && p.q.physical_stop_confirmed);
   assert(!p.q.first_error&&!p.d.view.error&&p.d.view.stop_verified&&p.q.odom.valid);
@@ -130,7 +132,7 @@ static void closed_queue(float angle){
   assert(p.q.odom.travel>.85f&&p.q.odom.travel<1.1f);
   assert(angle>0.f?p.q.odom.y>.3f:p.q.odom.y<-.3f);
   assert(p.q.odom.yaw_total*angle>0.f && p.now-p.q.started_ms>500u);
-  printf("PASS integration real Drive+MQ MOVE .5 / TURN %s90 / MOVE .5, offline %u ms, %u sources, max gap %u ms\n",angle>0.f?"+":"-",(unsigned)(p.now-p.q.started_ms),(unsigned)p.samples,(unsigned)p.max_gap);
+  printf("PASS integration real Drive+MQ MOVE .5 / TURN %s90 / MOVE .5, renewed %u ms, %u sources, max gap %u ms\n",angle>0.f?"+":"-",(unsigned)(p.now-p.q.started_ms),(unsigned)p.samples,(unsigned)p.max_gap);
   printf("PASS integration CAN MOVE cruise %d RPM, near-end MOVE and TURN 1 RPM\n",p.max_move_rpm);
 }
 static void cancellation(void){

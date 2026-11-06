@@ -23,13 +23,11 @@ static void check_target(MQSegment segment,int16_t left,int16_t right){
   Peer p={.view={.state=MQ_DRIVE_STOPPED,.stop_verified=true,.guard_valid=true}};
   MQ q;mq_init(&q,1,&ops,&p);
   MQSample sample={.sequence=1,.valid=true};mq_sample(&q,&sample);
-  assert(mq_begin(&q,1,q.odom.epoch,1,mq_segments_crc(&segment,1),100)==MQ_OK);
+  assert(mq_begin(&q,1,q.odom.epoch,1,mq_segments_crc(&segment,1),MQ_LEASE_MS)==MQ_OK);
   assert(mq_append(&q,1,0,segment)==MQ_OK&&mq_commit(&q,1)==MQ_OK);
   assert(mq_start(&q,1,0)==MQ_OK);
   mq_tick(&q,1);mq_tick(&q,2);
-  assert(p.targets==1&&p.left==left&&p.right==right&&!q.arrival_reached);
-  mq_tick(&q,100);
-  assert(q.first_error==MQ_ERR_DEADLINE&&p.stops==1);
+  assert(p.targets==1&&p.left==left&&p.right==right&&!q.arrival_reached&&!p.stops);
 }
 
 int main(void){

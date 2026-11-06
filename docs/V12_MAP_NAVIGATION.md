@@ -1,21 +1,22 @@
-# V11 保存地图导航
+# V12 保存地图导航
 
 PC 网页使用 `http://127.0.0.1:8766/`。RK 独占 V11 串口，PC 通过已核对主机密钥的 SSH 隧道访问 RK 的本机 API。每次规划都在保存的 PGM/YAML 地图上进行，网页同时显示路线、车头和里程计估计轨迹。
 
 1. 小车停稳后，在地图上标出当前位置及车头方向，点击「单次 AMCL 定位」。RK 使用本轮激光对应时刻的 MCU odom 对齐地图，随后结束临时 AMCL 会话。
 2. AMCL 识别失败时，在同一张地图上标出当前位置和方向，点击「置 0」。界面显示「人工对齐」和新的局部零点。地图位置由这个标记和后续 MCU 累计里程计推算。
 3. 在地图上选目标并预览。RK 在静态 costmap 上规划，按 TURN 和正向 MOVE 检查整段扫掠。成功定位后可连续预览多个目标。
-4. 默认 `ready` 模式将新队列上传至 READY。`drive` 模式的开始操作在核对新任务 READY 后发送 START。停车操作分别显示 STOP 应答和新轮速给出的停稳证明。RS485 会话失效后网页显示状态未知，MCU 仍可执行已经启动的队列。
+4. 默认 `ready` 模式将新队列上传至 READY。`drive` 模式在核对新任务 READY 后发送 START。任务开始后 STM32 发放 30 秒租约，RK 收到新鲜反馈并看到剩余约 5 秒时自动续约。任务状态显示剩余授权时间。失联后 STM32 在最近一次租约到期时执行停车。
+5. 停车操作分别显示 STOP 应答和新轮速给出的停稳证明。路线预计耗时供参考，持续续约的任务可以超过原先的 20 分钟，总队列最多 128 段。
 
 ## 构建与运行
 
 PC 从仓库根目录构建，PGM 和 YAML 使用同一份已保存地图，哈希分别来自地图原件。生成的归档包括 RK 所需源码、地图与文件清单。
 
 ```text
-python -B scripts/build_v11_map_package.py --name v11-map-r5 --map-pgm FINAL_PGM --map-yaml FINAL_YAML --map-sha256 PGM_SHA256 --yaml-sha256 YAML_SHA256
+python -B scripts/build_v11_map_package.py --name v12-map-r5 --map-pgm FINAL_PGM --map-yaml FINAL_YAML --map-sha256 PGM_SHA256 --yaml-sha256 YAML_SHA256
 ```
 
-将 `dist/v11-map-r5/v11-map-rk.tar.gz` 解包到一个新的 RK 目录并核对清单。启动前核对当前串口身份与归属、底盘新鲜反馈和实际停车状态。使用 RK 已有的 ROS Noetic 环境和 Python 3.8。
+将 `dist/v12-map-r5/v12-map-rk.tar.gz` 解包到一个新的 RK 目录并核对清单，与 V12 STM32 固件配套使用。启动前核对当前串口身份与归属、底盘新鲜反馈和实际停车状态。使用 RK 已有的 ROS Noetic 环境和 Python 3.8。
 
 ```sh
 source /opt/ros/noetic/setup.bash

@@ -35,8 +35,8 @@ static void ack(Fixture *f,uint32_t tick){
   f->motor.v.applied_left=f->motor.requested_left;f->motor.v.applied_right=f->motor.requested_right;
   f->motor.v.applied_tick_ms=tick;
 }
-static MQResult load(Fixture *f,uint64_t task,const MQSegment *s,uint16_t count,uint32_t duration){
-  MQResult r=mq_begin(&f->q,task,f->q.odom.epoch,count,mq_segments_crc(s,count),duration);
+static MQResult load(Fixture *f,uint64_t task,const MQSegment *s,uint16_t count){
+  MQResult r=mq_begin(&f->q,task,f->q.odom.epoch,count,mq_segments_crc(s,count),MQ_LEASE_MS);
   if(r!=MQ_OK)return r;
   for(uint16_t i=0;i<count;i++){r=mq_append(&f->q,task,i,s[i]);if(r!=MQ_OK)return r;}
   return mq_commit(&f->q,task);
@@ -50,6 +50,11 @@ static void step(Fixture *f,int16_t l,int16_t r){
   sample(f,f->now+50u,l,r);mq_tick(&f->q,f->now);
   if(f->q.target_pending){ack(f,f->now);mq_tick(&f->q,f->now);}
 }
+static void step_renewing(Fixture *f,int16_t l,int16_t r){
+  step(f,l,r);
+  if(mq_lease_remaining_ms(&f->q,f->now)==5000u)
+    assert(mq_renew(&f->q,f->q.task_id,f->now)==MQ_OK);
+}
 static void finish_stop(Fixture *f){
   f->motor.v.state=MQ_DRIVE_STOPPED;f->motor.v.stop_verified=true;
   f->motor.v.applied_left=f->motor.v.applied_right=0;mq_tick(&f->q,f->now);
@@ -58,30 +63,57 @@ static void expect(const char *name){printf("REVIEW PASS %s\n",name);}
 
 static void offline_and_tick_wrap(void){
   Fixture f;setup(&f,UINT32_MAX-1000u);MQSegment s={MQ_KIND_MOVE,.50f};
-  assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
   for(unsigned i=0;i<30;i++)step(&f,20,-20);
   assert(f.now<1000u && f.q.state==MQ_MOVE && f.motor.arms==1 && !f.motor.stops);
   assert(f.q.odom.valid && f.q.odom.travel>.02f && !f.q.first_error);
   /* No host API or heartbeat was called for 1500 ms, across the uint32 wrap. */
-  expect("offline execution exceeds host lease and crosses tick wrap");
+  expect("execution inside the initial lease crosses tick wrap");
 }
 static void deadline_and_late_ack(void){
   Fixture f;setup(&f,100u);MQSegment s={MQ_KIND_MOVE,10.f};
-  assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);
   for(unsigned i=0;i<5;i++){sample(&f,f.now+50u,0,0);mq_tick(&f.q,f.now);}
   sample(&f,f.now+50u,0,0);ack(&f,f.now);mq_tick(&f.q,f.now);
   assert(f.q.first_error==MQ_ERR_APPLY && f.q.state==MQ_STOPPING && !f.q.arrival_reached);
-  setup(&f,UINT32_MAX-1000u);assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);
+  setup(&f,UINT32_MAX-1000u);assert(load(&f,1,&s,1)==MQ_OK);start(&f);
   ack(&f,f.now);mq_tick(&f.q,f.now);
   /* Keep the measurement fresh without pretending to integrate the elapsed gap. */
-  f.q.odom.measurement_tick_ms=f.q.started_ms+1200000u;
+  f.q.odom.measurement_tick_ms=f.q.started_ms+MQ_LEASE_MS;
   mq_tick(&f.q,f.q.odom.measurement_tick_ms);
   assert(f.q.first_error==MQ_ERR_DEADLINE && f.motor.stops==1);
-  expect("late 300ms evidence and whole-task deadline remain hard bounds");
+  setup(&f,100u);assert(load(&f,1,&s,1)==MQ_OK);
+  assert(mq_start(&f.q,1,f.now)==MQ_OK);
+  f.now=3099u;f.q.odom.measurement_tick_ms=f.now;
+  assert(mq_renew(&f.q,1,f.now)==MQ_OK);
+  mq_tick(&f.q,3100u);
+  assert(f.q.first_error==MQ_ERR_DRIVE && f.motor.stops==1);
+  expect("late 300ms evidence, lease expiry and arming deadline remain hard bounds");
+}
+static void lease_renewal_and_expiration(void){
+  Fixture f;setup(&f,UINT32_MAX-1000u);MQSegment s={MQ_KIND_MOVE,10.f};
+  uint32_t crc=mq_segments_crc(&s,1);
+  assert(mq_begin(&f.q,1,1,1,crc,1200000u)==MQ_INVALID);
+  assert(load(&f,1,&s,1)==MQ_OK);
+  assert(mq_renew(&f.q,1,f.now)==MQ_ORDER && mq_lease_remaining_ms(&f.q,f.now)==0);
+  start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
+  assert(mq_lease_remaining_ms(&f.q,f.now)==MQ_LEASE_MS);
+  assert(mq_renew(&f.q,2,f.now)==MQ_IDENTITY);
+  for(unsigned i=0;i<25000;i++)step_renewing(&f,0,0);
+  assert(f.now-f.q.started_ms==1250000u && f.q.state==MQ_MOVE && f.motor.arms==1 && !f.motor.stops);
+  for(unsigned i=0;i<599;i++)step(&f,0,0);
+  assert(mq_lease_remaining_ms(&f.q,f.now)==50u);
+  sample(&f,f.now+50u,0,0);
+  assert(mq_renew(&f.q,1,f.now)==MQ_EXPIRED);
+  assert(f.q.first_error==MQ_ERR_DEADLINE && f.q.state==MQ_STOPPING && f.motor.stops==1);
+  assert(mq_renew(&f.q,1,f.now)==MQ_ORDER && mq_lease_remaining_ms(&f.q,f.now)==0);
+  finish_stop(&f);
+  assert(f.q.state==MQ_FAILED && mq_renew(&f.q,1,f.now)==MQ_ORDER && f.motor.arms==1);
+  expect("renewals carry one task past 20 minutes across tick wrap; late renewal cannot revive it");
 }
 static void malformed_or_partial_queue(void){
   Fixture f;setup(&f,100u);MQSegment s[2]={{MQ_KIND_MOVE,.20f},{MQ_KIND_TURN,1.f}};
-  assert(mq_begin(&f.q,1,f.q.odom.epoch,2,mq_segments_crc(s,2),1200000u)==MQ_OK);
+  assert(mq_begin(&f.q,1,f.q.odom.epoch,2,mq_segments_crc(s,2),MQ_LEASE_MS)==MQ_OK);
   assert(mq_append(&f.q,1,0,s[0])==MQ_OK && mq_commit(&f.q,1)==MQ_ORDER);
   assert(mq_start(&f.q,1,100u)!=MQ_OK && !f.motor.arms);
   assert(mq_append(&f.q,1,1,s[1])==MQ_OK);
@@ -91,15 +123,15 @@ static void malformed_or_partial_queue(void){
 }
 static void idempotence_and_old_task(void){
   Fixture f;setup(&f,100u);MQSegment s={MQ_KIND_MOVE,.101f};
-  assert(load(&f,10,&s,1,1200000u)==MQ_OK);start(&f);
+  assert(load(&f,10,&s,1)==MQ_OK);start(&f);
   assert(mq_start(&f.q,10,f.now)==MQ_OK && f.motor.arms==1);
   for(unsigned i=0;i<4 && f.q.state!=MQ_STOPPING;i++)step(&f,10,-10);
   assert(f.q.arrival_reached);finish_stop(&f);
   assert(mq_start(&f.q,10,f.now)==MQ_OK && f.motor.arms==1);
-  sample(&f,f.now+50u,0,0);assert(load(&f,11,&s,1,1200000u)==MQ_OK);
-  assert(mq_begin(&f.q,10,f.q.odom.epoch,1,mq_segments_crc(&s,1),1200000u)!=MQ_OK);
+  sample(&f,f.now+50u,0,0);assert(load(&f,11,&s,1)==MQ_OK);
+  assert(mq_begin(&f.q,10,f.q.odom.epoch,1,mq_segments_crc(&s,1),MQ_LEASE_MS)!=MQ_OK);
   assert(mq_reset_odom(&f.q,f.now)==MQ_OK);
-  assert(mq_begin(&f.q,10,f.q.odom.epoch,1,mq_segments_crc(&s,1),1200000u)!=MQ_OK);
+  assert(mq_begin(&f.q,10,f.q.odom.epoch,1,mq_segments_crc(&s,1),MQ_LEASE_MS)!=MQ_OK);
   assert(!f.q.committed && f.motor.arms==1);
   expect("same START idempotence and old task rejection survive new task and reset");
 }
@@ -107,7 +139,7 @@ static void duplicate_and_missing_samples(void){
   Fixture f;setup(&f,100u);MQSample duplicate={0};duplicate.sequence=f.seq;
   duplicate.tick_ms=500u;duplicate.left_tenths_rpm=100;duplicate.right_tenths_rpm=-100;duplicate.valid=true;
   mq_sample(&f.q,&duplicate);assert(f.q.odom.measurement_tick_ms==100u && f.q.odom.travel==0.f);
-  MQSegment s={MQ_KIND_MOVE,1.f};assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);
+  MQSegment s={MQ_KIND_MOVE,1.f};assert(load(&f,1,&s,1)==MQ_OK);start(&f);
   sample(&f,150u,10,-10);ack(&f,f.now);mq_tick(&f.q,f.now);
   float travel=f.q.odom.travel;f.seq++;sample(&f,200u,10,-10);
   assert(!f.q.odom.valid && f.q.odom.travel==travel && f.q.first_error==MQ_ERR_ODOM);
@@ -118,8 +150,8 @@ static void duplicate_and_missing_samples(void){
 }
 static void move_yaw_is_observation_only(void){
   Fixture f;setup(&f,100u);MQSegment s={MQ_KIND_MOVE,.5f};
-  assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
-  for(unsigned i=0;i<1200 && f.q.state!=MQ_STOPPING;i++)step(&f,20,-10);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
+  for(unsigned i=0;i<1200 && f.q.state!=MQ_STOPPING;i++)step_renewing(&f,20,-10);
   assert(f.q.arrival_reached && !f.q.first_error);
   assert(fabsf(f.q.yaw_deviation)>8.f*MQ_PI/180.f && fabsf(f.q.lateral_deviation)>.02f);
   assert(f.motor.requested_left==-f.motor.requested_right && f.motor.requested_left>0);
@@ -127,15 +159,15 @@ static void move_yaw_is_observation_only(void){
 }
 static void negative_turn_wrap(void){
   Fixture f;setup(&f,100u);MQSegment s={MQ_KIND_TURN,-1.5f*MQ_PI};
-  assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
-  for(unsigned i=0;i<1500 && f.q.state!=MQ_STOPPING;i++)step(&f,10,10);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
+  for(unsigned i=0;i<1500 && f.q.state!=MQ_STOPPING;i++)step_renewing(&f,10,10);
   assert(f.q.arrival_reached && !f.q.first_error && f.q.odom.yaw_total < -MQ_PI);
   assert(f.q.odom.yaw>0.f && f.q.progress>MQ_PI && f.motor.requested_left==f.motor.requested_right);
   expect("negative TURN uses unwrapped angle across pi boundary");
 }
 static void direct_stop_and_parking_sample(void){
   Fixture f;setup(&f,100u);MQSegment s={MQ_KIND_MOVE,.101f};
-  assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);
   /* Deliberately do not acknowledge the first nonzero target. */
   for(unsigned i=0;i<4 && f.q.state!=MQ_STOPPING;i++){
     sample(&f,f.now+50u,10,-10);mq_tick(&f.q,f.now);
@@ -148,7 +180,7 @@ static void direct_stop_and_parking_sample(void){
 }
 static void parking_fault_cannot_upgrade(void){
   Fixture f;setup(&f,100u);MQSegment s={MQ_KIND_MOVE,.101f};
-  assert(load(&f,1,&s,1,1200000u)==MQ_OK);start(&f);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);
   for(unsigned i=0;i<4 && f.q.state!=MQ_STOPPING;i++)step(&f,10,-10);
   assert(f.q.arrival_reached);
   f.motor.v.state=MQ_DRIVE_FAILED;f.motor.v.error=81u;f.motor.v.stop_verified=true;mq_tick(&f.q,f.now);
@@ -158,7 +190,7 @@ static void parking_fault_cannot_upgrade(void){
 }
 static void handoff_requires_new_zero_application(void){
   Fixture f;setup(&f,100u);MQSegment s[2]={{MQ_KIND_MOVE,.021f},{MQ_KIND_TURN,1.f}};
-  assert(load(&f,1,s,2,1200000u)==MQ_OK);start(&f);
+  assert(load(&f,1,s,2)==MQ_OK);start(&f);
   for(unsigned i=0;i<4 && f.q.state!=MQ_BARRIER;i++){
     sample(&f,f.now+50u,10,-10);mq_tick(&f.q,f.now);
   }
@@ -191,10 +223,10 @@ static void unavailable_can_fifo_is_bounded(void){
   expect("permanently unavailable CAN FIFO cannot leave STOP pending forever");
 }
 int main(void){
-  offline_and_tick_wrap();deadline_and_late_ack();malformed_or_partial_queue();
+  offline_and_tick_wrap();deadline_and_late_ack();lease_renewal_and_expiration();malformed_or_partial_queue();
   idempotence_and_old_task();duplicate_and_missing_samples();move_yaw_is_observation_only();
   negative_turn_wrap();direct_stop_and_parking_sample();parking_fault_cannot_upgrade();
   handoff_requires_new_zero_application();
   unavailable_can_fifo_is_bounded();
-  puts("REVIEW COMPLETE 11 production-core/driver scenarios");return 0;
+  puts("REVIEW COMPLETE 12 production-core/driver scenarios");return 0;
 }

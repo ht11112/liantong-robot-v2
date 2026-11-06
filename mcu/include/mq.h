@@ -7,7 +7,7 @@
 #endif
 
 #define MQ_CAPACITY 128u
-#define MQ_MAX_DURATION_MS 1200000u
+#define MQ_LEASE_MS 30000u
 #define MQ_PI 3.14159265358979323846f
 #define MQ_DIAMETER_M .20f
 #define MQ_SEPARATION_M .30f
@@ -55,7 +55,7 @@ typedef struct {
   MQDriveOps drive;
   void *drive_user;
   uint64_t boot_id,task_id;
-  uint32_t expected_crc,duration_ms,started_ms,first_error_tick_ms;
+  uint32_t expected_crc,lease_started_ms,started_ms,first_error_tick_ms;
   uint32_t first_error,first_drive_error,epoch_at_upload;
   uint32_t target_generation,target_requested_ms,last_target_ms;
   uint32_t barrier_started_ms,barrier_sample,zero_count;
@@ -73,10 +73,12 @@ void mq_sample(MQ *q,const MQSample *sample);
 void mq_tick(MQ *q,uint32_t now);
 void mq_fault(MQ *q,uint32_t error,uint32_t now);
 MQResult mq_begin(MQ *q,uint64_t task,uint32_t epoch,uint16_t count,
-                  uint32_t crc,uint32_t duration_ms);
+                  uint32_t crc,uint32_t lease_ms);
 MQResult mq_append(MQ *q,uint64_t task,uint16_t index,MQSegment segment);
 MQResult mq_commit(MQ *q,uint64_t task);
 MQResult mq_start(MQ *q,uint64_t task,uint32_t now);
+MQResult mq_renew(MQ *q,uint64_t task,uint32_t now);
+uint32_t mq_lease_remaining_ms(const MQ *q,uint32_t now);
 void mq_stop(MQ *q,uint32_t now);
 MQResult mq_reset_odom(MQ *q,uint32_t now);
 uint32_t mq_segments_crc(const MQSegment *segments,uint16_t count);

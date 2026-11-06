@@ -54,7 +54,7 @@ static void ack(const Fake*f,uint32_t request,MQResult result,uint32_t watermark
   const uint8_t*b=f->tx;
   assert(b[0]==0xa5&&b[1]==0x5a&&b[2]==WIRE_VERSION&&b[3]==WIRE_TELEMETRY);
   assert(r16(b+4)==102&&r32(b+42)==request&&b[46]==result&&(r16(b+48)&WIRE_ACK_VALID));
-  assert(r32(b+100)==0&&r32(b+104)==watermark&&r16(b+108)==wire_crc16(b+2,106));
+  assert(r32(b+100)<=MQ_LEASE_MS&&r32(b+104)==watermark&&r16(b+108)==wire_crc16(b+2,106));
 }
 static void discovery_and_legacy(void){
   MQ q;Wire w;Fake f;uint8_t b[64],old[64];init(&q,&w,&f);
@@ -71,31 +71,61 @@ static void discovery_and_legacy(void){
   assert(r32(f.tx+26)==1&&r32(f.tx+30)==0&&!(r16(f.tx+48)&WIRE_ODOM_VALID));
   n=command(b,WIRE_STOP,q.boot_id,1,1,0);b[2]=10;send(&w,b,n,310);
   assert(f.tx_count==2&&!f.stops&&!w.has_request);
+  b[2]=11;send(&w,b,n,315);
+  assert(f.tx_count==2&&!f.stops&&!w.has_request);
   b[2]=WIRE_VERSION;seal(b,n);
   memset(old,0,sizeof(old));old[0]=0xa5;old[1]=0x5a;old[2]=10;old[3]=WIRE_APPEND;
   p16(old+4,sizeof(old)-8);memcpy(old+8,b,n);send(&w,old,sizeof(old),320);
+  assert(f.tx_count==2&&!f.stops&&!w.has_request);
+  old[2]=11;send(&w,old,sizeof(old),330);
   assert(f.tx_count==2&&!f.stops&&!w.has_request);
   puts("PASS no unsolicited frames, exact discovery reply, reply-time snapshot and full legacy-frame rejection");
 }
 static void upload_and_replay(void){
   MQ q;Wire w;Fake f;uint8_t b[64];unsigned n;MQSegment s={1,.5f};init(&q,&w,&f);
-  n=command(b,WIRE_BEGIN,q.boot_id,1,1,1);p16(b+34,1);p32(b+36,mq_segments_crc(&s,1));p32(b+40,1200000);
+  n=command(b,WIRE_BEGIN,q.boot_id,1,1,1);p16(b+34,1);p32(b+36,mq_segments_crc(&s,1));p32(b+40,MQ_LEASE_MS);
   send(&w,b,n,20);ack(&f,1,MQ_OK,1);assert(q.state==MQ_LOADING);
   n=command(b,WIRE_APPEND,q.boot_id,1,2,1);p16(b+34,0);p32(b+36,1);pf(b+40,.5f);
   send(&w,b,n,40);ack(&f,2,MQ_OK,2);assert(q.received==1);
   n=command(b,WIRE_COMMIT,q.boot_id,1,3,1);send(&w,b,n,60);
   ack(&f,3,MQ_OK,3);assert(q.committed&&q.state==MQ_READY);
   n=command(b,WIRE_START,q.boot_id,1,4,1);send(&w,b,n,80);
-  ack(&f,4,MQ_OK,4);assert(f.arms==1&&q.has_started);
+  ack(&f,4,MQ_OK,4);assert(f.arms==1&&q.has_started&&r32(f.tx+100)==MQ_LEASE_MS-2u);
   send(&w,b,n,100);ack(&f,4,MQ_OK,4);assert(f.arms==1&&r32(f.tx+18)==5);
   b[3]=WIRE_RESET;send(&w,b,n,120);ack(&f,4,MQ_IDENTITY,4);assert(q.odom.epoch==1);
   n=command(b,WIRE_STOP,q.boot_id,999,5,0);send(&w,b,n,140);
-  ack(&f,5,MQ_OK,5);assert(f.stops==1);
+  ack(&f,5,MQ_OK,5);assert(f.stops==1&&r32(f.tx+100)==0);
   send(&w,b,n,160);ack(&f,5,MQ_OK,5);assert(f.stops==1);
   n=command(b,WIRE_QUERY,q.boot_id,1,1,0);send(&w,b,n,180);ack(&f,1,MQ_ORDER,5);
   n=command(b,WIRE_QUERY,0,0,0,0);send(&w,b,n,200);ack(&f,0,MQ_OK,5);
   assert(f.tx_count==10);
   puts("PASS BEGIN APPEND COMMIT START, byte-exact replay, unchanged STOP epoch bypass and discovery watermark");
+}
+static void renewal_and_replay(void){
+  MQ q;Wire w;Fake f;uint8_t b[64];MQSegment s={MQ_KIND_MOVE,1.f};init(&q,&w,&f);
+  assert(mq_begin(&q,1,1,1,mq_segments_crc(&s,1),MQ_LEASE_MS)==MQ_OK);
+  assert(mq_append(&q,1,0,s)==MQ_OK&&mq_commit(&q,1)==MQ_OK);
+  unsigned n=command(b,WIRE_RENEW,q.boot_id,1,1,1);send(&w,b,n,10);
+  ack(&f,1,MQ_ORDER,1);assert(!f.arms&&r32(f.tx+100)==0);
+  assert(mq_start(&q,1,20)==MQ_OK);
+  n=command(b,WIRE_RENEW,q.boot_id+1,1,2,1);send(&w,b,n,30);
+  ack(&f,2,MQ_IDENTITY,1);
+  n=command(b,WIRE_RENEW,q.boot_id,2,2,1);send(&w,b,n,40);
+  ack(&f,2,MQ_IDENTITY,1);
+  n=command(b,WIRE_RENEW,q.boot_id,1,2,2);send(&w,b,n,50);
+  ack(&f,2,MQ_IDENTITY,2);assert(q.lease_started_ms==20);
+  n=command(b,WIRE_RENEW,q.boot_id,1,3,1);send(&w,b,n,60);
+  ack(&f,3,MQ_OK,3);assert(q.lease_started_ms==60&&r32(f.tx+100)==MQ_LEASE_MS-2u);
+  send(&w,b,n,80);ack(&f,3,MQ_OK,3);
+  assert(q.lease_started_ms==60&&r32(f.tx+100)==MQ_LEASE_MS-22u);
+  f.drive.guard_valid=false;
+  n=command(b,WIRE_RENEW,q.boot_id,1,4,1);send(&w,b,n,90);
+  ack(&f,4,MQ_UNHEALTHY,4);assert(q.lease_started_ms==60);
+  n=command(b,WIRE_STOP,q.boot_id,1,5,0);send(&w,b,n,100);
+  ack(&f,5,MQ_OK,5);assert(f.stops==1);
+  n=command(b,WIRE_RENEW,q.boot_id,1,6,1);send(&w,b,n,110);
+  ack(&f,6,MQ_ORDER,6);assert(q.lease_started_ms==60&&r32(f.tx+100)==0&&f.arms==1);
+  puts("PASS RENEW binds boot, epoch and task; replay does not extend lease; STOP ends renewal");
 }
 static void invalid_frames(void){
   MQ q;Wire w;Fake f;uint8_t b[64];init(&q,&w,&f);
@@ -151,7 +181,7 @@ static void critical_transport_stays_locked(void){
     wire_poll(&w,10);assert(q.first_error==MQ_ERR_UART&&f.stops==1&&!f.tx_count);
     mq_tick(&q,11);assert(q.state==MQ_FAILED&&q.physical_stop_confirmed);
     assert(q.odom.valid&&f.drive.guard_valid&&f.drive.stop_verified&&!f.drive.error);
-    unsigned n=command(b,WIRE_BEGIN,q.boot_id,1,1,1);p16(b+34,1);p32(b+36,mq_segments_crc(&s,1));p32(b+40,1200000);
+    unsigned n=command(b,WIRE_BEGIN,q.boot_id,1,1,1);p16(b+34,1);p32(b+36,mq_segments_crc(&s,1));p32(b+40,MQ_LEASE_MS);
     send(&w,b,n,20);ack(&f,1,MQ_UNHEALTHY,0);assert(q.task_id==0&&q.count==0);
     n=command(b,WIRE_START,q.boot_id,1,1,1);send(&w,b,n,30);ack(&f,1,MQ_UNHEALTHY,0);assert(!f.arms);
     n=command(b,WIRE_RESET,q.boot_id,1,1,0);send(&w,b,n,40);ack(&f,1,MQ_UNHEALTHY,0);assert(q.odom.epoch==1);
@@ -172,16 +202,16 @@ static void golden(void){
   q.state=MQ_TURN;q.index=1;q.count=2;q.progress=.25f;q.odom.x=1.25f;q.odom.y=-.5f;q.odom.yaw=-1.f;
   q.odom.v=.02f;q.odom.w=-.05f;q.odom.position_left=0xfffffffe;q.odom.position_right=1234;
   q.odom.left_tenths_rpm=7;q.odom.right_tenths_rpm=-9;q.first_error=3;q.first_drive_error=0x12345678;
-  q.first_error_tick_ms=9000;q.committed=q.has_started=true;
+  q.first_error_tick_ms=9000;q.committed=q.has_started=true;q.lease_started_ms=9500;
   wire_telemetry(&q,t,9,10000,5,MQ_ORDER,true,false,32);
   unsigned nq=command(query,WIRE_QUERY,0,0,0,0);seal(query,nq);
-  unsigned nb=command(b,WIRE_BEGIN,q.boot_id,7,33,q.task_id+1);p16(b+34,2);p32(b+36,mq_segments_crc(seg,2));p32(b+40,1200000);seal(b,nb);
+  unsigned nb=command(b,WIRE_BEGIN,q.boot_id,7,33,q.task_id+1);p16(b+34,2);p32(b+36,mq_segments_crc(seg,2));p32(b+40,MQ_LEASE_MS);seal(b,nb);
   unsigned na=command(a,WIRE_APPEND,q.boot_id,7,34,q.task_id+1);p16(a+34,1);p32(a+36,2);pf(a+40,-1.5f);seal(a,na);
   printf("GOLDEN{\"telemetry\":\"");hex(t,110);printf("\",\"query\":\"");hex(query,nq);printf("\",\"begin\":\"");hex(b,nb);
   printf("\",\"append\":\"");hex(a,na);printf("\",\"queue_crc32\":%u}\n",(unsigned)mq_segments_crc(seg,2));
 }
 int main(void){
   assert(wire_crc16((const uint8_t*)"123456789",9)==0x29b1);
-  discovery_and_legacy();upload_and_replay();invalid_frames();pending_stop_and_expiry();
+  discovery_and_legacy();upload_and_replay();renewal_and_replay();invalid_frames();pending_stop_and_expiry();
   changing_transmit_clock();critical_transport_stays_locked();golden();return 0;
 }

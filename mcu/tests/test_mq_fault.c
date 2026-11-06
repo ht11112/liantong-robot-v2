@@ -20,7 +20,7 @@ static void setup(Fixture *f){
   mq_init(&f->queue,UINT64_C(0x1234567890abcdef),&drive_ops,&f->motor);
   MQSample sample={.sequence=1,.tick_ms=100,.valid=true};mq_sample(&f->queue,&sample);
   MQSegment segment={MQ_KIND_MOVE,.5f};
-  assert(mq_begin(&f->queue,42,1,1,mq_segments_crc(&segment,1),10000)==MQ_OK);
+  assert(mq_begin(&f->queue,42,1,1,mq_segments_crc(&segment,1),MQ_LEASE_MS)==MQ_OK);
   assert(mq_append(&f->queue,42,0,segment)==MQ_OK);
   assert(mq_commit(&f->queue,42)==MQ_OK);
 }

@@ -17,8 +17,7 @@ def wire_preview(grid, goal, actions):
     # Construct exact wire bytes independently of A* to exercise the final
     # verifier against intentionally unsafe routes through this saved map.
     segments, crc = _queue(actions)
-    return dict(map_id=grid.map_id, goal=goal, segments=segments, queue_crc32=crc,
-                no_motion=False, duration_s=1200.)
+    return dict(map_id=grid.map_id, goal=goal, segments=segments, queue_crc32=crc, no_motion=False)
 
 
 class MapPlanTests(unittest.TestCase):
@@ -82,11 +81,11 @@ class MapPlanTests(unittest.TestCase):
     def test_rotated_map_transform_and_straight_no_blind_compensation(self):
         grid = self.make_map(origin=(10.,20.,math.pi/2.))
         start, goal = pose(8.,22.,math.pi/2.), pose(8.,22.5)
-        plan = grid.plan(start,goal,duration_s=60.)
+        plan = grid.plan(start,goal)
         self.assertFalse(plan['no_motion'])
         self.assertEqual(plan['segments'],[dict(kind='move',distance_m=.5)])
         self.assertAlmostEqual(plan['path'][-1]['y'],22.5)
-        self.assertEqual(plan['duration_s'],60.)
+        self.assertGreater(plan['nominal_duration_s'], 0.)
         self.assertAlmostEqual(plan['modeled_early_stop_position_error_m'],.1)
         self.assertFalse(plan['actual_endpoint_verified'])
         self.assertEqual(grid.validate_plan(start,plan)['path'],plan['path'])
@@ -183,12 +182,15 @@ class MapPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanningError,'exact map'):
             other.validate_plan(start,plan)
 
-    def test_duration_capacity_and_short_actions_rejected(self):
-        grid = self.make_map()
-        with self.assertRaisesRegex(PlanningError,'duration exceeds'):
-            grid.plan(pose(2.,2.),pose(2.5,2.),duration_s=10.)
-        with self.assertRaisesRegex(PlanningError,'1200'):
-            grid.plan(pose(2.,2.),pose(2.5,2.),duration_s=1200.1)
+    def test_long_route_is_not_limited_by_nominal_duration(self):
+        grid = self.make_map(width=320)
+        start, goal = pose(2., 2.), pose(30., 2.)
+        plan = grid.plan(start, goal)
+        self.assertGreater(plan['nominal_duration_s'], 1200.)
+        self.assertEqual(plan['segments'], [dict(kind='move', distance_m=28.)])
+        self.assertEqual(grid.validate_plan(start, plan)['path'], plan['path'])
+
+    def test_capacity_and_short_actions_rejected(self):
         with self.assertRaisesRegex(PlanningError,'128'):
             _queue([dict(kind='move',distance_m=.5)]*129)
         with self.assertRaisesRegex(PlanningError,'below its termination tolerance'):

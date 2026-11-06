@@ -1,4 +1,4 @@
-"""RK V11 map navigation. The serial loop owns every MCU request."""
+"""RK V12 map navigation. The serial loop owns every MCU request."""
 
 import argparse
 from collections import deque
@@ -13,14 +13,15 @@ import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
-from mcu_v11 import (EXECUTING, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, RkMaster,
-                     error_record, open_port)
+from mcu_v11 import (EXECUTING, LEASE_STATES, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, Rejected,
+                     RkMaster, error_record, open_port)
 from v11_map_plan import load_map
 
 
 PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
           'barrier', 'stopping', 'complete', 'failed')
 SOURCE_MAX_AGE_S = .250
+RENEW_BEFORE_S = 5.
 
 
 def angle(value):
@@ -64,6 +65,7 @@ class Navigation:
         self.plan = self.route = None
         self.work = None
         self.pending = None
+        self.lease_task = None
         self.stop_requested = False
         self.stop_revision = 0
         self.stop_ack = self.stop_verified = None
@@ -208,6 +210,7 @@ class Navigation:
             if not self.connected:
                 raise ValueError('串口状态未知，请在现场停车')
             self.plan = None
+            self.lease_task = None
             self.stop_requested = True
             self.stop_revision += 1
             self.stop_ack = self.stop_verified = None
@@ -239,7 +242,36 @@ class Navigation:
             if not same_pose(self._map_pose(), pose):
                 raise ValueError('上传期间起点已变化，请重新预览')
             self.work = 'starting'
-        self.observe(master.start(reply.status.task))
+        started = master.start(reply.status.task)
+        self.observe(started)
+        status = started.status
+        with self.lock:
+            if not self.stop_requested and status.state in LEASE_STATES and status.lease_remaining_ms:
+                self.lease_task = status.boot, status.epoch, status.task
+
+    def _lease_seconds(self, exchange):
+        # The MCU computes its remaining time after this send, so this is a lower bound.
+        return max(0., exchange.sent_at + exchange.status.lease_remaining_ms / 1000. - self.clock())
+
+    def _renew_if_due(self, master, reply):
+        status = reply.status
+        with self.lock:
+            if self.lease_task is None:
+                return
+            if (self.lease_task != (status.boot, status.epoch, status.task)
+                    or status.state not in LEASE_STATES or not status.lease_remaining_ms):
+                self.lease_task = None
+                return
+            if self.stop_requested or not self._fresh() or not 0 < self._lease_seconds(reply) <= RENEW_BEFORE_S:
+                return
+        try:
+            self.observe(master.renew(status.task))
+        except Rejected as exc:
+            # The MCU may complete or stop the task while RENEW is in flight.
+            self.observe(exc.exchange)
+            with self.lock:
+                self.lease_task = None
+                self.error = '任务续约未获底盘接受'
 
     def _stop(self, master):
         result = master.stop(on_reply=self.observe)
@@ -275,8 +307,9 @@ class Navigation:
                             reply = master.query()
                             if reply is not None:
                                 self.observe(reply)
+                                self._renew_if_due(master, reply)
                         if master.failed:
-                            raise LinkError(self.error or 'V11 会话已失效')
+                            raise LinkError(self.error or 'V12 会话已失效')
                     except (ValueError, LinkError) as exc:
                         if master.failed or not (stop or plan is not None):
                             raise
@@ -296,12 +329,13 @@ class Navigation:
             with self.lock:
                 self.error = str(exc)
                 task = self.latest.status.task if self.latest is not None else None
-            print(json.dumps(dict(event='v11_owner_closed', task=task, error=error_record(exc))),
+            print(json.dumps(dict(event='v12_owner_closed', task=task, error=error_record(exc))),
                   flush=True)
         finally:
             with self.lock:
                 self.connected = False
                 self.pending = None
+                self.lease_task = None
                 self.stop_requested = False
                 self._invalidate('串口已关闭，请重新连接并定位')
 
@@ -318,6 +352,8 @@ class Navigation:
                                else PHASES[status.state] if status_fresh else 'unknown'),
                         index=status.index if status else 0, count=status.count if status else 0,
                         progress=status.progress if status else 0,
+                        lease_remaining_s=self._lease_seconds(self.latest) if status_fresh
+                                          and status.lease_remaining_ms else None,
                         arrival=bool(status_fresh and status.flags & 8),
                         stop_ack=self.stop_ack,
                         stop_verified=(None if not status_fresh or
@@ -422,11 +458,11 @@ def main(argv=None):
         localizer = RosLocalizer(args.map_yaml, args.scan_topic)
     nav = Navigation(grid, localizer, mode=args.mode)
     closed = threading.Event()
-    owner = threading.Thread(target=nav.run, args=(args.port, closed), name='v11-owner')
+    owner = threading.Thread(target=nav.run, args=(args.port, closed), name='v12-owner')
     try:
         with ThreadingHTTPServer(('127.0.0.1', 8767), handler_for(nav)) as server:
             owner.start()
-            print('RK V11 map API: http://127.0.0.1:8767 ({})'.format(args.mode), flush=True)
+            print('RK V12 map API: http://127.0.0.1:8767 ({})'.format(args.mode), flush=True)
             server.serve_forever()
     except KeyboardInterrupt:
         pass

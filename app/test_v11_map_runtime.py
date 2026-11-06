@@ -8,7 +8,8 @@ from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from v11_map_runtime import Navigation, load_map
-from mcu_v11 import ACK_VALID, ODOM_INITIALIZED, ODOM_VALID, Exchange, LinkError, QueuePlan, Telemetry
+from mcu_v11 import (ACK_VALID, EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RENEW,
+                     Exchange, LinkError, QueuePlan, Telemetry)
 
 
 class Localization:
@@ -45,7 +46,7 @@ class NavigationTest(unittest.TestCase):
             index=0, count=0, progress=0., x=0., y=0., yaw=0., v=0., w=0.,
             position_left=0, position_right=0, left_tenths_rpm=0, right_tenths_rpm=0,
             first_error=0, first_drive_error=0, first_error_tick_ms=0,
-            reserved_100=0, reserved_102=0, accepted_request_watermark=0)
+            lease_remaining_ms=0, accepted_request_watermark=0)
         self.nav = Navigation(self.grid, clock=lambda: self.now)
         self.observe()
 
@@ -162,6 +163,7 @@ class NavigationTest(unittest.TestCase):
         opening.assert_called_once_with('/dev/ttyUSB2', .1)
         owner.assert_called_once_with(port)
         master.start.assert_not_called()
+        master.renew.assert_not_called()
         master.upload.assert_not_called()
         master.stop.assert_not_called()
         output.assert_not_called()
@@ -241,8 +243,9 @@ class NavigationTest(unittest.TestCase):
                     return [reply]
 
                 master.upload.side_effect = upload
-                master.start.return_value = Exchange(4, 4, self.now - .02, self.now,
-                                                     replace(self.sample, task=1, state=3), '', '')
+                active = replace(self.sample, task=1, state=3, flags=self.sample.flags | EXECUTING,
+                                 lease_remaining_ms=30000)
+                master.start.return_value = Exchange(4, 4, self.now - .02, self.now, active, '', '')
                 with patch.object(self.grid, 'validate_plan', wraps=self.grid.validate_plan) as validate:
                     if error:
                         with self.assertRaisesRegex(ValueError, error):
@@ -257,8 +260,44 @@ class NavigationTest(unittest.TestCase):
                         master.upload.assert_called_once()
                 if error:
                     master.start.assert_not_called()
+                    self.assertIsNone(self.nav.lease_task)
                 else:
                     master.start.assert_called_once_with(1)
+                    self.assertEqual(self.nav.lease_task, (42, 1, 1))
+
+    def test_renew_uses_fresh_owned_task_status_and_stops_on_cancel(self):
+        self.nav.mode = 'drive'
+        self.nav.lease_task = (42, 1, 7)
+        master = Mock()
+        active = self.sample.flags | EXECUTING
+        for index, remaining in enumerate((30000, 5010, 30000, 5010), start=2):
+            self.now += 25.
+            self.observe(task=7, state=4, flags=active, sample_sequence=index,
+                         lease_remaining_ms=remaining)
+            renewed = replace(self.sample, lease_remaining_ms=30000)
+            master.renew.return_value = Exchange(RENEW, index, self.now - .01, self.now, renewed, '', '')
+            self.nav._renew_if_due(master, self.nav.latest)
+            self.assertAlmostEqual(self.nav.snapshot()['task']['lease_remaining_s'],
+                                   29.98 if remaining == 30000 else 29.99)
+        self.assertEqual(master.renew.call_count, 2)
+        master.renew.assert_called_with(7)
+
+        self.nav.request_stop()
+        self.observe(task=7, state=4, flags=active, sample_sequence=6, lease_remaining_ms=4000)
+        self.nav._renew_if_due(master, self.nav.latest)
+        self.assertEqual(master.renew.call_count, 2)
+        self.assertIsNone(self.nav.lease_task)
+
+    def test_never_adopts_a_discovered_or_replaced_active_task(self):
+        active = self.sample.flags | EXECUTING
+        self.observe(task=7, state=4, flags=active, lease_remaining_ms=4000)
+        master = Mock()
+        self.nav._renew_if_due(master, self.nav.latest)
+        self.nav.lease_task = (42, 1, 7)
+        self.observe(task=8, state=4, flags=active, lease_remaining_ms=4000)
+        self.nav._renew_if_due(master, self.nav.latest)
+        self.assertIsNone(self.nav.lease_task)
+        master.renew.assert_not_called()
 
     def test_boot_change_invalidates_prepared_route(self):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')

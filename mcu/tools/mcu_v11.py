@@ -1,4 +1,4 @@
-"""RK master for the V11 request/reply link. Import does not access serial."""
+"""RK master for the V12 request/reply link. Import does not access serial."""
 
 import argparse
 from collections import Counter
@@ -15,21 +15,23 @@ import time
 from mcu_v10 import BAUD, canonical_segments, crc16
 
 
-VERSION = 11
-BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, TELEMETRY = 1, 2, 3, 4, 5, 6, 7, 128
+VERSION = 12
+BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, RENEW, TELEMETRY = 1, 2, 3, 4, 5, 6, 7, 8, 128
+LEASE_MS = 30000
 TELEMETRY_SIZE = 110
 PERIOD_S = .020
 MASK32 = 0xFFFFFFFF
 ODOM_INITIALIZED, ODOM_VALID, EXECUTING = 1, 2, 4
 STOP_CONFIRMED, RX_FAULT, COMMITTED, STARTED, ACK_VALID = 16, 32, 64, 128, 256
 READY = 2
+LEASE_STATES = range(3, 7)  # ARMING, MOVE, TURN, BARRIER
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
-HEADER = b'\xa5\x5a\x0b\x80\x66\x00'
-STATUS = struct.Struct('<QIIIIIQIBBHHHffffffIIhhHIIHHI')
+HEADER = bytes((0xa5, 0x5a, VERSION, TELEMETRY, TELEMETRY_SIZE - 8, 0))
+STATUS = struct.Struct('<QIIIIIQIBBHHHffffffIIhhHIIII')
 
 
 def command(kind, boot=0, epoch=0, request=0, task=0, extra=b''):
-    if not 1 <= kind <= 7 or len(extra) != (10 if kind in (BEGIN, APPEND) else 0):
+    if not BEGIN <= kind <= RENEW or len(extra) != (10 if kind in (BEGIN, APPEND) else 0):
         raise ValueError('Invalid command opcode or payload length')
     if request == 0:
         if kind != QUERY or boot or epoch or task:
@@ -68,8 +70,7 @@ class Telemetry:
     first_error: int
     first_drive_error: int
     first_error_tick_ms: int
-    reserved_100: int
-    reserved_102: int
+    lease_remaining_ms: int
     accepted_request_watermark: int
 
     @property
@@ -84,20 +85,21 @@ class Telemetry:
 
 def decode_telemetry(raw):
     if len(raw) != TELEMETRY_SIZE or raw[:6] != HEADER:
-        raise ValueError('Invalid V11 reply header')
+        raise ValueError('Invalid V12 reply header')
     if crc16(raw[2:108]) != struct.unpack_from('<H', raw, 108)[0]:
-        raise ValueError('Invalid V11 reply CRC')
+        raise ValueError('Invalid V12 reply CRC')
     return decode_status(raw)
 
 
 def decode_status(raw):
     value = Telemetry(*STATUS.unpack_from(raw, 6))
     if (not value.boot or not value.epoch or value.state > 9 or value.flags & ~511
-            or value.reserved_100 or value.reserved_102 or value.ack_result > 8
+            or value.ack_result > 8 or value.lease_remaining_ms > LEASE_MS
+            or value.lease_remaining_ms and (not value.flags & EXECUTING or value.state not in LEASE_STATES)
             or value.flags & ODOM_VALID and not value.source_valid
             or not all(math.isfinite(v) for v in (value.progress, value.x, value.y, value.yaw, value.v, value.w))
             or abs(value.yaw) > math.pi + .000001):
-        raise ValueError('Inconsistent V11 reply metadata')
+        raise ValueError('Inconsistent V12 reply metadata')
     return value
 
 
@@ -158,12 +160,13 @@ class Exchange:
 class QueuePlan:
     segments: tuple
     checksum: int
-    duration_ms: int
 
     @classmethod
     def from_document(cls, document):
-        segments, checksum, duration_ms = canonical_segments(document)
-        return cls(tuple(segments), checksum, duration_ms)
+        if 'duration_s' in document:
+            raise ValueError('Remove duration_s from V12 queues. Task time is governed by the renewable lease.')
+        segments, checksum, _ = canonical_segments(document)
+        return cls(tuple(segments), checksum)
 
 
 class LinkError(RuntimeError):
@@ -275,7 +278,7 @@ class RkMaster:
                 self._dropped_request = request
                 self.dropped_queries += 1
                 return None
-            raise ReplyTimeout('Timed out without a matching V11 reply', exchange, details=details)
+            raise ReplyTimeout('Timed out without a matching V12 reply', exchange, details=details)
         except Rejected:
             if discover:
                 self.failed = True
@@ -315,7 +318,7 @@ class RkMaster:
                     on_ack(reply)
 
             try:
-                metadata = struct.pack('<HII', len(plan.segments), plan.checksum, plan.duration_ms)
+                metadata = struct.pack('<HII', len(plan.segments), plan.checksum, LEASE_MS)
                 record(self._exchange(BEGIN, task=task, extra=metadata))
                 for index, segment in enumerate(plan.segments):
                     record(self._exchange(APPEND, task=task, extra=struct.pack('<H', index) + segment))
@@ -339,6 +342,19 @@ class RkMaster:
                     or value.flags & (STARTED | EXECUTING)):
                 raise ValueError('START requires the explicitly selected READY task on this MCU')
             return self._exchange(START, task=task)
+
+    def renew(self, task):
+        with self.lock:
+            value = self.latest.status if self.latest else None
+            if (type(task) is not int or not 0 < task <= UINT64_MAX or value is None
+                    or value.task != task or value.state not in LEASE_STATES or not value.flags & EXECUTING
+                    or not value.lease_remaining_ms):
+                raise ValueError('RENEW requires the exact active task with an unexpired lease')
+            reply = self._exchange(RENEW, task=task)
+            if reply.status.task != task:
+                self.failed = True
+                raise LinkError('RENEW ACK did not identify the current task', reply)
+            return reply
 
     def stop(self, *, proof_timeout=3., on_reply=None):
         if not math.isfinite(proof_timeout) or proof_timeout <= 0:

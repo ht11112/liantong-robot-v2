@@ -1,4 +1,4 @@
-"""Bounded, deterministic A* and V11 MOVE/TURN swept-volume checks.
+"""Deterministic A* and MOVE/TURN swept-volume checks.
 
 All poses are in the saved map frame, in metres and radians. This module has
 no ROS, serial or runtime side effects. The swept disk bounds the body and
@@ -18,7 +18,6 @@ MOVE_TOLERANCE_M = .02
 GOAL_TOLERANCE_M = .10
 TURN_TOLERANCE_RAD = math.pi / 60.
 MAX_SEGMENTS = 128
-MAX_DURATION_S = 1200.
 _WHEEL_M_PER_RPM_S = math.pi * .20 / 60.
 _TURN_RAD_S = 2. * _WHEEL_M_PER_RPM_S / .30
 _EPS = 1e-10
@@ -52,13 +51,6 @@ def _wrap(angle):
     return (angle + math.pi) % (2. * math.pi) - math.pi
 
 
-def _duration(value):
-    value = _number(value)
-    if not 0 < value <= MAX_DURATION_S or round(value * 1000) < 1:
-        raise PlanningError('Task duration must be within 1 ms and 1200 s')
-    return round(value * 1000) / 1000.
-
-
 def _float32(value):
     return struct.unpack('<f', struct.pack('<f', value))[0]
 
@@ -75,7 +67,7 @@ def _queue(segments):
     try:
         packed, crc, _ = canonical_segments({'segments': segments})
     except (ValueError, TypeError, OverflowError) as exc:
-        raise PlanningError('Invalid V11 queue: ' + str(exc)) from exc
+        raise PlanningError('Invalid action queue: ' + str(exc)) from exc
     canonical = []
     for index, raw in enumerate(packed):
         kind, value = struct.unpack('<If', raw)
@@ -274,7 +266,7 @@ class _Costmap:
                 if self.center_clear(x, y) and self.sweep(point, self.center((x, y))):
                     yield x, y
 
-    def astar(self, start, goal, max_distance):
+    def astar(self, start, goal):
         if self.sweep(start, goal):
             return [start, goal]
         targets = set(self.connectors(goal))
@@ -283,7 +275,7 @@ class _Costmap:
         open_nodes, cost, parent = [], {}, {}
         def add(node, distance, previous):
             estimate = distance + math.hypot(self.center(node)[0]-goal[0], self.center(node)[1]-goal[1])
-            if estimate <= max_distance and distance < cost.get(node, math.inf):
+            if distance < cost.get(node, math.inf):
                 cost[node], parent[node] = distance, previous
                 heapq.heappush(open_nodes, (estimate, distance, node))
         for node in self.connectors(start):
@@ -310,7 +302,7 @@ class _Costmap:
                     continue  # No diagonal corner cutting, independently of sweep.
                 if self.sweep(self.center(node), self.center(neighbor)):
                     add(neighbor, next_cost, node)
-        raise PlanningError('No path through known clear space within the task distance budget')
+        raise PlanningError('No path through known clear space')
 
     def simplify(self, chain):
         result, index = [chain[0]], 0
@@ -379,7 +371,7 @@ class GridMap:
             raise PlanningError('Goal footprint intersects occupied, unknown or outside space')
         return a, b
 
-    def _verify(self, costmap, pose, goal, segments, duration):
+    def _verify(self, costmap, pose, goal, segments):
         x, y, yaw = pose
         path, distance, estimated_time = [dict(x=x, y=y)], 0., 4.
         position_error, heading_error = 0., 0.
@@ -408,8 +400,6 @@ class GridMap:
         error = math.hypot(x-goal[0], y-goal[1])
         if error > GOAL_TOLERANCE_M+_EPS:
             raise PlanningError('Encoded actions do not end within the nominal map goal tolerance')
-        if estimated_time > duration:
-            raise PlanningError('Conservative nominal action duration exceeds the task limit')
         return dict(path=path, distance_m=distance, nominal_end_pose=dict(x=x, y=y, yaw=yaw),
                     nominal_goal_error_m=error, nominal_duration_s=estimated_time,
                     modeled_early_stop_position_error_m=position_error,
@@ -432,20 +422,18 @@ class GridMap:
             x, y = x+length*math.cos(yaw), y+length*math.sin(yaw)
         return _queue(segments)
 
-    def plan(self, pose, goal, *, duration_s=MAX_DURATION_S):
+    def plan(self, pose, goal):
         start, target = _point(pose, ('x', 'y', 'yaw')), _point(goal)
-        duration = _duration(duration_s)
         costmap = _Costmap(self)
         a, b = self._endpoints(costmap, start, target)
         result = dict(map_id=self.map_id, start=dict(zip(('x', 'y', 'yaw'), start)),
-                      goal=dict(zip(('x', 'y'), target)), duration_s=duration,
+                      goal=dict(zip(('x', 'y'), target)),
                       goal_tolerance_m=GOAL_TOLERANCE_M)
         if math.hypot(target[0]-start[0], target[1]-start[1]) <= GOAL_TOLERANCE_M+_EPS:
             return dict(result, no_motion=True, segments=[], queue_crc32=0,
-                        path=[dict(x=start[0], y=start[1])], distance_m=0.,
+                        path=[dict(x=start[0], y=start[1])], distance_m=0., nominal_duration_s=0.,
                         nominal_goal_error_m=math.hypot(target[0]-start[0], target[1]-start[1]),
                         actual_endpoint_verified=False)
-        maximum = duration * 2. * _WHEEL_M_PER_RPM_S / self.resolution
         last_error = None
         # Try wider candidate routes only during preview. Every candidate must
         # still pass the exact encoded sweep with its own early-stop envelope.
@@ -454,14 +442,14 @@ class GridMap:
             if not search.sweep(a, a) or not search.sweep(b, b):
                 break  # Larger search disks cannot reconnect these endpoints.
             try:
-                chain = search.simplify(search.astar(a, b, maximum))
+                chain = search.simplify(search.astar(a, b))
             except PlanningError as exc:
                 if last_error is None:
                     last_error = exc
                 break  # A wider disk cannot open a path.
             try:
                 segments, crc = self._compile(start, chain)
-                checked = self._verify(costmap, start, target, segments, duration)
+                checked = self._verify(costmap, start, target, segments)
             except PlanningError as exc:
                 last_error = exc
                 continue
@@ -479,4 +467,4 @@ class GridMap:
             raise PlanningError('Preview queue CRC does not match the exact action bytes')
         costmap = _Costmap(self)
         self._endpoints(costmap, start, target)
-        return self._verify(costmap, start, target, segments, _duration(plan.get('duration_s')))
+        return self._verify(costmap, start, target, segments)

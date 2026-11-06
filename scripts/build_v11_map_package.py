@@ -1,4 +1,4 @@
-"""Build an RK V11 navigation package from source and an external saved map."""
+"""Build an RK V12 navigation package from source and an external saved map."""
 
 import argparse
 import ast
@@ -32,7 +32,7 @@ def assemble(args):
     metadata = grid.metadata()
     if sha256(files[yaml]) != metadata['yaml_sha256']:
         raise ValueError('Map YAML changed during packaging')
-    manifest = dict(schema='v11-map-rk-package-1', entry_point='app/v11_map_runtime.py',
+    manifest = dict(schema='v12-map-rk-package-1', entry_point='app/v11_map_runtime.py',
                     map=metadata, map_pgm=pgm, map_yaml=yaml, default_mode='ready',
                     files={name: sha256(raw) for name, raw in sorted(files.items())})
     files['manifest.json'] = (json.dumps(manifest, indent=2) + '\n').encode('utf-8')
@@ -54,7 +54,7 @@ def main(argv=None):
     files, manifest = assemble(args)
     raw = archive_bytes(files)
     target.mkdir(parents=True, exist_ok=False)
-    archive = target / 'v11-map-rk.tar.gz'
+    archive = target / 'v12-map-rk.tar.gz'
     archive.write_bytes(raw)
     (target / 'manifest.json').write_bytes(files['manifest.json'])
     print(json.dumps(dict(archive=str(archive), sha256=sha256(raw),

@@ -94,7 +94,7 @@ static void start_fault_schedules(void){
   for(unsigned mode=0;mode<2;mode++){
     init(&s);
     s.q.task_id=1;s.q.committed=true;s.q.state=MQ_READY;s.q.epoch_at_upload=1;
-    s.q.duration_ms=1000;s.q.count=1;
+    s.q.count=1;
     command(&s,b,WIRE_START,1);s.clock=64;receive(&s,b,36);
     if(mode)s.error_at_view=true;else s.fault_at_enter=true;
     poll(&s,64);
@@ -104,14 +104,14 @@ static void start_fault_schedules(void){
   }
   init(&s);
   s.q.task_id=1;s.q.committed=true;s.q.state=MQ_READY;s.q.epoch_at_upload=1;
-  s.q.duration_ms=1000;s.q.count=1;command(&s,b,WIRE_START,1);
+  s.q.count=1;command(&s,b,WIRE_START,1);
   s.clock=64;receive(&s,b,36);poll(&s,64);assert(s.arms==1&&s.w.ack_result==MQ_OK);
   poll(&s,66);assert(s.tx_count==1&&s.tx[46]==MQ_OK);
   s.busy=false;s.clock=67;receive(&s,b,36);s.fault_on_enter=s.enters+2u;poll(&s,67);
   assert(s.arms==1&&s.w.ack_result==MQ_UNHEALTHY&&s.q.first_error==MQ_ERR_UART);
   init(&s);
   s.q.task_id=1;s.q.committed=true;s.q.state=MQ_READY;s.q.epoch_at_upload=1;
-  s.q.duration_ms=1000;s.q.count=1;command(&s,b,WIRE_START,1);
+  s.q.count=1;command(&s,b,WIRE_START,1);
   receive(&s,b,36);poll(&s,50);assert(s.w.ack_result==MQ_OK&&s.w.reply_pending);
   wire_transport_error(&s.w);poll(&s,52);
   assert(s.tx_count==1&&s.tx[46]==MQ_UNHEALTHY&&s.tx[90]==MQ_ERR_UART&&s.stops==1);
@@ -139,7 +139,7 @@ static void echo_and_stop_frames(void){
 static void long_operation_fault(void){
   Sim s;uint8_t b[46]={0};init(&s);
   command(&s,b,WIRE_BEGIN,1);p16(b+4,38);p64(b+26,1);
-  p16(b+34,1);p32(b+36,123);p32(b+40,1000);p16(b+44,wire_crc16(b+2,42));
+  p16(b+34,1);p32(b+36,123);p32(b+40,MQ_LEASE_MS);p16(b+44,wire_crc16(b+2,42));
   s.clock=64;receive(&s,b,46);s.error_at_view=s.expect_view_unmasked=true;poll(&s,64);
   assert(s.w.ack_result==MQ_UNHEALTHY&&s.q.first_error==MQ_ERR_UART);
   assert(s.q.state==MQ_STOPPING&&s.q.critical_latched&&!s.arms&&s.stops==1);

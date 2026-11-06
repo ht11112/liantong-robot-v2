@@ -19,7 +19,7 @@ static const MQDriveOps ops={arm,target,stop,view};
 static void init(MQ*q,Fake*f){memset(f,0,sizeof(*f));f->d.state=MQ_DRIVE_STOPPED;f->d.stop_verified=f->d.guard_valid=true;mq_init(q,0x12345678,&ops,f);}
 static void sample(MQ*q,uint32_t seq,uint32_t n,int16_t l,int16_t r){MQSample s={.sequence=seq,.tick_ms=n,.left_tenths_rpm=l,.right_tenths_rpm=r,.valid=true};mq_sample(q,&s);}
 static void load(MQ*q,MQSegment*s,uint16_t count,uint64_t task){
-  assert(mq_begin(q,task,q->odom.epoch,count,mq_segments_crc(s,count),1200000)==MQ_OK);
+  assert(mq_begin(q,task,q->odom.epoch,count,mq_segments_crc(s,count),MQ_LEASE_MS)==MQ_OK);
   for(uint16_t i=0;i<count;i++)assert(mq_append(q,task,i,s[i])==MQ_OK);
   assert(mq_commit(q,task)==MQ_OK);
 }
@@ -56,6 +56,7 @@ static void multi_segment(void){
     n+=10;
     if(n%50==0)sample(&q,++seq,n,(int16_t)(f.d.applied_left*10),(int16_t)(f.d.applied_right*10));
     mq_tick(&q,n);
+    if(mq_lease_remaining_ms(&q,n)==5000u)assert(mq_renew(&q,1,n)==MQ_OK);
   }
   assert(q.state==MQ_COMPLETE && q.arrival_reached && q.physical_stop_confirmed);
   assert(f.arms==1 && f.stops==1 && q.index==2);
@@ -68,7 +69,7 @@ static void crc_contract(void){
   /* Python zlib.crc32(struct.pack('<IfIf',1,.5,2,-1.5)) cross-language vector. */
   assert(mq_segments_crc(s,2)==0x615aabe9u);
   MQ q;Fake f;init(&q,&f);sample(&q,1,0,0,0);
-  assert(mq_begin(&q,1,1,2,0,1200000)==MQ_OK);
+  assert(mq_begin(&q,1,1,2,0,MQ_LEASE_MS)==MQ_OK);
   assert(mq_append(&q,1,1,s[1])==MQ_ORDER);
   assert(mq_append(&q,1,0,s[0])==MQ_OK);
   assert(mq_commit(&q,1)==MQ_ORDER);
@@ -82,12 +83,12 @@ static void uart_fault_stays_latched(void){
   mq_fault(&q,MQ_ERR_UART,0);mq_tick(&q,1);
   assert(q.physical_stop_confirmed && q.state==MQ_FAILED);
   MQSegment s={1,.5f};
-  assert(mq_begin(&q,1,1,1,mq_segments_crc(&s,1),1200000)==MQ_UNHEALTHY);
+  assert(mq_begin(&q,1,1,1,mq_segments_crc(&s,1),MQ_LEASE_MS)==MQ_UNHEALTHY);
   assert(mq_reset_odom(&q,1)==MQ_UNHEALTHY);
   init(&q,&f);sample(&q,1,0,0,0);
   mq_fault(&q,MQ_ERR_CANCEL,0);mq_fault(&q,MQ_ERR_UART,0);mq_tick(&q,1);
   assert(q.first_error==MQ_ERR_CANCEL && q.critical_latched);
-  assert(mq_begin(&q,1,1,1,mq_segments_crc(&s,1),1200000)==MQ_UNHEALTHY);
+  assert(mq_begin(&q,1,1,1,mq_segments_crc(&s,1),MQ_LEASE_MS)==MQ_UNHEALTHY);
   assert(mq_reset_odom(&q,1)==MQ_UNHEALTHY);
   puts("PASS critical UART fault survives physical STOP, new task and reset");
 }
