@@ -115,6 +115,8 @@ MQResult mq_commit(MQ *q,uint64_t task) {
 }
 MQResult mq_start(MQ *q,uint64_t task,uint32_t now) {
   if(task!=q->task_id || q->epoch_at_upload!=q->odom.epoch)return MQ_IDENTITY;
+  /* Critical boot/UART faults also invalidate an old successful START ACK. */
+  if(q->critical_latched)return MQ_UNHEALTHY;
   if(q->has_started)return MQ_OK; /* A repeated START never runs a finished task again. */
   if(q->state!=MQ_READY || !q->committed)return MQ_ORDER;
   MQDriveView d=view(q);

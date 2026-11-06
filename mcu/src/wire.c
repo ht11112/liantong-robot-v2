@@ -18,6 +18,13 @@ static void finish(uint8_t *out,size_t n,uint8_t kind){
   out[0]=0xa5;out[1]=0x5a;out[2]=WIRE_VERSION;out[3]=kind;
   p16(out+4,(uint16_t)(n-8));p16(out+n-2,wire_crc16(out+2,n-4));
 }
+static bool sync_valid(const Wire *w){
+  return (!w->io.critical_enter&&!w->io.critical_exit&&!w->io.rx_pending)||
+    (w->io.critical_enter&&w->io.critical_exit&&w->io.rx_pending);
+}
+static uint32_t enter(Wire *w){return sync_valid(w)&&w->io.critical_enter?w->io.critical_enter(w->user):0;}
+static void leave(Wire *w,uint32_t saved){if(sync_valid(w)&&w->io.critical_exit)w->io.critical_exit(w->user,saved);}
+static bool pending(Wire *w){return sync_valid(w)&&w->io.rx_pending&&w->io.rx_pending(w->user);}
 size_t wire_telemetry(const MQ *q,uint8_t *o,uint32_t seq,uint32_t pub,
  uint32_t ack,uint8_t result,bool ack_valid,bool rx_fault,uint16_t open,uint16_t close,uint32_t watermark){
   uint16_t flags=0;
@@ -44,6 +51,7 @@ size_t wire_telemetry(const MQ *q,uint8_t *o,uint32_t seq,uint32_t pub,
 void wire_init(Wire *w,MQ *q,const WireOps *io,void *user,uint32_t now){
   memset(w,0,sizeof(*w));w->queue=q;w->io=*io;w->user=user;w->origin_ms=now;
   w->attempted_frame=UINT32_MAX;w->last_rx_ms=now-2u;
+  if(!sync_valid(w))w->transport_fault=true;
 }
 void wire_rx_byte(Wire *w,uint8_t byte,uint32_t now){
   uint16_t next=(uint16_t)(w->rx_write+1u);w->last_rx_ms=now;
@@ -51,6 +59,20 @@ void wire_rx_byte(Wire *w,uint8_t byte,uint32_t now){
   w->ring[w->rx_write&(WIRE_RING_SIZE-1u)]=byte;w->rx_write=next;
 }
 void wire_transport_error(Wire *w){w->transport_fault=true;}
+bool wire_service_fault(Wire *w,uint32_t now){
+  if(w->transport_fault&&!w->fault_reported){
+    w->fault_reported=true;mq_fault(w->queue,MQ_ERR_UART,now);
+  }
+  /* Preserve buffered/partial RX: a complete clean STOP after the fault must
+     still reach the unchanged CRC/identity/replay gates. A corrupt prefix can
+     still consume a later frame; collisions are not reliable delivery. */
+  return w->transport_fault;
+}
+static bool sync_fault(Wire *w,uint32_t now){
+  if(!sync_valid(w)){wire_transport_error(w);return wire_service_fault(w,now);}
+  uint32_t saved=enter(w);(void)pending(w);
+  bool fault=wire_service_fault(w,now);leave(w,saved);return fault;
+}
 static bool same_request(const Wire *w,const uint8_t *f,uint16_t n){
   /* Only the grant changes on a retry. CRC also changes and is excluded. */
   return n==w->previous_length && !memcmp(f+2,w->previous+2,20)
@@ -64,14 +86,19 @@ static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
   if(!req)return;
   w->ack_request=req;w->ack_valid=true;
   if(boot!=q->boot_id){w->ack_result=MQ_IDENTITY;return;}
+  sync_fault(w,now);
   /* Critical UART/overflow is boot-latched, independently of MQ task cleanup.
      Check before cached ACKs: even an old successful START is now unhealthy. */
   if(w->transport_fault && op!=WIRE_STOP && op!=WIRE_QUERY){
     w->ack_result=MQ_UNHEALTHY;return;
   }
   if(w->has_request && req==w->last_request){
+    uint32_t saved=enter(w);(void)pending(w);wire_service_fault(w,now);
     if(same_request(w,f,n))w->ack_result=w->previous[0];
     else w->ack_result=MQ_IDENTITY;
+    (void)pending(w);
+    if(wire_service_fault(w,now)&&op!=WIRE_STOP&&op!=WIRE_QUERY)w->ack_result=MQ_UNHEALTHY;
+    leave(w,saved);
     return;
   }
   if(w->has_request && (int32_t)(req-w->last_request)<=0){w->ack_result=MQ_ORDER;return;}
@@ -87,11 +114,22 @@ static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
     case WIRE_BEGIN:r=mq_begin(q,task,epoch,r16(f+34),r32(f+36),r32(f+40));break;
     case WIRE_APPEND:{MQSegment s;s.kind=r32(f+36);s.value=rf(f+40);r=mq_append(q,task,r16(f+34),s);break;}
     case WIRE_COMMIT:r=mq_commit(q,task);break;
-    case WIRE_START:r=mq_start(q,task,now);break;
+    case WIRE_START:{
+      if(!sync_valid(w)){wire_transport_error(w);wire_service_fault(w,now);r=MQ_UNHEALTHY;break;}
+      uint32_t saved=enter(w);
+      (void)pending(w);wire_service_fault(w,now);
+      r=w->transport_fault?MQ_UNHEALTHY:mq_start(q,task,now);
+      (void)pending(w);
+      if(wire_service_fault(w,now))r=MQ_UNHEALTHY;
+      leave(w,saved);break;
+    }
     case WIRE_STOP:mq_stop(q,now);r=MQ_OK;break;
     case WIRE_RESET:r=mq_reset_odom(q,now);break;
     default:r=MQ_OK;break;
   }
+  /* Long operations (queue CRC/reset) remain outside the IRQ mask. If an IRQ
+     reports a fault during them, publish it before an OK ACK can escape. */
+  if(sync_fault(w,now)&&op!=WIRE_STOP&&op!=WIRE_QUERY)r=MQ_UNHEALTHY;
   w->ack_result=(uint8_t)r;w->last_request=req;w->has_request=true;w->last_used_grant=grant;
   memcpy(w->previous,f,n);w->previous_length=n;w->previous[0]=(uint8_t)r;
 }
@@ -101,11 +139,14 @@ static void consume(Wire *w,uint8_t byte,uint32_t now){
   w->frame[w->used++]=byte;
   if(w->used==6u){
     uint16_t len=r16(w->frame+4);
-    if(w->frame[2]!=WIRE_VERSION||len<28u||len>WIRE_COMMAND_MAX-8u){w->used=0;return;}
+    bool telemetry=w->frame[3]==WIRE_TELEMETRY&&len==WIRE_TELEMETRY_SIZE-8u;
+    if(w->frame[2]!=WIRE_VERSION||(!telemetry&&(len<28u||len>WIRE_COMMAND_MAX-8u))){w->used=0;return;}
     w->wanted=(uint16_t)(len+8u);
   }
   if(w->used>=6u && w->used==w->wanted){
-    if(r16(w->frame+w->wanted-2u)==wire_crc16(w->frame+2,w->wanted-4u))dispatch(w,w->frame,w->wanted,now);
+    /* Consume an entire telemetry envelope, including any command-looking
+       payload. RX during TX is retained; a local echo is never a command. */
+    if(w->frame[3]!=WIRE_TELEMETRY&&r16(w->frame+w->wanted-2u)==wire_crc16(w->frame+2,w->wanted-4u))dispatch(w,w->frame,w->wanted,now);
     w->used=0;
   }
 }
@@ -114,9 +155,7 @@ void wire_poll(Wire *w,uint32_t now){
   uint32_t elapsed=now-w->origin_ms,frame=elapsed/WIRE_PERIOD_MS,phase=elapsed%WIRE_PERIOD_MS;
   /* Bound each poll even if an interrupt producer continually adds garbage. */
   unsigned budget=WIRE_RING_SIZE;
-  if(w->transport_fault && !w->fault_reported){
-    w->fault_reported=true;mq_fault(w->queue,MQ_ERR_UART,now);w->rx_read=w->rx_write;w->used=0;
-  }
+  wire_service_fault(w,now);
   while(budget-- && w->rx_read!=w->rx_write){
     uint8_t b=w->ring[w->rx_read&(WIRE_RING_SIZE-1u)];w->rx_read=(uint16_t)(w->rx_read+1u);consume(w,b,now);
   }
@@ -124,12 +163,20 @@ void wire_poll(Wire *w,uint32_t now){
   if(frame==w->attempted_frame)return;
   if(phase>1u){w->attempted_frame=frame;return;}
   if(w->used||w->rx_read!=w->rx_write||(uint32_t)(now-w->last_rx_ms)<2u||!w->io.tx_ready(w->user))return;
+  bool built_fault=w->transport_fault,built_reported=w->fault_reported;
   wire_telemetry(w->queue,w->tx,w->pub_sequence+1u,now,w->ack_request,w->ack_result,
       w->ack_valid,w->transport_fault,(uint16_t)(14u-phase),(uint16_t)(38u-phase),w->has_request?w->last_request:0);
-  if((w->io.now_ms && w->io.now_ms(w->user)!=now)||w->rx_read!=w->rx_write||
-      (uint32_t)(now-w->last_rx_ms)<2u)return;
+  if(!sync_valid(w)){wire_transport_error(w);wire_service_fault(w,now);return;}
+  uint32_t saved=enter(w);bool rx_pending=pending(w);wire_service_fault(w,now);
+  if((!built_fault&&w->transport_fault)||(!built_reported&&w->fault_reported)||rx_pending||
+      (w->io.now_ms&&w->io.now_ms(w->user)!=now)||w->used||w->rx_read!=w->rx_write||
+      (uint32_t)(now-w->last_rx_ms)<2u||!w->io.tx_ready(w->user)){
+    leave(w,saved);return;
+  }
   if(w->io.tx_start(w->user,w->tx,WIRE_TELEMETRY_SIZE,now)){
     w->pub_sequence++;w->pub_tick_ms=now;w->grant_frame_start=now-phase;
     w->has_published=true;w->attempted_frame=frame;
   }
+  wire_service_fault(w,now);
+  leave(w,saved);
 }

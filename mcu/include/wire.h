@@ -20,13 +20,20 @@ typedef struct {
   /* Nonblocking. Keep data until physical UART TC, then release RS485 DE. */
   bool (*tx_start)(void *user,const uint8_t *data,uint16_t length,uint32_t expected_tick_ms);
   uint32_t (*now_ms)(void *user);
+  /* All three are required together on an interrupt-driven target. Portable
+     single-threaded tests may leave all three NULL. Restore the saved mask. */
+  uint32_t (*critical_enter)(void *user);
+  void (*critical_exit)(void *user,uint32_t saved_mask);
+  /* Called only inside the critical section. Observe pending RX/error/BUSY;
+     latch a transport fault on hardware errors, without consuming a byte. */
+  bool (*rx_pending)(void *user);
 } WireOps;
 
 typedef struct {
   MQ *queue;
   WireOps io;
   void *user;
-  uint8_t tx[WIRE_TELEMETRY_SIZE],frame[WIRE_COMMAND_MAX];
+  uint8_t tx[WIRE_TELEMETRY_SIZE],frame[WIRE_TELEMETRY_SIZE];
   uint8_t previous[WIRE_COMMAND_MAX];
   volatile uint8_t ring[WIRE_RING_SIZE];
   volatile uint16_t rx_write,rx_read;
@@ -44,6 +51,8 @@ void wire_init(Wire *w,MQ *queue,const WireOps *io,void *user,uint32_t now);
 /* ISR-safe producer only: never dispatch MQ or transmit from the ISR. */
 void wire_rx_byte(Wire *w,uint8_t byte,uint32_t rx_tick_ms);
 void wire_transport_error(Wire *w);
+/* Main-context publication only; returns the current boot-latched fault. */
+bool wire_service_fault(Wire *w,uint32_t now);
 void wire_poll(Wire *w,uint32_t now);
 /* Portable codec also used by native/WASM tests; no packed C structs. */
 size_t wire_telemetry(const MQ *q,uint8_t *out,uint32_t pub_sequence,

@@ -15,7 +15,7 @@ static bool ready(void*p){return !((Fake*)p)->busy;}
 static bool tx(void*p,const uint8_t*b,uint16_t n,uint32_t tick){(void)tick;Fake*f=p;assert(n==110);memcpy(f->tx,b,n);f->tx_count++;return true;}
 static uint32_t advancing_clock(void*p){Fake*f=p;return f->clock++;}
 static const MQDriveOps dops={arm,target,stop,view};
-static const WireOps wops={ready,tx,NULL};
+static const WireOps wops={ready,tx,NULL,NULL,NULL,NULL};
 static void p16(uint8_t*p,uint16_t n){p[0]=(uint8_t)n;p[1]=(uint8_t)(n>>8);}
 static void p32(uint8_t*p,uint32_t n){p16(p,(uint16_t)n);p16(p+2,(uint16_t)(n>>16));}
 static void p64(uint8_t*p,uint64_t n){p32(p,(uint32_t)n);p32(p+4,(uint32_t)(n>>32));}

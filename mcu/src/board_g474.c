@@ -57,7 +57,9 @@ static void uart_init(void){
 }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *h){
   if(h!=&uart)return;
-  if(!uart_tx_busy)wire_rx_byte(&wire,rx_byte,HAL_GetTick());
+  /* Preserve every received byte, including a complete STOP across TX/TC.
+     The wire parser consumes a whole telemetry echo without dispatching it. */
+  wire_rx_byte(&wire,rx_byte,HAL_GetTick());
   if(HAL_UART_Receive_IT(&uart,&rx_byte,1)!=HAL_OK){uart_error=true;wire_transport_error(&wire);}
 }
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *h){
@@ -70,8 +72,32 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *h){
 }
 static bool wire_tx_ready(void *u){(void)u;return !uart_tx_busy&&uart.gState==HAL_UART_STATE_READY;}
 static uint32_t wire_now_ms(void *u){(void)u;return HAL_GetTick();}
+static uint32_t wire_critical_enter(void *u){
+  (void)u;uint32_t saved=__get_PRIMASK();__disable_irq();__DMB();return saved;
+}
+static void wire_critical_exit(void *u,uint32_t saved){
+  (void)u;__DMB();__set_PRIMASK(saved);
+}
+static bool wire_rx_pending(void *u){
+  (void)u;
+  /* IRQ masking does not stop the peripheral. Observe pending hardware as well
+     as the ISR ring; never consume RDR or clear flags in this commit gate. */
+  uint32_t status=uart.Instance->ISR;
+  uint32_t errors=status&(USART_ISR_PE|USART_ISR_FE|USART_ISR_NE|USART_ISR_ORE|USART_ISR_RTOF);
+  if(errors){uart_error=true;wire_transport_error(&wire);}
+  return errors||(status&(USART_ISR_RXNE_RXFNE|USART_ISR_BUSY));
+}
+static void uart_service_fault(uint32_t now){
+  uint32_t saved=wire_critical_enter(NULL);(void)wire_rx_pending(NULL);
+  /* Publish the UART cause before the derived driver failure. No CAN send is
+     performed by either of these state transitions. */
+  if(wire_service_fault(&wire,now)||uart_error)drive_uart_fault(&drive,now);
+  wire_critical_exit(NULL,saved);
+}
 static bool wire_tx_start(void *u,const uint8_t *bytes,uint16_t count,uint32_t expected_tick){
-  (void)u;if(!wire_tx_ready(NULL)||HAL_GetTick()!=expected_tick)return false;
+  /* Called inside Wire's short commit transaction. A final peripheral read
+     also covers RX which became pending while checking the software ring. */
+  (void)u;if(!wire_tx_ready(NULL)||HAL_GetTick()!=expected_tick||wire_rx_pending(NULL))return false;
   uart_tx_busy=true;
   if(HAL_UART_Transmit_IT(&uart,(uint8_t *)bytes,count)==HAL_OK)return true;
   uart_tx_busy=false;uart_error=true;wire_transport_error(&wire);return false;
@@ -98,7 +124,13 @@ static bool can_ready(void *u){(void)u;return HAL_FDCAN_GetTxFifoFreeLevel(&can)
 static bool can_send(void *u,const uint8_t bytes[8]){
   (void)u;FDCAN_TxHeaderTypeDef h={0};h.Identifier=0x601;h.IdType=FDCAN_STANDARD_ID;h.TxFrameType=FDCAN_DATA_FRAME;h.DataLength=FDCAN_DLC_BYTES_8;
   h.ErrorStateIndicator=FDCAN_ESI_ACTIVE;h.BitRateSwitch=FDCAN_BRS_OFF;h.FDFormat=FDCAN_CLASSIC_CAN;h.TxEventFifoControl=FDCAN_NO_TX_EVENTS;
-  return HAL_FDCAN_AddMessageToTxFifoQ(&can,&h,(uint8_t *)bytes)==HAL_OK;
+  uint32_t saved=wire_critical_enter(NULL);(void)wire_rx_pending(NULL);
+  /* A UART event can arrive after the main-loop fault service. Do not commit
+     another ARM/target transaction before that event has entered the STOP
+     state machine. Already stopping traffic keeps its original proof rules. */
+  bool allowed=!wire.transport_fault||drive.uart_failed||drive.view.state==MQ_DRIVE_STOPPING;
+  bool sent=allowed&&HAL_FDCAN_AddMessageToTxFifoQ(&can,&h,(uint8_t *)bytes)==HAL_OK;
+  wire_critical_exit(NULL,saved);return sent;
 }
 static uint32_t can_errors(void *u){
   (void)u;uint32_t ecr=can.Instance->ECR&0x7fffu;
@@ -130,13 +162,18 @@ int main(void){
   can_init();
   static const DriveBusOps bus_ops={can_send,can_ready,can_errors};drive_init(&drive,&bus_ops,NULL,HAL_GetTick());
   mq_init(&queue,rng_ok?boot:0,drive_ops(),&drive);
-  static const WireOps wire_ops={wire_tx_ready,wire_tx_start,wire_now_ms};wire_init(&wire,&queue,&wire_ops,NULL,HAL_GetTick());
+  static const WireOps wire_ops={wire_tx_ready,wire_tx_start,wire_now_ms,
+    wire_critical_enter,wire_critical_exit,wire_rx_pending};
+  wire_init(&wire,&queue,&wire_ops,NULL,HAL_GetTick());
   uart_init();watchdog_init();
   for(;;){
-    uint32_t now=HAL_GetTick();can_receive();
-    if(uart_error)drive_uart_fault(&drive,now);
-    drive_poll(&drive,now);MQSample sample;
+    uint32_t now=HAL_GetTick();
+    uart_service_fault(now);
+    can_receive();drive_poll(&drive,now);
+    uart_service_fault(now);
+    MQSample sample;
     while(drive_pop_sample(&drive,&sample))mq_sample(&queue,&sample);
+    uart_service_fault(now);
     mq_tick(&queue,now);wire_poll(&wire,now);IWDG->KR=0xaaaa;HAL_Delay(1);
   }
 }
