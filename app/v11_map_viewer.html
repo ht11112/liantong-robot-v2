@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>地图导航 · 联通机器人</title>
+  <style>
+    :root{--ink:#202c43;--muted:#65748a;--line:#dfe6f0;--paper:#fff;--bg:#f3f6fa;--blue:#315dd3;--green:#13745d;--orange:#ad6a19;--red:#a9303c;--violet:#7c45ac}
+    *{box-sizing:border-box} [hidden]{display:none!important}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+    button,input{font:inherit} button{cursor:pointer;background:white;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px 12px;font-weight:600}
+    button:disabled{cursor:not-allowed;opacity:.48} button:focus-visible,input:focus-visible{outline:3px solid #a6bcfd;outline-offset:2px}
+    .primary{background:var(--blue);border-color:var(--blue);color:white}.stop{background:#ffeff1;border-color:#f0ccd2;color:var(--red)}
+    header{display:flex;align-items:center;justify-content:space-between;gap:16px;background:white;border-bottom:1px solid var(--line);padding:15px max(18px,calc((100vw - 1400px)/2))}
+    .brand{display:flex;align-items:center;gap:12px}.mark{display:grid;place-items:center;width:37px;height:37px;border-radius:10px;background:#2444a5;color:white;font-weight:750}
+    .brand strong{display:block;font-size:15px}.brand small,.muted{color:var(--muted)}
+    .pill{display:inline-block;border-radius:20px;background:#eef2f8;color:var(--muted);padding:4px 10px;font-size:12px;font-weight:650;white-space:nowrap}.pill.on{background:#e9f7f0;color:var(--green)}
+    main{max-width:1440px;margin:auto;padding:22px 20px 34px}.heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}h1{margin:0 0 5px;font-size:24px}h2{margin:0;font-size:15px}p{margin:6px 0}
+    .notice{padding:9px 12px;border:1px solid #e9d7af;background:#fff7e8;color:#7c531b;border-radius:8px;margin-bottom:12px}
+    .layout{display:grid;grid-template-columns:minmax(0,1fr) 350px;gap:16px;align-items:start}.side{display:grid;gap:12px}.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+    .cardhead{display:flex;align-items:center;justify-content:space-between;gap:9px;border-bottom:1px solid var(--line);padding:12px 15px}.body{padding:12px 15px}.map-controls,.actions,.legend{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.map-controls button{padding:5px 9px;font-size:12px}.map-controls button[aria-pressed="true"]{background:#eaf0ff;border-color:#cbd9fd;color:#254ba8}
+    .canvas-box{position:relative;height:clamp(430px,64vh,680px);background:#e8edf4}.canvas-box canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.map-help{position:absolute;top:9px;left:10px;right:10px;width:fit-content;max-width:calc(100% - 20px);padding:5px 8px;border-radius:6px;background:#fffffff2;color:var(--muted);font-size:12px;pointer-events:none}.map-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;padding:10px 13px;color:var(--muted)}.legend span{display:inline-flex;align-items:center;gap:5px}.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--blue)}.legend .trail{background:var(--green)}.legend .goal{background:#d58626}.legend .seed{background:var(--violet)}
+    .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 10px}.fields.two{grid-template-columns:repeat(2,minmax(0,1fr))}.fields label{font-size:12px;color:var(--muted)}input{width:100%;min-width:0;background:white;color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 8px;margin-top:3px}.actions button{flex:1}.summary,.message{margin:9px 0 0;background:#f4f7fc;padding:7px 9px;border-radius:7px;font-size:12px;overflow-wrap:anywhere}.message.error{color:var(--red);background:#ffeff1}.body small{display:block;color:var(--muted);line-height:1.55}.body dl{margin:0}.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #eef2f7;font-size:12px}.kv dt{color:var(--muted)}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}progress{width:100%;height:8px;margin-top:9px;accent-color:var(--blue)}
+    @media(max-width:850px){.layout{grid-template-columns:1fr}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
+    @media(max-width:540px){main{padding:16px 12px}.heading{align-items:flex-start}.side{grid-template-columns:1fr}.canvas-box{height:390px}.cardhead{align-items:flex-start}.map-controls{justify-content:flex-end}h1{font-size:21px}}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="mark" aria-hidden="true">V11</span><div><strong>联通机器人</strong><small>本地地图控制台</small></div></div>
+    <span id="connection" class="pill" role="status">正在连接 RK</span>
+  </header>
+  <main>
+    <div class="heading"><div><h1>地图点到点导航</h1><p class="muted">在保存地图上选点，先预览队列，再按当前模式提交。</p></div><span class="pill" id="run-mode">模式待确认</span></div>
+    <p id="offline" class="notice" role="status" hidden></p>
+    <div class="layout">
+      <section class="card" aria-label="保存地图与轨迹">
+        <div class="cardhead"><h2>保存地图</h2><div class="map-controls" aria-label="地图选点模式"><button id="pick-goal" type="button" aria-pressed="true">选目标</button><button id="pick-seed" type="button" aria-pressed="false">设起点与车头</button></div></div>
+        <div class="canvas-box"><canvas id="map" aria-label="保存地图、预览路径与车辆轨迹；可使用右侧坐标输入替代选点"></canvas><div class="map-help" id="map-help">等待地图信息</div></div>
+        <div class="map-foot"><div class="legend"><span><i></i>车辆 / 预览</span><span><i class="trail"></i>轨迹</span><span><i class="goal"></i>目标</span><span><i class="seed"></i>定位起点</span></div><span id="map-details">等待已校验地图</span></div>
+      </section>
+      <aside class="side" aria-label="定位与任务控制">
+        <section class="card">
+          <div class="cardhead"><h2>1 · 建立地图位姿</h2><span class="pill" id="localization">待定位</span></div>
+          <div class="body"><small>点击地图设起点，拖动给车头方向。也可填写坐标。</small>
+            <div class="fields"><label>X（m）<input id="seed-x" type="number" step=".01" inputmode="decimal"></label><label>Y（m）<input id="seed-y" type="number" step=".01" inputmode="decimal"></label><label>朝向（°）<input id="seed-yaw" type="number" step=".1" inputmode="decimal" value="0"></label></div>
+            <div class="actions"><button id="localize" type="button" disabled>单次定位</button><button id="zero" type="button" disabled>置0</button></div>
+            <p class="summary" id="pose">当前位置尚未建立</p><small id="local-pose"></small><small id="localization-reason"></small>
+          </div>
+        </section>
+        <section class="card">
+          <div class="cardhead"><h2>2 · 目标与预览</h2><span class="pill" id="busy" hidden>处理中</span></div>
+          <div class="body">
+            <div class="fields two"><label>目标 X（m）<input id="goal-x" type="number" step=".01" inputmode="decimal"></label><label>目标 Y（m）<input id="goal-y" type="number" step=".01" inputmode="decimal"></label></div>
+            <div class="actions"><button id="preview" type="button" disabled>预览</button><button id="start" type="button" class="primary" disabled>开始</button></div>
+            <p class="summary" id="plan">尚无预览</p><p class="message" id="action-note" role="status" hidden></p>
+          </div>
+        </section>
+        <section class="card">
+          <div class="cardhead"><h2>3 · 任务状态</h2><span class="pill" id="task-phase">待命</span></div>
+          <div class="body"><dl>
+            <div class="kv"><dt>任务编号</dt><dd class="mono" id="task-id">—</dd></div>
+            <div class="kv"><dt>段序</dt><dd id="task-index">—</dd></div>
+            <div class="kv"><dt>段内进度</dt><dd id="task-progress">—</dd></div>
+            <div class="kv"><dt>到点</dt><dd id="arrival">未报告</dd></div>
+            <div class="kv"><dt>STOP 回应</dt><dd id="stop-ack">—</dd></div>
+            <div class="kv"><dt>实测停稳</dt><dd id="stop-proof">—</dd></div>
+          </dl>
+          <p class="message error" id="task-error" hidden></p><div class="actions" style="margin-top:10px"><button id="stop" type="button" class="stop" disabled>停车</button></div></div>
+        </section>
+      </aside>
+    </div>
+  </main>
+  <script>
+  (() => {
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const canvas = $('map'), ctx = canvas.getContext('2d');
+    const seedFields = ['seed-x','seed-y','seed-yaw'].map($);
+    const goalFields = ['goal-x','goal-y'].map($);
+    const phaseNames = {idle:'待命',uploading:'上传队列',ready:'READY',starting:'启动中',arming:'使能中',move:'直行',turn:'转向',barrier:'段间停车',stopping:'停车中',complete:'已完成',failed:'失败',unknown:'未知'};
+    const locNames = {amcl:'AMCL 已定位',manual:'手动位姿',unlocalized:'未定位'};
+    let state = {connected:false}, image = null, imageKey = '', view = null;
+    let selectionMode = 'goal', drag = null, prepared = null, action = null, stopping = false;
+    const finite = Number.isFinite;
+    const angle = n => Math.atan2(Math.sin(n),Math.cos(n));
+    const poseText = pose => `(${pose.x.toFixed(3)}, ${pose.y.toFixed(3)}) m · ${(pose.yaw*180/Math.PI).toFixed(1)}°`;
+    const point = values => values.every(finite) ? {x:values[0],y:values[1]} : null;
+    const goal = () => point(goalFields.map(input => input.valueAsNumber));
+    function seed() {
+      const values = seedFields.map(input => input.valueAsNumber);
+      return values.every(finite) ? {x:values[0],y:values[1],yaw:angle(values[2]*Math.PI/180)} : null;
+    }
+    function screen(p) {
+      const {map,left,top,scale} = view;
+      const [ox,oy,yaw] = map.origin, c=Math.cos(yaw),s=Math.sin(yaw);
+      const x=p.x-ox,y=p.y-oy;
+      return {x:left+scale*(c*x+s*y)/map.resolution,
+        y:top+scale*(map.height-(-s*x+c*y)/map.resolution)};
+    }
+    function world(event) {
+      const {map,left,top,scale} = view;
+      const rect=canvas.getBoundingClientRect();
+      const u=(event.clientX-rect.left-left)/scale, v=(event.clientY-rect.top-top)/scale;
+      if(u<0 || v<0 || u>=map.width || v>=map.height) return null;
+      const [ox,oy,yaw]=map.origin,c=Math.cos(yaw),s=Math.sin(yaw);
+      const x=u*map.resolution,y=(map.height-v)*map.resolution;
+      return {x:ox+c*x-s*y,y:oy+s*x+c*y};
+    }
+    function line(points,color,pattern=[]) {
+      if(!points || points.length<2) return;
+      ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2.6;ctx.setLineDash(pattern);
+      points.forEach((p,i) => {const q=screen(p);if(i)ctx.lineTo(q.x,q.y);else ctx.moveTo(q.x,q.y);});
+      ctx.stroke();ctx.setLineDash([]);
+    }
+    function marker(p,color,heading) {
+      if(!p) return;
+      const q=screen(p);
+      ctx.save();ctx.translate(q.x,q.y);ctx.fillStyle=color;ctx.strokeStyle='white';ctx.lineWidth=1.6;ctx.beginPath();
+      if(heading){
+        ctx.rotate(view.map.origin[2]-p.yaw);
+        ctx.moveTo(13,0);ctx.lineTo(-7,7);ctx.lineTo(-4,0);ctx.lineTo(-7,-7);ctx.closePath();
+      }else ctx.arc(0,0,6,0,2*Math.PI);
+      ctx.fill();ctx.stroke();ctx.restore();
+    }
+    function draw() {
+      const w=canvas.clientWidth,h=canvas.clientHeight,dpr=window.devicePixelRatio||1;
+      if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){
+        canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+      }
+      ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);view=null;
+      const map=state.map;
+      if(!image || !map || state.map_image_available!==true || imageKey!==map.pgm_sha256) return;
+      const scale=Math.min(w/map.width,h/map.height);
+      const left=(w-map.width*scale)/2,top=(h-map.height*scale)/2;
+      view={map,scale,left,top};ctx.imageSmoothingEnabled=false;
+      ctx.drawImage(image,left,top,map.width*scale,map.height*scale);
+      ctx.save();ctx.beginPath();ctx.rect(left,top,map.width*scale,map.height*scale);ctx.clip();
+      line(state.trail,'#16866d');
+      const route=state.preview||state.route;
+      if(route) line(route.path,'#3767ea',[6,4]);
+      marker(seed(),'#7c45ac',true);marker(goal(),'#d58626',false);marker(state.source_fresh===false?null:state.pose,'#245bd4',true);
+      ctx.restore();
+    }
+    function loadMap() {
+      const map=state.map;
+      if(!map || state.map_image_available!==true || imageKey===map.pgm_sha256) return;
+      image=null;imageKey=map.pgm_sha256;
+      const next=new Image();
+      next.onload=() => {
+        if(imageKey!==map.pgm_sha256) return;
+        if(next.naturalWidth===map.width && next.naturalHeight===map.height) image=next;
+        render();
+      };
+      next.onerror=() => { if(imageKey===map.pgm_sha256){imageKey='';render();} };
+      next.src='/map.png?v='+encodeURIComponent(map.pgm_sha256);
+    }
+    function note(text,error=false) {
+      const node=$('action-note');node.hidden=!text;node.textContent=text;
+      node.className='message'+(error?' error':'');
+    }
+    function render() {
+      const online=state.connected===true, map=state.map, ready=state.mode==='ready';
+      const matched=state.map_image_available===true && image && map && imageKey===map.pgm_sha256;
+      const editable=online && matched && Boolean(state.csrf_token) && !action && !stopping;
+      const loc=state.localization||{}, task=state.task||{}, preview=state.preview, route=preview||state.route;
+      const canPrepare=editable && state.can_prepare===true;
+      $('connection').textContent=online?'RK 已连接':'RK 未连接';$('connection').className='pill'+(online?' on':'');
+      $('run-mode').textContent=ready?'静止验收：上传至 READY':state.mode==='drive'?'行驶模式':'模式待确认';
+      $('busy').hidden=!(state.busy||action||stopping);
+      $('offline').hidden=online && (!map || state.map_image_available===true);
+      $('offline').textContent=online?'网页地图与 RK 当前地图不匹配，无法在图上准备任务。':(state.error||'等待 RK 状态。断开时图中位姿为最近一次快照。');
+      $('map-help').textContent=!matched?'等待已校验地图':selectionMode==='seed'?'按下设起点，拖动指向车头方向':'点击地图选择目标，不会启动机器人';
+      $('map-details').textContent=map?`${map.width} × ${map.height} · ${map.resolution.toFixed(3)} m/格`:'等待地图信息';
+      $('pick-goal').setAttribute('aria-pressed',String(selectionMode==='goal'));
+      $('pick-seed').setAttribute('aria-pressed',String(selectionMode==='seed'));
+      $('localization').textContent=locNames[loc.mode]||'未定位';$('localization-reason').textContent=loc.reason||'';
+      const pose=state.source_fresh===false?null:state.pose;
+      $('pose').textContent=pose?`${online?'地图位姿':'上次位姿'}：${poseText(pose)}`:'当前位置尚未建立';
+      $('local-pose').textContent=pose && state.local_pose?`置零坐标：${poseText(state.local_pose)}`:'';
+      $('localize').disabled=!canPrepare||!seed();$('zero').disabled=!canPrepare||!seed();
+      $('preview').disabled=!canPrepare||!goal()||!pose;
+      $('start').textContent=ready?'上传至 READY':'开始';
+      $('start').disabled=!editable||state.can_start!==true||!preview||prepared!==preview.id;
+      $('stop').disabled=!online||!state.csrf_token||state.can_stop!==true||stopping;
+      [...seedFields,...goalFields].forEach(input=>{input.disabled=Boolean(action);});
+      const crc=route && typeof route.queue_crc32==='number'?route.queue_crc32.toString(16).padStart(8,'0'):route?.queue_crc32;
+      $('plan').textContent=!route?'尚无预览':route.no_motion?'目标已在容差内，无需上传动作':
+        `${preview?'预览':'已提交路线'} · ${route.segments.length} 段 · ${(route.nominal_duration_s ?? route.duration_s).toFixed(1)} s · CRC32 ${crc ?? '—'}`;
+      $('task-phase').textContent=phaseNames[task.phase]||task.phase||'待命';$('task-id').textContent=task.id??'—';
+      $('task-index').textContent=task.count?`${Math.min(task.index+1,task.count)} / ${task.count}`:'—';
+      $('arrival').textContent=task.arrival?'已报告到点':'未报告';
+      $('stop-ack').textContent=task.stop_ack==null?'—':task.stop_ack?'已收到':'未收到';
+      $('stop-proof').textContent=task.stop_verified==null?'—':task.stop_verified?'已确认':'尚未确认';
+      $('task-progress').textContent=!finite(task.progress)?'—':task.phase==='move'?`${task.progress.toFixed(3)} m`:
+        task.phase==='turn'?`${(task.progress*180/Math.PI).toFixed(1)}°`:'—';
+      $('task-error').textContent=task.error||'';$('task-error').hidden=!task.error;
+      draw();
+    }
+    async function poll() {
+      try {
+        const response=await fetch('/api/state',{cache:'no-store'});
+        const next=await response.json();
+        if(!response.ok) throw new Error(next.error||'无法读取 RK 状态');
+        state=next.connected===false && !next.map ? {...state,...next} : next;
+        loadMap();
+      } catch(error) {
+        state={...state,connected:false,error:error.message};
+      } finally {
+        render();window.setTimeout(poll,650);
+      }
+    }
+    async function submit(op,body) {
+      if($(op).disabled) return;
+      if(op==='stop') stopping=true;
+      else action=op;
+      prepared=null;
+      note(op==='localize'?'正在进行单次定位，请等待 RK 应答。':'正在提交请求。');render();
+      try {
+        const response=await fetch('/api/'+op,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':state.csrf_token},body:JSON.stringify(body)});
+        const next=await response.json();
+        if(!response.ok||!('connected' in next)) throw new Error(next.error||'RK 未确认本次请求');
+        if(op==='preview') prepared=next.preview?.id??null;
+        note(op==='stop'?'已提交停车请求，请看实测停稳状态。':'RK 已应答，请查看最新状态。');
+      } catch(error) {note(error.message,true);}
+      finally {if(op==='stop')stopping=false;else action=null;render();}
+    }
+    function setPoint(fields,p,yaw) {
+      fields[0].value=p.x.toFixed(3);fields[1].value=p.y.toFixed(3);
+      if(yaw!=null)fields[2].value=(yaw*180/Math.PI).toFixed(1);
+      prepared=null;render();
+    }
+    $('pick-goal').onclick=()=>{selectionMode='goal';render();};
+    $('pick-seed').onclick=()=>{selectionMode='seed';render();};
+    [...seedFields,...goalFields].forEach(input=>input.addEventListener('input',()=>{prepared=null;render();}));
+    canvas.addEventListener('pointerdown',event=>{
+      if(!view||action||event.button!==0) return;
+      const p=world(event);if(!p)return;
+      if(selectionMode==='goal'){setPoint(goalFields,p);return;}
+      drag=p;canvas.setPointerCapture(event.pointerId);setPoint(seedFields,p);
+    });
+    canvas.addEventListener('pointermove',event=>{
+      if(!drag||!view)return;
+      const p=world(event);if(p && Math.hypot(p.x-drag.x,p.y-drag.y)>.04) setPoint(seedFields,drag,Math.atan2(p.y-drag.y,p.x-drag.x));
+    });
+    canvas.addEventListener('lostpointercapture',()=>{drag=null;});
+    $('localize').onclick=()=>submit('localize',seed());$('zero').onclick=()=>submit('zero',seed());
+    $('preview').onclick=()=>submit('preview',goal());$('start').onclick=()=>submit('start',{plan_id:prepared});
+    $('stop').onclick=()=>submit('stop',{});
+    window.addEventListener('resize',draw);
+    render();poll();
+  })();
+  </script>
+</body>
+</html>

@@ -2,6 +2,8 @@
 
 当前第三分支 `feature/rk-master-stm-slave` 增加 V11 问答式串口。RK 以 20 ms 为目标发送 QUERY，STM32 按请求回复，并继续独立计算 odom 和运行已启动的动作队列。上传依次等待 ACK，提交停在 READY。构建、RK 命令和静止验收见 [MCU 说明](mcu/README.md)及[线协议](mcu/docs/PROTOCOL_V11.md)。
 
+第三分支还提供 [V11 保存地图导航](docs/V11_MAP_NAVIGATION.md)。在网页上定位一次，或用「置 0」把当前位置和朝向对齐到保存地图。之后由累计里程计更新车位，RK 在静态 costmap 上规划并预览 TURN/MOVE 路线。
+
 第二分支 `feature/mcu-odom-queue` 保留 V10 主动遥测及对应工具，第一分支仍配套 V9。手推建图、点到点网页和来源基线从父分支继承。
 
 ## 继承的第一分支功能

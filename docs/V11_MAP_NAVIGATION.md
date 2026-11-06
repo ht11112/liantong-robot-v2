@@ -1,0 +1,33 @@
+# V11 保存地图导航
+
+PC 网页使用 `http://127.0.0.1:8766/`。RK 独占 V11 串口，PC 通过已核对主机密钥的 SSH 隧道访问 RK 的本机 API。每次规划都在保存的 PGM/YAML 地图上进行，网页同时显示路线、车头和里程计估计轨迹。
+
+1. 小车停稳后，在地图上标出当前位置及车头方向，点击「单次 AMCL 定位」。RK 使用本轮激光对应时刻的 MCU odom 对齐地图，随后结束临时 AMCL 会话。
+2. AMCL 识别失败时，在同一张地图上标出当前位置和方向，点击「置 0」。界面显示「人工对齐」和新的局部零点。地图位置由这个标记和后续 MCU 累计里程计推算。
+3. 在地图上选目标并预览。RK 在静态 costmap 上规划，按 TURN 和正向 MOVE 检查整段扫掠。成功定位后可连续预览多个目标。
+4. 默认 `ready` 模式将新队列上传至 READY。`drive` 模式的开始操作在核对新任务 READY 后发送 START。停车操作分别显示 STOP 应答和新轮速给出的停稳证明。RS485 会话失效后网页显示状态未知，MCU 仍可执行已经启动的队列。
+
+## 构建与运行
+
+PC 从仓库根目录构建，PGM 和 YAML 使用同一份已保存地图，哈希分别来自地图原件。生成的归档包括 RK 所需源码、地图与文件清单。
+
+```text
+python -B scripts/build_v11_map_package.py --name v11-map-r5 --map-pgm FINAL_PGM --map-yaml FINAL_YAML --map-sha256 PGM_SHA256 --yaml-sha256 YAML_SHA256
+```
+
+将 `dist/v11-map-r5/v11-map-rk.tar.gz` 解包到一个新的 RK 目录并核对清单。启动前核对当前串口身份与归属、底盘新鲜反馈和实际停车状态。使用 RK 已有的 ROS Noetic 环境和 Python 3.8。
+
+```sh
+source /opt/ros/noetic/setup.bash
+python3 -B app/v11_map_runtime.py --port CURRENT_RK_PORT --map-pgm map/final.pgm --map-yaml map/final.yaml --map-sha256 PGM_SHA256 --yaml-sha256 YAML_SHA256
+```
+
+默认雷达话题为 `/lidar1/laser_fan`，可用 `--scan-topic` 指定。地图定位使用前 180° 及 1 m 有效下限。仅使用手动对齐时可加 `--manual-only`。现场进入行驶阶段时以 `--mode drive` 启动运行端。
+
+PC 使用仓库现有的 `requirements-pc.txt`，启动网页入口后在本机浏览器打开 8766。已知主机键按别名保存时，另传 `--host-key-alias`。
+
+```text
+python -B scripts/run_v11_map_web.py --host RK_HOST --user cat --known-hosts KNOWN_HOSTS --map-pgm FINAL_PGM --map-sha256 PGM_SHA256
+```
+
+置零和 AMCL 对齐均绑定当前 MCU 会话和地图。MCU 会话变化或有效里程计中断后重新定位。首轮实车验收依次核对新队列 READY、约 0.5 m 直行、实测停稳与尺量 10 cm 到点标准，再做转向接直行和取消停车。

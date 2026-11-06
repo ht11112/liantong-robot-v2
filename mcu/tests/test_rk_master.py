@@ -277,8 +277,12 @@ class MasterTests(unittest.TestCase):
 
         worker = threading.Thread(target=poll)
         worker.start()
-        acks = master.upload({'segments': [{'kind': 'move', 'distance_m': .5}, {'kind': 'turn', 'angle_rad': -1.5}]})
+        seen = []
+        acks = master.upload({'segments': [{'kind': 'move', 'distance_m': .5},
+                                           {'kind': 'turn', 'angle_rad': -1.5}]},
+                             on_ack=lambda ack: seen.append((len(port.writes), ack)))
         worker.join(1)
+        self.assertEqual(seen, list(zip(range(2, 6), acks)))
         self.assertEqual(acks[-1].status.state, v11.READY)
         self.assertEqual([ack.opcode for ack in acks], [v11.BEGIN, v11.APPEND, v11.APPEND, v11.COMMIT])
         self.assertEqual([packet[3] for _, packet in port.writes],
@@ -331,7 +335,9 @@ class MasterTests(unittest.TestCase):
 
         master, port = self.make_master(response)
         master.discover()
-        result = master.stop()
+        seen = []
+        result = master.stop(on_reply=lambda reply: seen.append(reply.opcode))
+        self.assertEqual(seen, [v11.STOP, v11.QUERY, v11.QUERY])
         self.assertTrue(result['stop_verified'])
         self.assertEqual(result['ack']['status']['state'], 7)
         self.assertEqual(result['proof']['status']['state'], 9)

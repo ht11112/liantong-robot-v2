@@ -277,7 +277,7 @@ class RkMaster:
         with self.lock:
             return self._exchange(QUERY)
 
-    def upload(self, document, task=None):
+    def upload(self, document, task=None, *, on_ack=None):
         plan = document if isinstance(document, QueuePlan) else QueuePlan.from_document(document)
         with self.lock:
             if self.latest is None:
@@ -287,18 +287,24 @@ class RkMaster:
             if type(task) is not int or not current < task <= UINT64_MAX:
                 raise ValueError('New upload requires a strictly increasing uint64 task ID')
             acks = []
+
+            def record(reply):
+                acks.append(reply)
+                if on_ack is not None:
+                    on_ack(reply)
+
             try:
                 metadata = struct.pack('<HII', len(plan.segments), plan.checksum, plan.duration_ms)
-                acks.append(self._exchange(BEGIN, task=task, extra=metadata))
+                record(self._exchange(BEGIN, task=task, extra=metadata))
                 for index, segment in enumerate(plan.segments):
-                    acks.append(self._exchange(APPEND, task=task, extra=struct.pack('<H', index) + segment))
+                    record(self._exchange(APPEND, task=task, extra=struct.pack('<H', index) + segment))
                 reply = self._exchange(COMMIT, task=task)
                 value = reply.status
                 if (value.task != task or value.state != READY or not value.flags & COMMITTED
                         or value.flags & (STARTED | EXECUTING) or value.count != len(plan.segments)):
                     self.failed = True
                     raise LinkError('COMMIT ACK did not prove the new task is READY', reply)
-                acks.append(reply)
+                record(reply)
             except LinkError as exc:
                 exc.details['accepted_upload_prefix'] = [asdict(ack) for ack in acks]
                 raise
@@ -313,11 +319,13 @@ class RkMaster:
                 raise ValueError('START requires the explicitly selected READY task on this MCU')
             return self._exchange(START, task=task)
 
-    def stop(self, *, proof_timeout=3.):
+    def stop(self, *, proof_timeout=3., on_reply=None):
         if not math.isfinite(proof_timeout) or proof_timeout <= 0:
             raise ValueError('Stop proof timeout must be finite and positive')
         with self.lock:
             ack = self._exchange(STOP)
+            if on_reply is not None:
+                on_reply(ack)
             deadline = self.clock() + proof_timeout
             while self.clock() < deadline:
                 try:
@@ -326,6 +334,8 @@ class RkMaster:
                     return dict(ack=asdict(ack), stop_verified=False, error=error_record(exc))
                 if reply is None:
                     break
+                if on_reply is not None:
+                    on_reply(reply)
                 value, before = reply.status, ack.status
                 if (value.flags & STOP_CONFIRMED and value.source_valid and not value.flags & EXECUTING
                         and value.state in (0, 8, 9)
