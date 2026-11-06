@@ -30,6 +30,13 @@ def pose_of(sample):
     return dict(x=sample.x, y=sample.y, yaw=sample.yaw)
 
 
+def same_pose(current, reference):
+    # Allow float32 odometry round-off, including yaw wrapping at ±π.
+    return (current is not None
+            and math.hypot(current['x'] - reference['x'], current['y'] - reference['y']) <= 1e-6
+            and abs(angle(current['yaw'] - reference['yaw'])) <= 1e-5)
+
+
 def compose(first, second):
     c, s = math.cos(first['yaw']), math.sin(first['yaw'])
     return dict(x=first['x'] + c * second['x'] - s * second['y'],
@@ -144,15 +151,17 @@ class Navigation:
                         raise ValueError('AMCL 当前不可用，可手动对齐')
                     map_pose, odom_pose = self.localizer.localize(seed)
                 else:
-                    map_pose, odom_pose = seed, initial
+                    map_pose = seed
                 with self.lock:
                     current = self._require_stationary()
                     if (current.boot, current.epoch) != (before.boot, before.epoch):
                         raise ValueError('定位期间 MCU 会话已变化')
                     if self.stop_revision != stop_revision:
                         raise ValueError('定位已取消')
-                    if mode == 'manual' and pose_of(current) != initial:
-                        raise ValueError('置零期间车体位置发生变化，请停稳后重试')
+                    if mode == 'manual':
+                        odom_pose = pose_of(current)
+                        if not same_pose(odom_pose, initial):
+                            raise ValueError('置零期间车体位置发生变化，请停稳后重试')
                     self.alignment = compose(map_pose, inverse(odom_pose))
                     self.origin = dict(x=odom_pose['x'], y=odom_pose['y'], yaw=odom_pose['yaw'])
                     self.localization = dict(mode=mode, reason=None, stamp_ns=map_pose.get('stamp_ns'),
@@ -174,7 +183,7 @@ class Navigation:
             plan = self.grid.plan(pose, goal)
             with self.lock:
                 if (self.stop_revision != stop_revision or anchor is not self.alignment
-                        or self._map_pose() != pose):
+                        or not same_pose(self._map_pose(), pose)):
                     raise ValueError('规划期间起点已变化，请重新预览')
                 self.plan = dict(plan, id=uuid.uuid4().hex)
 
@@ -215,7 +224,7 @@ class Navigation:
             pose = self._map_pose()
             if pose is None:
                 raise ValueError('地图定位已失效，请重新定位')
-            if pose != plan['start']:
+            if not same_pose(pose, plan['start']):
                 raise ValueError('起点已变化，请重新预览')
         self.grid.validate_plan(pose, plan)
         with self.lock:
@@ -226,7 +235,7 @@ class Navigation:
             if self.mode == 'ready' or self.stop_requested:
                 return
             self._require_stationary()
-            if self._map_pose() != pose:
+            if not same_pose(self._map_pose(), pose):
                 raise ValueError('上传期间起点已变化，请重新预览')
             self.work = 'starting'
         self.observe(master.start(reply.status.task))

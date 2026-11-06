@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from dataclasses import replace
+from unittest.mock import Mock, patch
 
 from v11_map_runtime import Navigation, load_map
 from mcu_v11 import ACK_VALID, ODOM_INITIALIZED, ODOM_VALID, Exchange, QueuePlan, Telemetry
@@ -93,6 +94,85 @@ class NavigationTest(unittest.TestCase):
         self.assertFalse(state['source_fresh'])
         self.assertEqual(state['localization']['mode'], 'unlocalized')
         self.assertIsNone(state['pose'])
+
+    def test_manual_zero_accepts_wrapped_yaw_roundoff_but_not_motion(self):
+        seed = dict(x=1., y=1., yaw=0.)
+        require_stationary = self.nav._require_stationary
+        for displacement in (0., .002):
+            with self.subTest(displacement=displacement):
+                self.observe(x=0., yaw=math.pi - 1e-7)
+
+                def new_sample():
+                    if self.nav.work == 'aligning':
+                        self.observe(x=displacement, yaw=-math.pi + 1e-7)
+                    return require_stationary()
+
+                with patch.object(self.nav, '_require_stationary', side_effect=new_sample):
+                    if displacement:
+                        with self.assertRaisesRegex(ValueError, '置零期间车体位置发生变化'):
+                            self.nav.align(seed, 'manual')
+                    else:
+                        self.nav.align(seed, 'manual')
+                        self.assertEqual(self.nav.snapshot()['local_pose'], dict(x=0., y=0., yaw=0.))
+
+    def test_preview_accepts_roundoff_but_rejects_heading_change_during_planning(self):
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        goal = dict(x=1.5, y=1.)
+        plan = self.grid.plan
+
+        for yaw, success in ((2e-7, True), (.002, False)):
+            with self.subTest(yaw=yaw):
+                def plan_after_sample(pose, target):
+                    self.observe(x=4e-7, y=4e-7, yaw=yaw)
+                    return plan(pose, target)
+
+                with patch.object(self.grid, 'plan', side_effect=plan_after_sample):
+                    if success:
+                        self.nav.preview(goal)
+                    else:
+                        with self.assertRaisesRegex(ValueError, '规划期间起点已变化'):
+                            self.nav.preview(goal)
+                self.assertEqual(self.nav.snapshot()['can_start'], success)
+
+    def test_upload_validates_current_pose_and_checks_motion_before_and_after_upload(self):
+        for before, after, error in ((4e-7, 7e-7, None),
+                                     (.002, .002, '^起点已变化'),
+                                     (4e-7, .002, '^上传期间起点已变化')):
+            with self.subTest(before=before, after=after):
+                self.nav = Navigation(self.grid, mode='drive', clock=lambda: self.now)
+                self.observe(x=0., yaw=0., task=0, state=0)
+                self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+                self.nav.preview(dict(x=1.5, y=1.))
+                plan = self.nav.snapshot()['preview']
+                self.observe(x=before, yaw=2e-7)
+                current_pose = self.nav.snapshot()['pose']
+                master = Mock()
+
+                def upload(plan, on_ack):
+                    sample = replace(self.sample, task=1, state=2, x=after, yaw=3e-7)
+                    reply = Exchange(3, 3, self.now - .02, self.now, sample, '', '')
+                    on_ack(reply)
+                    return [reply]
+
+                master.upload.side_effect = upload
+                master.start.return_value = Exchange(4, 4, self.now - .02, self.now,
+                                                     replace(self.sample, task=1, state=3), '', '')
+                with patch.object(self.grid, 'validate_plan', wraps=self.grid.validate_plan) as validate:
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            self.nav._upload(master, plan)
+                    else:
+                        self.nav._upload(master, plan)
+                    if before == .002:
+                        validate.assert_not_called()
+                        master.upload.assert_not_called()
+                    else:
+                        validate.assert_called_once_with(current_pose, plan)
+                        master.upload.assert_called_once()
+                if error:
+                    master.start.assert_not_called()
+                else:
+                    master.start.assert_called_once_with(1)
 
     def test_boot_change_invalidates_prepared_route(self):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
