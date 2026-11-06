@@ -71,15 +71,18 @@ class SSHHTTP:
             if body is not None:
                 headers['Content-Type'] = 'application/json'
             connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            limit = 8*1024*1024
-            raw = response.read(limit+1)
-            if len(raw) > limit:
-                raise ValueError('RK response exceeds the size limit')
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError('Expected a JSON object from RK')
-            return response.status, payload
+            # getresponse() closes a connection-close socket after its headers;
+            # unlike a native socket file, ChannelFile cannot outlive its channel.
+            with http.client.HTTPResponse(channel, method=method) as response:
+                response.begin()
+                limit = 8*1024*1024
+                raw = response.read(limit+1)
+                if len(raw) > limit:
+                    raise ValueError('RK response exceeds the size limit')
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError('Expected a JSON object from RK')
+                return response.status, payload
         finally:
             connection.close()
 
