@@ -1,12 +1,14 @@
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from v11_map_runtime import Navigation, load_map
-from mcu_v11 import ACK_VALID, ODOM_INITIALIZED, ODOM_VALID, Exchange, QueuePlan, Telemetry
+from mcu_v11 import ACK_VALID, ODOM_INITIALIZED, ODOM_VALID, Exchange, LinkError, QueuePlan, Telemetry
 
 
 class Localization:
@@ -86,14 +88,98 @@ class NavigationTest(unittest.TestCase):
         self.nav.preview(dict(x=1., y=2.))
         self.assertEqual(len(self.nav.snapshot()['preview']['segments']), 1)
 
-    def test_duplicate_source_does_not_extend_map_anchor_lifetime(self):
+    def test_duplicate_source_does_not_refresh_pose_or_invalidate_alignment(self):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
         self.now += .260
         self.observe(publication_sequence=2, publication_tick_ms=101)
         state = self.nav.snapshot()
         self.assertFalse(state['source_fresh'])
-        self.assertEqual(state['localization']['mode'], 'unlocalized')
+        self.assertEqual(state['localization']['mode'], 'manual')
         self.assertIsNone(state['pose'])
+        self.observe(flags=ACK_VALID | ODOM_INITIALIZED)
+        self.assertEqual(self.nav.snapshot()['localization']['mode'], 'unlocalized')
+
+    def test_query_misses_keep_owner_and_age_real_feedback_until_next_reply(self):
+        self.nav.mode = 'drive'
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        self.nav.localizer = Mock()
+        initial = self.nav.latest
+        initial_alignment = self.nav.alignment
+        initial_source_time = self.nav.source_time
+        closed, port, master = Event(), object(), Mock(failed=False)
+        master.discover.return_value = initial
+        steps = iter(('drop', 'age', 'receive', 'verify'))
+
+        def query():
+            step = next(steps)
+            if step == 'drop':
+                self.now += .1
+                return None
+            if step == 'age':
+                state = self.nav.snapshot()
+                self.assertIs(self.nav.latest, initial)
+                self.assertEqual(self.nav.source_time, initial_source_time)
+                self.assertTrue(state['connected'])
+                self.assertTrue(state['source_fresh'])
+                self.assertIsNone(state['error'])
+                self.now += .16
+                return None
+            if step == 'receive':
+                state = self.nav.snapshot()
+                self.assertTrue(state['connected'])
+                self.assertTrue(state['can_stop'])
+                self.assertFalse(state['source_fresh'])
+                self.assertFalse(state['can_prepare'])
+                self.assertEqual(state['task']['phase'], 'unknown')
+                self.assertEqual(state['localization']['mode'], 'manual')
+                self.assertIs(self.nav.alignment, initial_alignment)
+                self.assertIsNone(state['pose'])
+                self.assertIsNone(state['error'])
+                self.now += .02
+                sample = replace(self.sample, publication_sequence=2, sample_sequence=2,
+                                 publication_tick_ms=150, measurement_tick_ms=145, x=.25)
+                return Exchange(7, 2, self.now - .01, self.now, sample, '', '')
+            state = self.nav.snapshot()
+            self.assertTrue(state['connected'])
+            self.assertTrue(state['source_fresh'])
+            self.assertTrue(state['can_prepare'])
+            self.assertEqual(state['task']['phase'], 'idle')
+            self.assertEqual(state['localization']['mode'], 'manual')
+            self.assertIs(self.nav.alignment, initial_alignment)
+            self.assertEqual(state['pose'], dict(x=1.25, y=1., yaw=0.))
+            self.assertEqual(self.nav.latest.status.sample_sequence, 2)
+            self.assertGreater(self.nav.source_time, initial_source_time)
+            self.assertIsNone(state['error'])
+            closed.set()
+            return None
+
+        master.query.side_effect = query
+        with patch('v11_map_runtime.open_port', return_value=nullcontext(port)) as opening, \
+                patch('v11_map_runtime.RkMaster', return_value=master) as owner, \
+                patch('builtins.print') as output:
+            self.nav.run('/dev/ttyUSB2', closed)
+        self.assertTrue(closed.is_set())
+        opening.assert_called_once_with('/dev/ttyUSB2', .1)
+        owner.assert_called_once_with(port)
+        master.start.assert_not_called()
+        master.upload.assert_not_called()
+        master.stop.assert_not_called()
+        output.assert_not_called()
+        self.assertEqual(self.nav.localizer.publish.call_count, 2)
+
+    def test_actual_link_failure_still_closes_owner_and_reports_error(self):
+        master = Mock(failed=True)
+        master.discover.return_value = self.nav.latest
+        master.query.side_effect = LinkError('Serial exchange failed')
+        with patch('v11_map_runtime.open_port', return_value=nullcontext(object())), \
+                patch('v11_map_runtime.RkMaster', return_value=master), patch('builtins.print'):
+            self.nav.run('/dev/ttyUSB2', Event())
+        state = self.nav.snapshot()
+        self.assertFalse(state['connected'])
+        self.assertFalse(state['source_fresh'])
+        self.assertFalse(state['can_stop'])
+        self.assertEqual(state['task']['phase'], 'unknown')
+        self.assertEqual(state['error'], 'Serial exchange failed')
 
     def test_manual_zero_accepts_wrapped_yaw_roundoff_but_not_motion(self):
         seed = dict(x=1., y=1., yaw=0.)

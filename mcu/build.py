@@ -14,6 +14,7 @@ REPO = ROOT.parent
 UNITY = Path('C:/Program Files/Unity/Hub/Editor/6000.6.2f1/Editor/Data/PlaybackEngines/WebGLSupport/BuildTools/Emscripten')
 SDK = Path('C:/Users/Administrator/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3')
 ARM = Path('F:/STM32CubeIDE_2.2.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.14.3.rel1.win32_1.0.100.202602081740/tools/bin')
+SPEED_DEFAULTS = {'move_cruise_rpm': 2, 'move_near_rpm': 1, 'turn_rpm': 1}
 
 
 def sha(path):
@@ -36,16 +37,26 @@ def run(command, destination, env=None):
     return r.stdout+r.stderr
 
 
-def cruise_flags(rpm):
-    # Omit the override for the default build to preserve the released binary.
-    return [] if rpm == 2 else ['-DMQ_MOVE_CRUISE_RPM='+str(rpm)]
+def wheel_rpm(value):
+    try:
+        rpm = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('expected an integer RPM magnitude') from exc
+    if not 0 <= rpm <= 32767:
+        raise argparse.ArgumentTypeError('RPM magnitude must fit a signed 16-bit target (0 to 32767)')
+    return rpm
+
+
+def speed_flags(args, *, explicit=False):
+    return [f'-DMQ_{key.upper()}={getattr(args, key)}' for key, default in SPEED_DEFAULTS.items()
+            if explicit or getattr(args, key) != default]
 
 
 def host_tests(args, out):
     sources = [ROOT/'src'/n for n in ('mq.c', 'drive.c', 'wire.c') if (ROOT/'src'/n).is_file()]
     native = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     common = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-DMQ_HOST_TEST=1',
-              '-I'+str(ROOT/'include'), '-I'+str(ROOT/'tests')]+cruise_flags(args.move_cruise_rpm)
+              '-I'+str(ROOT/'include'), '-I'+str(ROOT/'tests')]
     env = dict(os.environ)
     if native:
         compiler = [native]
@@ -62,7 +73,10 @@ def host_tests(args, out):
     for test in sorted((ROOT/'tests').glob('test_*.c')):
         binary = out/(test.stem+('.exe' if os.name=='nt' and native else '' if native else '.js'))
         flags = [] if native else ['-sENVIRONMENT=node', '-sEXIT_RUNTIME=1', '-sSINGLE_FILE=1']
-        run(compiler+common+list(map(str, sources))+[str(test), '-lm']+flags+['-o', str(binary)],
+        # The closed-loop fixtures use the default profile. A separate suite
+        # tests the requested targets independently of simulated feedback.
+        profile = speed_flags(args, explicit=True) if test.stem == 'test_speed_profile' else []
+        run(compiler+common+profile+list(map(str, sources))+[str(test), '-lm']+flags+['-o', str(binary)],
             out/(test.stem+'_compile.log'), env)
         command = [str(binary)] if native else [str(args.emscripten/'node/node.exe'), str(binary)]
         output = run(command, out/(test.stem+'.log'), env)
@@ -101,7 +115,7 @@ def firmware(args, out):
              '-ffunction-sections', '-fdata-sections', '-Wall', '-Wextra', '-Werror',
              '-DMQ_PRODUCTION=1', '-DSTM32G474xx', '-DUSE_HAL_DRIVER',
              '-DUSER_VECT_TAB_ADDRESS', '-I'+str(ROOT/'include'), '-I'+str(hal/'Inc'),
-             '-I'+str(device/'Include'), '-I'+str(cmsis/'Include')]+cruise_flags(args.move_cruise_rpm)
+             '-I'+str(device/'Include'), '-I'+str(cmsis/'Include')]+speed_flags(args)
     objects = []
     for source in sources:
         if not source.is_file():
@@ -146,8 +160,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host-tests', action='store_true')
     parser.add_argument('--firmware', action='store_true')
-    parser.add_argument('--move-cruise-rpm', type=int, choices=range(1, 6), default=2,
+    parser.add_argument('--move-cruise-rpm', type=wheel_rpm, default=SPEED_DEFAULTS['move_cruise_rpm'],
                         help='MOVE command above 0.30 m remaining (default: 2 RPM)')
+    parser.add_argument('--move-near-rpm', type=wheel_rpm, default=SPEED_DEFAULTS['move_near_rpm'],
+                        help='MOVE command at 0.30 m remaining or less (default: 1 RPM)')
+    parser.add_argument('--turn-rpm', type=wheel_rpm, default=SPEED_DEFAULTS['turn_rpm'],
+                        help='TURN command magnitude for either direction (default: 1 RPM)')
     parser.add_argument('--name', default='mcu-v11-offline')
     parser.add_argument('--emscripten', type=Path, default=UNITY)
     parser.add_argument('--sdk', type=Path, default=SDK)
@@ -160,8 +178,8 @@ def main():
     out = REPO/'build'/args.name
     out.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    report = dict(status='OFFLINE_ONLY_NOT_FLASHED', hardware_accessed=False,
-                  flashed=False, move_cruise_rpm=args.move_cruise_rpm, source_sha256=identities())
+    report = dict(status='OFFLINE_ONLY_NOT_FLASHED', hardware_accessed=False, flashed=False,
+                  source_sha256=identities(), **{key: getattr(args, key) for key in SPEED_DEFAULTS})
     try:
         if args.host_tests:
             report['tests'] = host_tests(args, out)

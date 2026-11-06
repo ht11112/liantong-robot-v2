@@ -23,7 +23,7 @@ static const ArmStep arm_steps[]={
   {0x2014,2,2,LIMIT_WRITE,1},{0x2014,2,2,LIMIT_VERIFY,1},
   {0x2015,1,2,LIMIT_WRITE,2},{0x2015,1,2,LIMIT_VERIFY,2},
   {0x2015,2,2,LIMIT_WRITE,3},{0x2015,2,2,LIMIT_VERIFY,3},
-  {0x2008,0,2,LIMIT_WRITE,4},{0x2008,0,2,LIMIT_VERIFY,4},
+  {0x2008,0,2,LIMIT_VERIFY,4},
   {0x2000,0,2,EQ,500},
   {0x60ff,3,4,LIMIT_WRITE,5},{0x60ff,3,4,EQ,0},
   {0x6040,0,2,LIMIT_WRITE,6},{0x6041,0,4,STATUS1,0},
@@ -110,7 +110,11 @@ static bool arm_check(Drive *d,const ArmStep *s,uint32_t v){
   case STATUS_ZERO:return statuses(v,0);
   case HALL_RANGE:return v>=1u&&v<=6u;
   case LE500:return s->index==0x6064||s->index==0x6077||v<=500u;
-  case POSITIVE:if(!v)return false;d->limit_values[s->value]=v<(s->value==4?10u:30u)?v:(s->value==4?10u:30u);return true;
+  case POSITIVE:
+    if(!v)return false;
+    /* The configured maximum speed is verified as read. Current limits retain their cap. */
+    d->limit_values[s->value]=s->value<4&&v>30u?30u:v;
+    return true;
   case LIMIT_WRITE:return true;
   case LIMIT_VERIFY:return v==d->limit_values[s->value];
   case STATUS1:return statuses(v,1);
@@ -198,7 +202,6 @@ static void request_arm(void *user,uint32_t now){
 static uint32_t request_target(void *user,int16_t left,int16_t right,uint32_t now){
   Drive *d=user;d->now=now;
   if(d->view.state!=MQ_DRIVE_ENABLED||d->flow||d->view.error||d->target_pending)return 0;
-  if(left<-5||left>5||right<-5||right>5){fault(d,DRIVE_ERR_LIMIT);return 0;}
   if(++d->generation==0)++d->generation;
   d->desired_generation=d->generation;d->desired_left=left;d->desired_right=right;d->target_pending=true;
   return d->generation;

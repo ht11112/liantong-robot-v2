@@ -8,7 +8,7 @@ MCU基于真实0.1RPM轮速及自身时间持续积分odom，以名义20Hz读取
 
 `measurement_tick_ms`实际记录MCU收到CAN读速响应的完成时刻，序号也是本机采纳序号；驱动器没有在此SDO中提供内部测量时间，不能把接收时刻称为驱动内部传感器时间。
 
-MOVE使用两轮等速前进给定，按实测中心轮程结束；不纠偏，不因偏航超过8°停车。TURN按有符号的连续相对角度结束。速度向下量化：直行最高2整数RPM（约0.02094m/s），近终点1RPM；转向1RPM（约4°/s），均低于原0.03m/s和6.9°/s上限。普通MOVE容差2cm、末MOVE10cm，TURN容差3°；MOVE在剩余30cm内减速。
+MOVE使用两轮等速前进给定，按实测中心轮程结束；不纠偏，不因偏航超过8°停车。TURN按有符号的连续相对角度结束。默认直行巡航 2 RPM、剩余 30 cm 内 1 RPM、转向 1 RPM。普通 MOVE 容差 2 cm，末段 MOVE 容差 10 cm，TURN 容差 3°。
 
 段间须零目标已应用，随后取得五个不同且严格晚于应用时刻的真实零速样本；该交接最多2秒。最终到点直接STOP，取消旧到点封存与停车后位置复验。`arrival_reached`只是动作终止条件已满足，`physical_stop_confirmed`另报告停车事实；二者不等于地图定位或地面终点精度已验。
 
@@ -29,7 +29,7 @@ python -B mcu/build.py --host-tests --name v11-host-check
 python -B mcu/build.py --firmware --name v11-production
 ```
 
-临时试车需要 5 RPM 直行巡航时，运行 `python -B mcu/build.py --host-tests --firmware --move-cruise-rpm 5 --name v11-move5`。仅直行剩余超过 30 cm 时使用该给定，按名义轮径约为 0.052 m/s。常规构建默认 2 RPM。
+构建参数 `--move-cruise-rpm`、`--move-near-rpm`、`--turn-rpm` 分别设置直行巡航、近端和转向的轮速给定。给定以整数 RPM 表示，范围由 CAN 双轮目标字段决定，方向由动作决定。MCU 在使能时沿用驱动器的最大转速配置。15 RPM 实测超速停车保护仍独立生效。
 
 输出目录必须是新名字，结果在`build/名字/`，含测试日志或生产`mcu-v11.bin`、`.elf`、`.map`及SHA/内存报告`receipt.json`。构建脚本没有连接设备、烧录或启动功能。32KB超限即失败，不扩大应用区。
 

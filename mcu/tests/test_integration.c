@@ -1,4 +1,4 @@
-/* Independent closed loop: production Drive + MQ; all CAN traffic stays in RAM. */
+/* Default-profile closed loop: production Drive + MQ; all CAN traffic stays in RAM. */
 #include "drive.h"
 #include "mq.h"
 #include <assert.h>
@@ -58,7 +58,6 @@ static void apply_write(ClosedLoop *a,uint16_t index,uint8_t sub,uint32_t value)
     uint32_t previous=a->target;
     a->target=value;
     int16_t l=(int16_t)value,r=(int16_t)(value>>16);
-    assert(l>=-5&&l<=5&&r>=-5&&r<=5);
     if(value){
       assert(a->status==7u);a->motion_writes++;
       if(l==r){assert(l==1||l==-1);a->turn_writes++;}
@@ -73,7 +72,7 @@ static void apply_write(ClosedLoop *a,uint16_t index,uint8_t sub,uint32_t value)
     a->stop_words++;a->status=value==6u?1u:value==7u?3u:value==15u?7u:0u;
     if(value==6u||value==0u||value==2u)a->decel_until=a->now+120u;
   }else if(index==0x2000){assert(value==500u);a->guard=value;}
-  else {unsigned i=limit_slot(index,sub);assert(value<=a->limits[i]);a->limits[i]=value;}
+  else {assert(index!=0x2008);unsigned i=limit_slot(index,sub);assert(value<=a->limits[i]);a->limits[i]=value;}
 }
 static void reply(ClosedLoop *a){
   if(!a->waiting||(int32_t)(a->now-a->reply_at)<0)return;

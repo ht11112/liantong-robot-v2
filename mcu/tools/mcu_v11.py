@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
@@ -182,7 +182,7 @@ class ReplyTimeout(LinkError):
 
 
 class RkMaster:
-    """One serial owner, one transaction at a time. Only regular queries may retry."""
+    """One serial owner, one transaction at a time. Ordinary queries may drop."""
 
     def __init__(self, port, *, reply_timeout=.100, clock=time.monotonic, sleep=time.sleep):
         if not math.isfinite(reply_timeout) or reply_timeout <= 0:
@@ -195,12 +195,13 @@ class RkMaster:
         self.latest = None
         self.last_sent = None
         self.sent = 0
-        self.query_retries = 0
-        self.last_query_retry = None
+        self.dropped_queries = 0
+        self._dropped_request = None
         self.ignored = Counter(unmatched_ack=0, stale_reply=0)
         self.failed = False
 
-    def _exchange(self, kind, *, task=0, extra=b'', discover=False, start_before=None, reply_by=None):
+    def _exchange(self, kind, *, task=0, extra=b'', discover=False, start_before=None, reply_by=None,
+                  drop_missing=False):
         if self.failed:
             raise LinkError('Owner closed to new requests after an uncertain transaction')
         previous = self.latest.status if self.latest else None
@@ -212,7 +213,12 @@ class RkMaster:
         else:
             if previous is None:
                 raise ValueError('Discover the MCU before regular requests')
-            request = (previous.accepted_request_watermark + 1) & MASK32 or 1
+            watermark = previous.accepted_request_watermark
+            base = watermark if self._dropped_request is None else self._dropped_request
+            request = (base + 1) & MASK32 or 1
+            if not forward(request, watermark):
+                self.failed = True
+                raise LinkError('Request sequence has exhausted the forward range of the last known watermark')
             packet = command(kind, previous.boot, previous.epoch, request, task, extra)
 
         earliest = self.clock() if self.last_sent is None else self.last_sent + PERIOD_S
@@ -243,9 +249,10 @@ class RkMaster:
                     break
                 for value, raw in self.parser.feed(data):
                     exchange = Exchange(kind, request, sent_at, arrived, value, packet.hex(), raw.hex())
-                    if previous and (value.boot, value.epoch) != (previous.boot, previous.epoch):
+                    matches = value.flags & ACK_VALID and value.ack_request == request
+                    if previous and (matches or not drop_missing) and (value.boot, value.epoch) != (previous.boot, previous.epoch):
                         raise LinkError('MCU boot or odometry epoch changed during request', exchange, details=details)
-                    if not value.flags & ACK_VALID or value.ack_request != request:
+                    if not matches:
                         self.ignored['unmatched_ack'] += 1
                         continue
                     if previous and (not forward(value.publication_sequence, previous.publication_sequence)
@@ -253,14 +260,24 @@ class RkMaster:
                         self.ignored['stale_reply'] += 1
                         continue
                     if not discover:
-                        allowed = (request, previous.accepted_request_watermark) if value.ack_result else (request,)
-                        if value.accepted_request_watermark not in allowed:
+                        accepted = value.accepted_request_watermark
+                        # A rejected request may reveal acceptance of an earlier dropped QUERY.
+                        known_or_dropped = accepted == watermark or (accepted != 0 and forward(accepted, watermark)
+                                                                     and forward(request, accepted))
+                        if accepted != request and not (value.ack_result and known_or_dropped):
                             raise LinkError('Reply acceptance watermark does not match request', exchange, details=details)
+                        if accepted == request:
+                            self._dropped_request = None
                     self.latest = exchange
                     if value.ack_result:
                         raise Rejected('MCU rejected opcode {} with result {}'.format(kind, value.ack_result),
                                        exchange, details=details)
                     return exchange
+            if drop_missing and kind == QUERY and not discover:
+                # The next request must not accept a late ACK for this sample.
+                self._dropped_request = request
+                self.dropped_queries += 1
+                return None
             raise ReplyTimeout('Timed out without a matching V11 reply', exchange, details=details)
         except Rejected:
             if discover:
@@ -280,22 +297,9 @@ class RkMaster:
             return self._exchange(QUERY, discover=True)
 
     def query(self):
+        """Return the current exchange or None for a dropped status sample."""
         with self.lock:
-            try:
-                return self._exchange(QUERY)
-            except ReplyTimeout as first:
-                self.query_retries += 1
-                self.last_query_retry = error_record(first)
-                self.failed = False
-                try:
-                    reply = self._exchange(QUERY)
-                except LinkError as exc:
-                    exc.details['first_query_attempt'] = self.last_query_retry
-                    raise
-                # The same request can still match its first reply. Keep the
-                # earlier send time so a delayed sample cannot appear newer.
-                self.latest = replace(reply, sent_at=first.details['sent_at'])
-                return self.latest
+            return self._exchange(QUERY, drop_missing=True)
 
     def upload(self, document, task=None, *, on_ack=None):
         plan = document if isinstance(document, QueuePlan) else QueuePlan.from_document(document)
@@ -371,19 +375,30 @@ class RkMaster:
         started = self.clock()
         deadline = started + duration
         replies = []
+        sends = []
+        drops = 0
         failure = None
         while self.clock() < deadline:
             try:
                 with self.lock:
-                    reply = self._exchange(QUERY, start_before=deadline)
+                    previous_sends = self.sent
+                    try:
+                        reply = self._exchange(QUERY, start_before=deadline, drop_missing=True)
+                    finally:
+                        sent = self.sent != previous_sends
+                        if sent:
+                            sends.append(self.last_sent)
             except LinkError as exc:
                 failure = error_record(exc)
                 break
             if reply is None:
-                break
+                if not sent:
+                    break
+                drops += 1
+                continue
             replies.append(reply)
-        result = poll_report(replies, duration, self.clock() - started)
-        result.update(error=failure, success=bool(replies) and failure is None)
+        result = poll_report(replies, sends, drops, duration, self.clock() - started)
+        result.update(error=failure, success=failure is None)
         return result
 
 
@@ -394,7 +409,7 @@ def error_record(exc):
     return report
 
 
-def poll_report(replies, duration, elapsed):
+def poll_report(replies, sends, drops, duration, elapsed):
     def cadence(values):
         if len(values) < 2 or values[-1] <= values[0]:
             return None
@@ -404,9 +419,10 @@ def poll_report(replies, duration, elapsed):
     sources = [status for status in statuses if status.source_valid]
     samples = {(status.boot, status.epoch, status.sample_sequence) for status in sources}
     latencies = [1000 * (reply.received_at - reply.sent_at) for reply in replies]
-    send_gaps = [1000 * (new.sent_at - old.sent_at) for old, new in zip(replies, replies[1:])]
+    send_gaps = [1000 * (new - old) for old, new in zip(sends, sends[1:])]
     return dict(duration_requested_s=duration, elapsed_s=elapsed, target_hz=1 / PERIOD_S,
-                acknowledged_queries=len(replies), send_rate_hz=cadence([reply.sent_at for reply in replies]),
+                query_attempts=len(sends), acknowledged_queries=len(replies), dropped_queries=drops,
+                send_rate_hz=cadence(sends),
                 reply_rate_hz=cadence([reply.received_at for reply in replies]),
                 max_send_gap_ms=max(send_gaps, default=None),
                 reply_latency_ms=dict(median=statistics.median(latencies) if latencies else None,
@@ -488,12 +504,14 @@ def main(argv=None):
                     reply = master.start(args.task_id)
                 else:
                     reply = master.query()
-                report.update(success=True, reply=asdict(reply))
+                    report['sample_dropped'] = reply is None
+                report.update(success=True, reply=asdict(reply) if reply is not None else None)
     except (ImportError, OSError, ValueError, KeyError, TypeError, LinkError) as exc:
         report.update(success=False, error=error_record(exc))
     if master is not None:
         report.update(transmit_attempts=master.sent, parser_errors=dict(master.parser.errors),
-                      ignored_replies=dict(master.ignored), owner_poisoned=master.failed)
+                      ignored_replies=dict(master.ignored), owner_poisoned=master.failed,
+                      dropped_queries=master.dropped_queries)
     print(json.dumps(report, indent=2, allow_nan=False))
     return 0 if report['success'] else 2
 

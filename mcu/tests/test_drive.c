@@ -6,7 +6,7 @@
 
 typedef struct {
   Drive d;uint32_t now,status,guard,target,bus_error,delay,decel_until;
-  uint32_t speed,current,positions[2],pole_override;
+  uint32_t speed,current,positions[2],pole_override,max_speed,max_speed_reads,max_speed_writes;
   uint32_t sends,target_writes,zero_writes,speed_reads,max_speed_gap,last_speed_sample;
   uint8_t request[8];bool waiting,drop_all,drop_next,force_speed,send_fail,fifo_blocked;
   uint32_t sent_at;MQSample samples[2000];unsigned sample_count;
@@ -39,7 +39,7 @@ static uint32_t read_value(Peer *p,uint16_t index,uint8_t sub,unsigned *bytes){
   case 0x2034:*bytes=2;return 1;
   case 0x6083:case 0x6084:return 100;
   case 0x2014:case 0x2015:*bytes=2;return 30;
-  case 0x2008:*bytes=2;return 10;
+  case 0x2008:*bytes=2;p->max_speed_reads++;return p->max_speed;
   case 0x2000:*bytes=2;return p->guard;
   case 0x6064:return p->positions[sub-1];
   case 0x6077:return p->current;
@@ -58,6 +58,7 @@ static void respond(Peer *p){
       else p->status=value==7u?3u:value==15u?7u:0u;
     }
     if(index==0x2000)p->guard=value;
+    if(index==0x2008){p->max_speed=value;p->max_speed_writes++;}
   }else{
     unsigned bytes;uint32_t value=read_value(p,index,sub,&bytes);b[0]=(uint8_t)(0x43u|((4u-bytes)<<2));
     for(unsigned i=0;i<4;i++)b[4+i]=(uint8_t)(value>>(i*8));
@@ -74,7 +75,7 @@ static void tick(Peer *p){
 }
 static void run(Peer *p,unsigned ms){for(unsigned i=0;i<ms;i++)tick(p);}
 static void init(Peer *p){
-  memset(p,0,sizeof(*p));p->delay=1;p->guard=500;p->now=1;
+  memset(p,0,sizeof(*p));p->delay=1;p->guard=500;p->max_speed=87;p->now=1;
   static const DriveBusOps ops={send,ready,errors};drive_init(&p->d,&ops,p,p->now);
 }
 static void boot(Peer *p){init(p);run(p,350);assert(p->d.view.state==MQ_DRIVE_STOPPED);assert(p->d.view.stop_verified&&p->d.view.guard_valid);}
@@ -114,10 +115,16 @@ static void test_bad_config_timeout_and_late_reply(void){
   uint32_t sends=p.sends;run(&p,500);assert(p.sends==sends);
   puts("PASS drive wrong-index reply, CAN timeout, invalid preflight and bounded failed-STOP silence");
 }
-static void test_boot_guard_and_invalid_target(void){
+static void test_boot_guard_and_target_encoding(void){
   Peer p;init(&p);p.guard=0;run(&p,350);assert(p.guard==500&&p.d.view.guard_valid&&p.d.view.stop_verified);
-  armed(&p);assert(!drive_ops()->target(&p.d,6,0,p.now));assert(p.d.view.error==DRIVE_ERR_LIMIT);
-  puts("PASS drive boot watchdog config readback and target limit");
+  armed(&p);assert(p.max_speed_reads==2&&!p.max_speed_writes&&p.max_speed==87);
+  /* Feedback is independent of the requested value or the driver's SDO ACK. */
+  p.force_speed=true;p.speed=0;
+  uint32_t generation=drive_ops()->target(&p.d,6,-17,p.now);assert(generation);
+  run(&p,60);assert(p.target==0xffef0006u&&p.d.view.applied_generation==generation&&!p.d.view.error);
+  generation=drive_ops()->target(&p.d,INT16_MAX,INT16_MIN,p.now);assert(generation);
+  run(&p,60);assert(p.target==0x80007fffu&&p.d.view.applied_generation==generation&&!p.d.view.error);
+  puts("PASS drive watchdog, read-only max speed and exact signed I16 target packing");
 }
 static void test_original_completion_clock(void){
   Peer p;armed(&p);
@@ -157,7 +164,7 @@ static void test_unavailable_tx_is_bounded(void){
   puts("PASS drive unavailable CAN TX cannot leave boot STOP pending indefinitely");
 }
 int main(void){
-  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_boundaries_and_fault_latches();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_invalid_target();
+  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_boundaries_and_fault_latches();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
   puts("PASS all production drive C tests (memory-only CAN peer)");return 0;
 }

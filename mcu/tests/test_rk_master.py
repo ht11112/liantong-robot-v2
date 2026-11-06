@@ -215,50 +215,98 @@ class MasterTests(unittest.TestCase):
                     master.discover()
                 self.assertEqual(len(port.writes), 1)
 
-    def test_regular_query_retries_same_request_after_a_lost_or_delayed_exchange(self):
-        for loss in ('request', 'reply', 'delayed_reply'):
+    def test_regular_query_drops_loss_crc_wrong_ack_and_late_reply_without_retry(self):
+        for loss in ('missing', 'bad_crc', 'wrong_ack', 'late'):
             with self.subTest(loss=loss):
-                accepted = []
-
                 def response(index, kind, request, task):
                     if index == 0:
                         return [(.014, telemetry(accepted_request_watermark=31))]
-                    if index == 1 and loss == 'request':
-                        return []
-                    if not accepted or accepted[-1] != request:
-                        accepted.append(request)
-                    if (index == 1 and loss == 'reply') or (index == 2 and loss == 'delayed_reply'):
-                        return []
-                    delay = .115 if index == 1 else .014
-                    return [(delay, telemetry(publication_sequence=index + 1,
-                                              publication_tick_ms=1000 + 20 * index,
-                                              ack_request=request, accepted_request_watermark=request))]
+                    ack = request + 3 if index == 1 and loss == 'wrong_ack' else request
+                    raw = telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
+                                    ack_request=ack, accepted_request_watermark=ack)
+                    if index == 1:
+                        if loss == 'missing':
+                            return []
+                        if loss == 'bad_crc':
+                            raw = raw[:-1] + bytes((raw[-1] ^ 1,))
+                        if loss == 'late':
+                            return [(.105, raw)]
+                    return [(.014, raw)]
 
                 master, port = self.make_master(response)
-                master.discover()
+                discovered = master.discover()
+                self.assertIsNone(master.query())
+                self.assertIs(master.latest, discovered)
+                self.assertEqual(len(port.writes), 2)
+                self.assertEqual(master.dropped_queries, 1)
                 reply = master.query()
-                self.assertEqual(reply.request, 32)
-                self.assertEqual(reply.sent_at, port.writes[1][0])
-                self.assertEqual(port.writes[2][1], port.writes[1][1])
-                self.assertGreater(reply.received_at, port.writes[2][0])
-                self.assertEqual(master.query_retries, 1)
-                self.assertEqual(master.last_query_retry['details']['request'], 32)
+                self.assertEqual(reply.request, 33)
+                self.assertEqual(reply.sent_at, port.writes[2][0])
+                self.assertEqual(struct.unpack_from('<I', port.writes[1][1], 18)[0], 32)
+                self.assertEqual(master.parser.errors['crc_errors'], int(loss == 'bad_crc'))
+                self.assertEqual(master.ignored['unmatched_ack'], int(loss in ('wrong_ack', 'late')))
                 self.assertFalse(master.failed)
-                self.assertEqual(master.query().request, 33)
-                self.assertEqual(accepted, [32, 33])
 
-    def test_two_regular_query_timeouts_close_the_owner(self):
+    def test_repeated_query_drops_keep_owner_open_and_advance_request(self):
         master, port = self.make_master(lambda index, *unused: [(.014, telemetry())] if not index else [])
+        discovery = master.discover()
+        for _ in range(3):
+            self.assertIsNone(master.query())
+        self.assertEqual(master.dropped_queries, 3)
+        self.assertFalse(master.failed)
+        self.assertIs(master.latest, discovery)
+        self.assertEqual([struct.unpack_from('<I', packet, 18)[0] for _, packet in port.writes], [0, 1, 2, 3])
+
+    def test_mutating_request_skips_dropped_query_id_and_wraps(self):
+        def response(index, kind, request, task):
+            ready = index < 2
+            raw = telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
+                            accepted_request_watermark=0xFFFFFFFE if index == 0 else request,
+                            ack_request=request, task=TASK, state=v11.READY if ready else 3,
+                            flags=v11.ACK_VALID | 3 | v11.COMMITTED | (0 if ready else v11.STARTED))
+            return [(.105 if index == 1 else .014, raw)]
+
+        master, port = self.make_master(response)
         master.discover()
-        with self.assertRaises(v11.ReplyTimeout) as timed_out:
+        self.assertIsNone(master.query())
+        ack = master.start(TASK)
+        self.assertEqual(ack.request, 1)
+        self.assertEqual(master.ignored['unmatched_ack'], 1)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.QUERY, v11.START])
+        self.assertEqual([struct.unpack_from('<I', packet, 18)[0] for _, packet in port.writes], [0, 0xFFFFFFFF, 1])
+
+    def test_explicit_reject_can_report_a_dropped_query_watermark(self):
+        def response(index, kind, request, task):
+            if index in (1, 2):
+                return []
+            rejected = index == 3
+            return [(.014, telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
+                                     accepted_request_watermark=1 if rejected else request,
+                                     ack_request=request, ack_result=4 if rejected else 0))]
+
+        master, port = self.make_master(response)
+        master.discover()
+        self.assertIsNone(master.query())
+        self.assertIsNone(master.query())
+        with self.assertRaises(v11.Rejected):
             master.query()
-        details = timed_out.exception.details
-        self.assertEqual(details['request'], details['first_query_attempt']['details']['request'])
-        self.assertEqual(master.query_retries, 1)
-        self.assertTrue(master.failed)
-        with self.assertRaises(v11.LinkError):
-            master.query()
-        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.QUERY, v11.QUERY])
+        self.assertFalse(master.failed)
+        self.assertEqual(master.query().request, 3)
+        self.assertEqual([struct.unpack_from('<I', packet, 18)[0] for _, packet in port.writes], [0, 1, 2, 3, 3])
+
+    def test_poll_counts_actual_attempts_and_drops_and_continues(self):
+        master, port = self.make_master()
+        response = port.response
+        port.response = lambda index, *args: [] if index in (1, 4) else response(index, *args)
+        master.discover()
+        report = master.poll(.3)
+        self.assertTrue(report['success'])
+        self.assertIsNone(report['error'])
+        self.assertEqual(report['dropped_queries'], 2)
+        self.assertEqual(report['query_attempts'], len(port.writes) - 1)
+        self.assertEqual(report['acknowledged_queries'], report['query_attempts'] - 2)
+        self.assertEqual(report['first_reply']['request'], 2)
+        self.assertAlmostEqual(report['max_send_gap_ms'], 100.)
 
     def test_short_regular_query_write_closes_without_retry(self):
         master, port = self.make_master()
@@ -267,7 +315,7 @@ class MasterTests(unittest.TestCase):
         with self.assertRaisesRegex(v11.LinkError, 'Partial serial write'):
             master.query()
         self.assertEqual(len(port.writes), 2)
-        self.assertEqual(master.query_retries, 0)
+        self.assertEqual(master.dropped_queries, 0)
         self.assertTrue(master.failed)
 
     def test_start_and_stop_timeouts_close_without_retry(self):
@@ -282,7 +330,7 @@ class MasterTests(unittest.TestCase):
                     else:
                         master.stop()
                 self.assertTrue(master.failed)
-                self.assertEqual(master.query_retries, 0)
+                self.assertEqual(master.dropped_queries, 0)
                 self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, opcode])
 
     def test_stale_ack_is_ignored_but_boot_change_poisoned(self):
@@ -302,6 +350,25 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(changed.exception.exchange.status.boot, BOOT + 1)
         self.assertTrue(master.failed)
         self.assertEqual(len(port.writes), 2)
+
+    def test_unmatched_old_identity_is_ignored_during_ordinary_query(self):
+        def response(index, kind, request, task):
+            if index == 0:
+                return [(.014, telemetry())]
+            status = dict(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index)
+            if index == 1:
+                return [(.014, telemetry(boot=BOOT - 1, ack_request=request + 1, **status)),
+                        (.016, telemetry(epoch=6, ack_request=request + 1, **status))]
+            return [(.014, telemetry(ack_request=request, accepted_request_watermark=request, **status))]
+
+        master, port = self.make_master(response)
+        original = master.discover()
+        self.assertIsNone(master.query())
+        self.assertIs(master.latest, original)
+        self.assertEqual(master.ignored['unmatched_ack'], 2)
+        self.assertFalse(master.failed)
+        self.assertEqual(master.query().request, 2)
+        self.assertEqual(len(port.writes), 3)
 
     def test_rejected_reply_keeps_raw_ack_and_uses_watermark(self):
         def response(index, kind, request, task):
@@ -434,6 +501,18 @@ class MasterTests(unittest.TestCase):
             with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 v11.main(['start', '--execute', '--port', '/dev/ttyUSB0'])
         opening.assert_not_called()
+
+    def test_cli_reports_dropped_query_without_reusing_discovery_sample(self):
+        master, _ = self.make_master(lambda index, *unused: [(.014, telemetry())] if not index else [])
+        with patch.object(v11, 'open_port'), patch.object(v11, 'RkMaster', return_value=master):
+            with redirect_stdout(StringIO()) as stream:
+                self.assertEqual(v11.main(['query', '--execute', '--port', '/dev/ttyUSB0']), 0)
+        report = json.loads(stream.getvalue())
+        self.assertTrue(report['success'])
+        self.assertTrue(report['sample_dropped'])
+        self.assertIsNone(report['reply'])
+        self.assertEqual(report['dropped_queries'], 1)
+        self.assertFalse(report['owner_poisoned'])
 
 
 if __name__ == '__main__':

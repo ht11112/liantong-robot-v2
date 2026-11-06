@@ -116,10 +116,10 @@ class Navigation:
             if distinct:
                 self.source = key
                 self.source_time = exchange.sent_at - (sample.source_age_ms + 1) / 1000
-            if not self._fresh():
+            if not sample.source_valid:
                 if self.alignment is not None:
                     self._invalidate('里程计失效，请重新定位')
-            elif distinct:
+            elif distinct and self._fresh():
                 pose = self._map_pose()
                 if pose is not None and (not self.trail or pose != self.trail[-1]):
                     self.trail.append(pose)
@@ -267,15 +267,9 @@ class Navigation:
                         elif plan is not None:
                             self._upload(master, plan)
                         else:
-                            retries = master.query_retries
                             reply = master.query()
-                            self.observe(reply)
-                            if master.query_retries != retries:
-                                print(json.dumps(dict(event='v11_query_recovered',
-                                                      task=reply.status.task, request=reply.request,
-                                                      first_attempt=master.last_query_retry,
-                                                      parser_errors=dict(master.parser.errors),
-                                                      ignored_replies=dict(master.ignored))), flush=True)
+                            if reply is not None:
+                                self.observe(reply)
                         if master.failed:
                             raise LinkError(self.error or 'V11 会话已失效')
                     except (ValueError, LinkError) as exc:
@@ -311,17 +305,17 @@ class Navigation:
             status = self.latest.status if self.latest else None
             pose = self._map_pose()
             fresh = self._fresh()
-            if self.alignment is not None and not fresh:
-                self._invalidate('里程计已过期，请重新定位')
+            status_fresh = (self.connected and self.latest is not None
+                            and 0 <= self.clock() - self.latest.sent_at < SOURCE_MAX_AGE_S)
             preparing = not self.work and not self.stop_requested and self._stationary()
             task = dict(id=str(status.task) if status else None,
                         phase=(self.work if self.work in ('uploading', 'starting', 'stopping')
-                               else PHASES[status.state] if self.connected and status else 'unknown'),
+                               else PHASES[status.state] if status_fresh else 'unknown'),
                         index=status.index if status else 0, count=status.count if status else 0,
                         progress=status.progress if status else 0,
-                        arrival=bool(self.connected and status and status.flags & 8),
+                        arrival=bool(status_fresh and status.flags & 8),
                         stop_ack=self.stop_ack,
-                        stop_verified=(None if not self.connected or
+                        stop_verified=(None if not status_fresh or
                                        (self.stop_requested and self.stop_ack is None) else
                                        self.stop_verified if self.stop_ack is not None else
                                        bool(status.flags & STOP_CONFIRMED) if fresh and status else None),

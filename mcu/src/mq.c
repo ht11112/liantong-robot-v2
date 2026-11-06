@@ -2,12 +2,19 @@
 #include <math.h>
 #include <string.h>
 
-/* Build-time commissioning choice only. Keep the drive's existing ±5 RPM cap. */
 #ifndef MQ_MOVE_CRUISE_RPM
 #define MQ_MOVE_CRUISE_RPM 2
 #endif
-#if MQ_MOVE_CRUISE_RPM < 1 || MQ_MOVE_CRUISE_RPM > 5
-#error "MOVE cruise must be an integer from 1 to 5 RPM"
+#ifndef MQ_MOVE_NEAR_RPM
+#define MQ_MOVE_NEAR_RPM 1
+#endif
+#ifndef MQ_TURN_RPM
+#define MQ_TURN_RPM 1
+#endif
+#if MQ_MOVE_CRUISE_RPM < 0 || MQ_MOVE_CRUISE_RPM > INT16_MAX || \
+    MQ_MOVE_NEAR_RPM < 0 || MQ_MOVE_NEAR_RPM > INT16_MAX || \
+    MQ_TURN_RPM < 0 || MQ_TURN_RPM > INT16_MAX
+#error "Wheel RPM magnitudes must be integers from 0 to INT16_MAX"
 #endif
 
 static bool after(uint32_t a,uint32_t b) { return (int32_t)(a-b)>0; }
@@ -233,8 +240,10 @@ void mq_tick(MQ *q,uint32_t now) {
     return;
   }
   if(s.kind==MQ_KIND_MOVE) {
-    int16_t rpm=remaining<=.30f?1:MQ_MOVE_CRUISE_RPM;request_target(q,rpm,(int16_t)-rpm,now);
+    int16_t rpm=remaining<=.30f?MQ_MOVE_NEAR_RPM:MQ_MOVE_CRUISE_RPM;
+    request_target(q,rpm,(int16_t)-rpm,now);
   } else {
-    int16_t rpm=s.value>0.f?-1:1;request_target(q,rpm,rpm,now);
+    int16_t rpm=s.value>0.f?-MQ_TURN_RPM:MQ_TURN_RPM;
+    request_target(q,rpm,rpm,now);
   }
 }
