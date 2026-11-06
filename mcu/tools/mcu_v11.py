@@ -200,8 +200,7 @@ class RkMaster:
         self.ignored = Counter(unmatched_ack=0, stale_reply=0)
         self.failed = False
 
-    def _exchange(self, kind, *, task=0, extra=b'', discover=False, start_before=None, reply_by=None,
-                  drop_missing=False):
+    def _exchange(self, kind, *, task=0, extra=b'', discover=False, start_before=None, drop_missing=False):
         if self.failed:
             raise LinkError('Owner closed to new requests after an uncertain transaction')
         previous = self.latest.status if self.latest else None
@@ -234,8 +233,6 @@ class RkMaster:
         self.last_sent, self.sent = sent_at, self.sent + 1
         details = dict(opcode=kind, request=request, request_hex=packet.hex(), sent_at=sent_at)
         deadline = sent_at + self.reply_timeout
-        if reply_by is not None:
-            deadline = min(deadline, reply_by)
         exchange = None
         try:
             written = self.port.write(packet)
@@ -351,13 +348,18 @@ class RkMaster:
             if on_reply is not None:
                 on_reply(ack)
             deadline = self.clock() + proof_timeout
+            # Each proof query needs its full response window, including after cadence sleep.
+            start_before = deadline - self.reply_timeout
             while self.clock() < deadline:
+                previous_sends = self.sent
                 try:
-                    reply = self._exchange(QUERY, start_before=deadline, reply_by=deadline)
+                    reply = self._exchange(QUERY, start_before=start_before, drop_missing=True)
                 except LinkError as exc:
                     return dict(ack=asdict(ack), stop_verified=False, error=error_record(exc))
                 if reply is None:
-                    break
+                    if self.sent == previous_sends:
+                        break
+                    continue
                 if on_reply is not None:
                     on_reply(reply)
                 value, before = reply.status, ack.status
@@ -367,7 +369,8 @@ class RkMaster:
                         and forward(value.measurement_tick_ms, before.publication_tick_ms)
                         and max(abs(value.left_tenths_rpm), abs(value.right_tenths_rpm)) <= 2):
                     return dict(ack=asdict(ack), stop_verified=True, proof=asdict(reply))
-            return dict(ack=asdict(ack), stop_verified=False, error={'message': 'No fresh measured stop proof before deadline'})
+            return dict(ack=asdict(ack), stop_verified=False,
+                        error=dict(code='stop_proof_deadline', message='No fresh measured stop proof before deadline'))
 
     def poll(self, duration):
         if not math.isfinite(duration) or duration <= 0:

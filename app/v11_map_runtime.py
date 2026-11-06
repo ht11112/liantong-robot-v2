@@ -243,12 +243,17 @@ class Navigation:
 
     def _stop(self, master):
         result = master.stop(on_reply=self.observe)
+        error = result.get('error', {})
         with self.lock:
             self.stop_evidence = result
             self.stop_ack = True
             self.stop_verified = result['stop_verified']
-            self.error = (None if result['stop_verified']
-                          else result.get('error', {}).get('message', '停车未确认'))
+            if result['stop_verified']:
+                self.error = None
+            elif error.get('code') == 'stop_proof_deadline':
+                self.error = '停稳确认到期，仍在更新底盘状态'
+            else:
+                self.error = error.get('message', '停车未确认')
 
     def run(self, device, closed):
         try:

@@ -482,17 +482,47 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(result['proof']['status']['sample_sequence'], 11)
         self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STOP, v11.QUERY, v11.QUERY])
 
-    def test_stop_ack_preserved_when_later_proof_times_out(self):
+    def test_stop_proof_skips_final_query_and_leaves_owner_usable(self):
         master, port = self.make_master()
-        response = port.response
-        port.response = lambda index, *args: response(index, *args) if index <= 1 else []
         master.discover()
-        result = master.stop(proof_timeout=.055)
+        result = master.stop(proof_timeout=.125)
         self.assertFalse(result['stop_verified'])
         self.assertEqual(result['ack']['opcode'], v11.STOP)
         self.assertEqual(result['ack']['status']['ack_result'], 0)
-        self.assertTrue(master.failed)
+        self.assertEqual(result['error']['code'], 'stop_proof_deadline')
+        self.assertFalse(master.failed)
         self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STOP, v11.QUERY])
+        self.assertEqual(master.query().request, 3)
+
+    def test_stop_proof_rechecks_full_reply_window_after_cadence_sleep(self):
+        master, port = self.make_master()
+        master.discover()
+        sleep = master.sleep
+
+        def oversleep_after_stop_ack(reply):
+            self.assertEqual(reply.opcode, v11.STOP)
+            master.sleep = lambda seconds: sleep(seconds + .010)
+
+        result = master.stop(proof_timeout=.110, on_reply=oversleep_after_stop_ack)
+        self.assertFalse(result['stop_verified'])
+        self.assertEqual(result['error']['code'], 'stop_proof_deadline')
+        self.assertFalse(master.failed)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STOP])
+
+    def test_stop_proof_missing_query_does_not_poison_owner(self):
+        master, port = self.make_master()
+        response = port.response
+        port.response = lambda index, *args: [] if index == 2 else response(index, *args)
+        master.discover()
+        result = master.stop(proof_timeout=.225)
+        self.assertFalse(result['stop_verified'])
+        self.assertEqual(result['ack']['opcode'], v11.STOP)
+        self.assertEqual(result['error']['code'], 'stop_proof_deadline')
+        self.assertFalse(master.failed)
+        self.assertEqual(master.dropped_queries, 1)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STOP, v11.QUERY, v11.QUERY])
+        self.assertEqual([struct.unpack_from('<I', packet, 18)[0] for _, packet in port.writes], [0, 1, 2, 3])
+        self.assertEqual(master.query().request, 4)
 
     def test_cli_defaults_to_offline_and_requires_a_separate_start_id(self):
         with patch.object(v11, 'open_port') as opening, redirect_stdout(StringIO()) as stream:
