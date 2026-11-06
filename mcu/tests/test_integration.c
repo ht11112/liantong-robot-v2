@@ -6,12 +6,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef MQ_MOVE_CRUISE_RPM
+#define MQ_MOVE_CRUISE_RPM 2
+#endif
+
 typedef struct {
   Drive d;MQ q;uint32_t now,reply_at,status,guard,fault,current;
   uint32_t target,position_left,position_right,limits[5],decel_until;
   uint8_t pending[8];bool waiting,drop_target_ack;
-  int16_t actual_left,actual_right;
-  unsigned sends,motion_writes,turn_writes,move_writes,zero_writes,stop_words;
+  int16_t actual_left,actual_right,max_move_rpm;
+  unsigned sends,motion_writes,turn_writes,move_writes,slow_move_writes,zero_writes,stop_words;
   uint32_t samples,last_sample,max_gap;
 } ClosedLoop;
 static ClosedLoop p;
@@ -57,7 +61,12 @@ static void apply_write(ClosedLoop *a,uint16_t index,uint8_t sub,uint32_t value)
     assert(l>=-5&&l<=5&&r>=-5&&r<=5);
     if(value){
       assert(a->status==7u);a->motion_writes++;
-      if(l==r)a->turn_writes++;else {assert(l>0&&r==-l);a->move_writes++;}
+      if(l==r){assert(l==1||l==-1);a->turn_writes++;}
+      else {
+        assert((l==1||l==MQ_MOVE_CRUISE_RPM)&&r==-l);a->move_writes++;
+        if(l==1)a->slow_move_writes++;
+        if(l>a->max_move_rpm)a->max_move_rpm=l;
+      }
       a->actual_left=(int16_t)(l*10);a->actual_right=(int16_t)(r*10);
     }else {a->zero_writes++;if(previous)a->decel_until=a->now+120u;}
   }else if(index==0x6040){
@@ -118,10 +127,12 @@ static void closed_queue(float angle){
   assert(p.q.state==MQ_COMPLETE && p.q.arrival_reached && p.q.physical_stop_confirmed);
   assert(!p.q.first_error&&!p.d.view.error&&p.d.view.stop_verified&&p.q.odom.valid);
   assert(p.move_writes>50u&&p.turn_writes>50u&&p.samples>1000u&&p.max_gap<=55u);
+  assert(p.max_move_rpm==MQ_MOVE_CRUISE_RPM&&p.slow_move_writes>0u);
   assert(p.q.odom.travel>.85f&&p.q.odom.travel<1.1f);
   assert(angle>0.f?p.q.odom.y>.3f:p.q.odom.y<-.3f);
   assert(p.q.odom.yaw_total*angle>0.f && p.now-p.q.started_ms>500u);
   printf("PASS integration real Drive+MQ MOVE .5 / TURN %s90 / MOVE .5, offline %u ms, %u sources, max gap %u ms\n",angle>0.f?"+":"-",(unsigned)(p.now-p.q.started_ms),(unsigned)p.samples,(unsigned)p.max_gap);
+  printf("PASS integration CAN MOVE cruise %d RPM, near-end MOVE and TURN 1 RPM\n",p.max_move_rpm);
 }
 static void cancellation(void){
   boot();MQSegment s={MQ_KIND_MOVE,.5f};upload_start(&s,1);to_moving();mq_stop(&p.q,p.now);

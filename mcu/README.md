@@ -29,6 +29,8 @@ python -B mcu/build.py --host-tests --name v11-host-check
 python -B mcu/build.py --firmware --name v11-production
 ```
 
+临时试车需要 5 RPM 直行巡航时，运行 `python -B mcu/build.py --host-tests --firmware --move-cruise-rpm 5 --name v11-move5`。仅直行剩余超过 30 cm 时使用该给定，按名义轮径约为 0.052 m/s。常规构建默认 2 RPM。
+
 输出目录必须是新名字，结果在`build/名字/`，含测试日志或生产`mcu-v11.bin`、`.elf`、`.map`及SHA/内存报告`receipt.json`。构建脚本没有连接设备、烧录或启动功能。32KB超限即失败，不扩大应用区。
 
 Linux主机测试使用`cc/gcc/clang`；Windows默认使用本机Unity的Emscripten/Node，路径可由`--emscripten`指定。生产构建使用STM32CubeG4 1.6.3及ARM GCC，路径通过`--sdk`、`--compiler-dir`指定；保持Cortex-M4、16MHz HSI、soft-float，与原硬件引脚及CAN500kbit/s配置一致。SDK不复制入仓库，构建报告记录实际SDK源与工具SHA。

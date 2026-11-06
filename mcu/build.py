@@ -36,11 +36,16 @@ def run(command, destination, env=None):
     return r.stdout+r.stderr
 
 
+def cruise_flags(rpm):
+    # Omit the override for the default build to preserve the released binary.
+    return [] if rpm == 2 else ['-DMQ_MOVE_CRUISE_RPM='+str(rpm)]
+
+
 def host_tests(args, out):
     sources = [ROOT/'src'/n for n in ('mq.c', 'drive.c', 'wire.c') if (ROOT/'src'/n).is_file()]
     native = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     common = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-DMQ_HOST_TEST=1',
-              '-I'+str(ROOT/'include'), '-I'+str(ROOT/'tests')]
+              '-I'+str(ROOT/'include'), '-I'+str(ROOT/'tests')]+cruise_flags(args.move_cruise_rpm)
     env = dict(os.environ)
     if native:
         compiler = [native]
@@ -96,7 +101,7 @@ def firmware(args, out):
              '-ffunction-sections', '-fdata-sections', '-Wall', '-Wextra', '-Werror',
              '-DMQ_PRODUCTION=1', '-DSTM32G474xx', '-DUSE_HAL_DRIVER',
              '-DUSER_VECT_TAB_ADDRESS', '-I'+str(ROOT/'include'), '-I'+str(hal/'Inc'),
-             '-I'+str(device/'Include'), '-I'+str(cmsis/'Include')]
+             '-I'+str(device/'Include'), '-I'+str(cmsis/'Include')]+cruise_flags(args.move_cruise_rpm)
     objects = []
     for source in sources:
         if not source.is_file():
@@ -141,6 +146,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host-tests', action='store_true')
     parser.add_argument('--firmware', action='store_true')
+    parser.add_argument('--move-cruise-rpm', type=int, choices=range(1, 6), default=2,
+                        help='MOVE command above 0.30 m remaining (default: 2 RPM)')
     parser.add_argument('--name', default='mcu-v11-offline')
     parser.add_argument('--emscripten', type=Path, default=UNITY)
     parser.add_argument('--sdk', type=Path, default=SDK)
@@ -154,7 +161,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     report = dict(status='OFFLINE_ONLY_NOT_FLASHED', hardware_accessed=False,
-                  flashed=False, source_sha256=identities())
+                  flashed=False, move_cruise_rpm=args.move_cruise_rpm, source_sha256=identities())
     try:
         if args.host_tests:
             report['tests'] = host_tests(args, out)

@@ -2,6 +2,14 @@
 #include <math.h>
 #include <string.h>
 
+/* Build-time commissioning choice only. Keep the drive's existing ±5 RPM cap. */
+#ifndef MQ_MOVE_CRUISE_RPM
+#define MQ_MOVE_CRUISE_RPM 2
+#endif
+#if MQ_MOVE_CRUISE_RPM < 1 || MQ_MOVE_CRUISE_RPM > 5
+#error "MOVE cruise must be an integer from 1 to 5 RPM"
+#endif
+
 static bool after(uint32_t a,uint32_t b) { return (int32_t)(a-b)>0; }
 static float absf(float a) { return a<0.f?-a:a; }
 static float wrap(float a) { return atan2f(sinf(a),cosf(a)); }
@@ -225,7 +233,7 @@ void mq_tick(MQ *q,uint32_t now) {
     return;
   }
   if(s.kind==MQ_KIND_MOVE) {
-    int16_t rpm=remaining<=.30f?1:2;request_target(q,rpm,(int16_t)-rpm,now);
+    int16_t rpm=remaining<=.30f?1:MQ_MOVE_CRUISE_RPM;request_target(q,rpm,(int16_t)-rpm,now);
   } else {
     int16_t rpm=s.value>0.f?-1:1;request_target(q,rpm,rpm,now);
   }
