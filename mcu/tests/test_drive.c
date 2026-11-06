@@ -7,7 +7,7 @@
 typedef struct {
   Drive d;uint32_t now,status,guard,target,bus_error,delay,decel_until;
   uint32_t speed,current,positions[2],pole_override,max_speed,max_speed_reads,max_speed_writes;
-  uint32_t sends,target_writes,zero_writes,speed_reads,max_speed_gap,last_speed_sample;
+  uint32_t sends,target_writes,zero_writes,fallback_writes,speed_reads,max_speed_gap,last_speed_sample;
   uint8_t request[8];bool waiting,drop_all,drop_next,force_speed,send_fail,fifo_blocked;
   uint32_t sent_at;MQSample samples[2000];unsigned sample_count;
 } Peer;
@@ -54,6 +54,7 @@ static void respond(Peer *p){
     uint32_t value=u32(q+4);b[0]=0x60;
     if(index==0x60ff){p->target=value;p->target_writes++;if(!value)p->zero_writes++;}
     if(index==0x6040){
+      if(value==2u)p->fallback_writes++;
       if(value==6u){p->status=1;p->decel_until=p->now+150;}
       else p->status=value==7u?3u:value==15u?7u:0u;
     }
@@ -93,13 +94,27 @@ static void test_stop_sampling_and_inflight(void){
   assert(p.d.view.stop_verified&&p.d.view.state==MQ_DRIVE_STOPPED);assert(p.zero_writes>z);assert(p.sample_count>before+5);assert(p.max_speed_gap<=65);
   puts("PASS drive STOP keeps fresh speed samples and cannot consume old target ACK as flow ACK");
 }
-static void test_boundaries_and_fault_latches(void){
-  Peer p;armed(&p);p.force_speed=true;p.speed=150u|((uint32_t)(uint16_t)-150<<16);run(&p,60);assert(!p.d.view.error);
-  p.speed=151u;run(&p,60);assert(p.d.view.error==DRIVE_ERR_LIMIT);run(&p,800);assert(!p.d.view.stop_verified&&p.d.tx_suppressed);
-  boot(&p);drive_uart_fault(&p.d,p.now);run(&p,300);assert(p.d.view.error==DRIVE_ERR_UART);assert(p.d.view.stop_verified);
+static void test_speed_feedback_and_failed_stop(void){
+  Peer p;armed(&p);p.force_speed=true;p.speed=151u|((uint32_t)(uint16_t)-173<<16);
+  unsigned sample_count=p.sample_count;
+  uint32_t generation=drive_ops()->target(&p.d,20,-20,p.now);assert(generation);
+  run(&p,150);
+  assert(p.d.view.state==MQ_DRIVE_ENABLED&&!p.d.view.error&&p.d.view.applied_generation==generation);
+  assert(p.sample_count>sample_count);
+  const MQSample *sample=&p.samples[p.sample_count-1];
+  assert(sample->valid&&sample->left_tenths_rpm==151&&sample->right_tenths_rpm==-173);
+  drive_ops()->stop(&p.d,p.now);run(&p,800);
+  assert(p.d.zero_ok&&p.d.shutdown_ok&&p.d.disable_ok&&!p.d.stationary_ok);
+  assert(p.d.view.state==MQ_DRIVE_FAILED&&p.d.view.error==DRIVE_ERR_STOP);
+  assert(!p.d.view.stop_verified&&p.d.tx_suppressed&&p.target==0&&p.fallback_writes==1&&p.guard==500);
+  uint32_t sends=p.sends;run(&p,501);assert(p.sends==sends);
+  puts("PASS drive accepts feedback above 15 RPM and explicit STOP still needs zero feedback or falls back to watchdog silence");
+}
+static void test_uart_fault_latch(void){
+  Peer p;boot(&p);drive_uart_fault(&p.d,p.now);run(&p,300);assert(p.d.view.error==DRIVE_ERR_UART);assert(p.d.view.stop_verified);
   drive_ops()->stop(&p.d,p.now);run(&p,300);drive_ops()->arm(&p.d,p.now);run(&p,100);
   assert(p.d.view.error==DRIVE_ERR_UART&&p.d.view.state==MQ_DRIVE_FAILED);
-  puts("PASS drive overspeed boundary, failed STOP silence and UART first cause survive STOP/new ARM");
+  puts("PASS drive UART first cause survives STOP and new ARM");
 }
 static void test_current_bus_guard(void){
   Peer p;armed(&p);p.current=40;run(&p,100);assert(!p.d.view.error);p.current=41;run(&p,100);assert(p.d.view.error==DRIVE_ERR_CAN);
@@ -164,7 +179,7 @@ static void test_unavailable_tx_is_bounded(void){
   puts("PASS drive unavailable CAN TX cannot leave boot STOP pending indefinitely");
 }
 int main(void){
-  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_boundaries_and_fault_latches();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
+  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
   puts("PASS all production drive C tests (memory-only CAN peer)");return 0;
 }

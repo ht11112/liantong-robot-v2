@@ -32,6 +32,21 @@ static void exact_odom(void){
   assert(z.odom.travel>0.f); /* No hidden 0.2RPM odometry deadband. */
   puts("PASS exact straight integration and sub-threshold real RPM");
 }
+static void wheel_feedback_validity(void){
+  MQ q;Fake f;init(&q,&f);sample(&q,1,0,0,0);
+  MQSegment move={MQ_KIND_MOVE,1.f};
+  load(&q,&move,1,1);assert(mq_start(&q,1,0)==MQ_OK);
+  mq_tick(&q,1);
+  sample(&q,2,50,151,-175);
+  mq_tick(&q,50);
+  assert(q.odom.valid&&q.odom.sample_sequence==2&&q.odom.x>0.f);
+  assert(q.odom.left_tenths_rpm==151&&q.odom.right_tenths_rpm==-175);
+  assert(q.state==MQ_MOVE&&q.first_error==MQ_ERR_NONE&&!f.stops);
+  MQSample invalid={.sequence=3,.tick_ms=100,.left_tenths_rpm=151,.right_tenths_rpm=-175};
+  mq_sample(&q,&invalid);
+  assert(!q.odom.valid&&q.first_error==MQ_ERR_ODOM&&q.state==MQ_STOPPING&&f.stops==1);
+  puts("PASS valid feedback above 15 RPM integrates, invalid feedback stops the task");
+}
 static void multi_segment(void){
   MQ q;Fake f;init(&q,&f);sample(&q,1,0,0,0);
   MQSegment s[]={{MQ_KIND_MOVE,.40f},{MQ_KIND_TURN,MQ_PI/2.f},{MQ_KIND_MOVE,.40f}};
@@ -76,4 +91,4 @@ static void uart_fault_stays_latched(void){
   assert(mq_reset_odom(&q,1)==MQ_UNHEALTHY);
   puts("PASS critical UART fault survives physical STOP, new task and reset");
 }
-int main(void){exact_odom();multi_segment();crc_contract();uart_fault_stays_latched();return 0;}
+int main(void){exact_odom();wheel_feedback_validity();multi_segment();crc_contract();uart_fault_stays_latched();return 0;}

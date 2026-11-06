@@ -44,8 +44,7 @@ void mq_fault(MQ *q,uint32_t error,uint32_t now) {
 }
 void mq_sample(MQ *q,const MQSample *s) {
   MQOdom *o=&q->odom;
-  if(!s->valid || s->left_tenths_rpm < -150 || s->left_tenths_rpm > 150 ||
-     s->right_tenths_rpm < -150 || s->right_tenths_rpm > 150) {
+  if(!s->valid) {
     o->valid=false;o->discontinuities++;
     if(mq_is_executing(q))mq_fault(q,MQ_ERR_ODOM,s->tick_ms);
     return;

@@ -80,7 +80,6 @@ static void publish_speed(Drive *d,uint32_t value,uint32_t tick){
   if(d->sample_ready)d->sample_overruns++;
   d->sample=(MQSample){++d->sample_sequence,tick,(int16_t)value,(int16_t)(value>>16),d->position_left,d->position_right,fresh};
   d->sample_ready=true;
-  if(magnitude((int16_t)value)>150u||magnitude((int16_t)(value>>16))>150u)fault(d,DRIVE_ERR_LIMIT);
   if(d->flow==FLOW_STOP&&d->flow_step==2){
     if(!elapsed(d->now,tick,250)&&magnitude((int16_t)value)<=2u&&magnitude((int16_t)(value>>16))<=2u)d->zero_count++;
     else d->zero_count=0;
