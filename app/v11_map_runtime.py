@@ -25,6 +25,8 @@ RENEW_BEFORE_S = 5.
 REPLAN_INTERVAL_S = 1.
 MCU_CANCELLED = 1
 ARRIVAL_REACHED = 8
+POSE_DISTANCE_TOLERANCE_M = .02
+POSE_HEADING_TOLERANCE_RAD = math.radians(2.)
 
 
 def angle(value):
@@ -36,10 +38,11 @@ def pose_of(sample):
 
 
 def same_pose(current, reference):
-    # Allow float32 odometry round-off, including yaw wrapping at ±π.
-    return (current is not None
-            and math.hypot(current['x'] - reference['x'], current['y'] - reference['y']) <= 1e-6
-            and abs(angle(current['yaw'] - reference['yaw'])) <= 1e-5)
+    if current is None:
+        return False
+    distance = math.hypot(current['x'] - reference['x'], current['y'] - reference['y'])
+    heading = abs(angle(current['yaw'] - reference['yaw']))
+    return distance <= POSE_DISTANCE_TOLERANCE_M and heading <= POSE_HEADING_TOLERANCE_RAD
 
 
 def compose(first, second):
@@ -287,12 +290,12 @@ class Navigation:
             if self.mode == 'ready' or self.stop_requested:
                 return
             self._require_stationary()
-            if not same_pose(self._map_pose(), pose):
+            current_pose = self._map_pose()
+            if not same_pose(current_pose, pose):
                 raise ValueError('上传期间起点已变化，请重新预览')
-            if self.scanner is not None:
-                current_cells = self._upload_obstacles()
-                if current_cells != cells:
-                    self.grid.validate_plan(pose, plan, obstacle_cells=current_cells)
+            current_cells = self._upload_obstacles() if self.scanner is not None else cells
+            if current_pose != pose or current_cells != cells:
+                self.grid.validate_plan(current_pose, plan, obstacle_cells=current_cells)
             self.work = 'starting'
         started = master.start(reply.status.task)
         self.observe(started)

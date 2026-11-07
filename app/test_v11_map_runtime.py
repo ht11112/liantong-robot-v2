@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
-from v11_map_runtime import Navigation, load_map
+from v11_map_runtime import Navigation, load_map, same_pose
 from mcu_v11 import (ACK_VALID, EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RENEW, STOP_CONFIRMED,
                      Exchange, LinkError, QueuePlan, Telemetry)
 
@@ -183,10 +183,16 @@ class NavigationTest(unittest.TestCase):
         self.assertEqual(state['task']['phase'], 'unknown')
         self.assertEqual(state['error'], 'Serial exchange failed')
 
-    def test_manual_zero_accepts_wrapped_yaw_roundoff_but_not_motion(self):
+    def test_same_pose_checks_distance_and_wrapped_heading_at_the_boundary(self):
+        reference = dict(x=0., y=0., yaw=math.radians(179.))
+        self.assertTrue(same_pose(dict(x=.02, y=0., yaw=math.radians(-179.)), reference))
+        self.assertFalse(same_pose(dict(x=.015, y=.015, yaw=reference['yaw']), reference))
+        self.assertFalse(same_pose(dict(x=0., y=0., yaw=math.radians(-178.9)), reference))
+
+    def test_manual_zero_accepts_small_pose_changes_but_rejects_displacement_over_limit(self):
         seed = dict(x=1., y=1., yaw=0.)
         require_stationary = self.nav._require_stationary
-        for displacement in (0., .002):
+        for displacement, success in ((.019, True), (.021, False)):
             with self.subTest(displacement=displacement):
                 self.observe(x=0., yaw=math.pi - 1e-7)
 
@@ -196,20 +202,22 @@ class NavigationTest(unittest.TestCase):
                     return require_stationary()
 
                 with patch.object(self.nav, '_require_stationary', side_effect=new_sample):
-                    if displacement:
+                    if not success:
                         with self.assertRaisesRegex(ValueError, '置零期间车体位置发生变化'):
                             self.nav.align(seed, 'manual')
                     else:
                         self.nav.align(seed, 'manual')
                         self.assertEqual(self.nav.snapshot()['local_pose'], dict(x=0., y=0., yaw=0.))
 
-    def test_preview_accepts_roundoff_but_rejects_heading_change_during_planning(self):
+    def test_preview_accepts_small_heading_change_but_rejects_over_limit(self):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
         goal = dict(x=1.5, y=1.)
         plan = self.grid.plan
 
-        for yaw, success in ((2e-7, True), (.002, False)):
+        for yaw, success in ((math.radians(1.9), True), (math.radians(2.1), False)):
             with self.subTest(yaw=yaw):
+                self.observe(x=0., yaw=0.)
+
                 def plan_after_sample(pose, target):
                     self.observe(x=4e-7, y=4e-7, yaw=yaw)
                     return plan(pose, target)
@@ -223,9 +231,9 @@ class NavigationTest(unittest.TestCase):
                 self.assertEqual(self.nav.snapshot()['can_start'], success)
 
     def test_upload_validates_current_pose_and_checks_motion_before_and_after_upload(self):
-        for before, after, error in ((4e-7, 7e-7, None),
-                                     (.002, .002, '^起点已变化'),
-                                     (4e-7, .002, '^上传期间起点已变化')):
+        for before, after, error in ((.010, .025, None),
+                                     (.021, .021, '^起点已变化'),
+                                     (.010, .031, '^上传期间起点已变化')):
             with self.subTest(before=before, after=after):
                 self.nav = Navigation(self.grid, mode='drive', clock=lambda: self.now)
                 self.observe(x=0., yaw=0., task=0, state=0)
@@ -252,11 +260,16 @@ class NavigationTest(unittest.TestCase):
                             self.nav._upload(master, plan)
                     else:
                         self.nav._upload(master, plan)
-                    if before == .002:
+                    if before > .02:
                         validate.assert_not_called()
                         master.upload.assert_not_called()
                     else:
-                        validate.assert_called_once_with(current_pose, plan)
+                        self.assertEqual(validate.call_args_list[0].args, (current_pose, plan))
+                        if error:
+                            self.assertEqual(validate.call_count, 1)
+                        else:
+                            self.assertEqual(validate.call_count, 2)
+                            self.assertAlmostEqual(validate.call_args.args[0]['x'], 1. + after)
                         master.upload.assert_called_once()
                 if error:
                     master.start.assert_not_called()
