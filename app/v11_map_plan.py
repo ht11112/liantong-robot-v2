@@ -158,7 +158,8 @@ def _sha(raw, expected):
     return actual
 
 
-def load_map(pgm_path, yaml_path, expected_pgm_sha256=None, expected_yaml_sha256=None):
+def load_map(pgm_path, yaml_path, expected_pgm_sha256=None, expected_yaml_sha256=None,
+             *, use_modeled_error_margin=True):
     pgm_path, yaml_path = Path(pgm_path), Path(yaml_path)
     if pgm_path.stat().st_size > 1_010_000 or yaml_path.stat().st_size > 8192:
         raise PlanningError('Saved map files exceed the supported size')
@@ -177,7 +178,7 @@ def load_map(pgm_path, yaml_path, expected_pgm_sha256=None, expected_yaml_sha256
                 bits |= 1 << x
         rows.append(bits)
     return GridMap(pgm, width, height, resolution, origin, tuple(rows), pgm_sha, yaml_sha,
-                   occupied, free, negate)
+                   occupied, free, negate, use_modeled_error_margin=use_modeled_error_margin)
 
 
 def _point_box_sq(x, y, i, j):
@@ -321,13 +322,14 @@ class _Costmap:
 
 class GridMap:
     def __init__(self, pgm, width, height, resolution, origin, rows, pgm_sha, yaml_sha,
-                 occupied, free, negate):
+                 occupied, free, negate, *, use_modeled_error_margin=True):
         self.pgm_bytes = pgm
         self.width, self.height, self.resolution, self.origin = width, height, resolution, origin
         self.blocked_rows = rows
         self.pgm_sha256, self.yaml_sha256 = pgm_sha, yaml_sha
         self.map_id = hashlib.sha256((pgm_sha + yaml_sha).encode('ascii')).hexdigest()
         self.occupied_thresh, self.free_thresh, self.negate = occupied, free, negate
+        self.use_modeled_error_margin = use_modeled_error_margin
         self._cos, self._sin = math.cos(origin[2]), math.sin(origin[2])
 
     def metadata(self):
@@ -377,9 +379,10 @@ class GridMap:
         position_error, heading_error = 0., 0.
         for index, segment in enumerate(segments):
             start = self._to_grid(x, y)
+            margin = position_error if self.use_modeled_error_margin else 0.
             if segment['kind'] == 'turn':
                 angle = segment['angle_rad']
-                if not costmap.sweep(start, start, (BODY_RADIUS_M+position_error)/self.resolution):
+                if not costmap.sweep(start, start, (BODY_RADIUS_M+margin)/self.resolution):
                     raise PlanningError('TURN swept disk intersects a blocked cell or map boundary')
                 yaw = _wrap(yaw+angle)
                 heading_error += _float32(TURN_TOLERANCE_RAD)
@@ -389,7 +392,9 @@ class GridMap:
                 x, y = x+length*math.cos(yaw), y+length*math.sin(yaw)
                 end = self._to_grid(x, y)
                 yaw_distance = 2.*length*math.sin(min(math.pi, heading_error)/2.)
-                radius = (BODY_RADIUS_M+position_error+yaw_distance)/self.resolution
+                if self.use_modeled_error_margin:
+                    margin += yaw_distance
+                radius = (BODY_RADIUS_M+margin)/self.resolution
                 if not costmap.sweep(start, end, radius):
                     raise PlanningError('MOVE swept capsule intersects a blocked cell or map boundary')
                 path.append(dict(x=x, y=y))
@@ -435,8 +440,8 @@ class GridMap:
                         nominal_goal_error_m=math.hypot(target[0]-start[0], target[1]-start[1]),
                         actual_endpoint_verified=False)
         last_error = None
-        # Try wider candidate routes only during preview. Every candidate must
-        # still pass the exact encoded sweep with its own early-stop envelope.
+        # Try wider candidate routes only during preview. Check each encoded
+        # route with the same sweep policy used before uploading it.
         for padding in (0., .10, .25, .50):
             search = costmap if not padding else _Costmap(self, padding)
             if not search.sweep(a, a) or not search.sweep(b, b):

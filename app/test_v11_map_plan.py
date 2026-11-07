@@ -148,6 +148,12 @@ class MapPlanTests(unittest.TestCase):
         # beyond the body radius, but the 3° TURN shortfall envelope reaches it.
         with self.assertRaisesRegex(PlanningError,'MOVE swept capsule'):
             grid.validate_plan(start,plan)
+        nominal_grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        nominal_grid.validate_plan(start, plan)
+        crossing = pose(2.1, 2.)
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept capsule'):
+            nominal_grid.validate_plan(crossing, wire_preview(
+                nominal_grid, pose(2.1, 3.5), plan['segments']))
 
     def test_small_turn_omission_does_not_invent_a_heading_change(self):
         grid = self.make_map()

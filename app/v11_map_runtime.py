@@ -450,8 +450,11 @@ def main(argv=None):
     parser.add_argument('--scan-topic', default='/lidar1/laser_fan')
     parser.add_argument('--mode', choices=('ready', 'drive'), default='ready')
     parser.add_argument('--manual-only', action='store_true', help='只启用地图手动对齐')
+    parser.add_argument('--no-modeled-error-margin', action='store_true',
+                        help='路线扫掠只检查车体包络，不叠加动作结束误差')
     args = parser.parse_args(argv)
-    grid = load_map(args.map_pgm, args.map_yaml, args.map_sha256, args.yaml_sha256)
+    grid = load_map(args.map_pgm, args.map_yaml, args.map_sha256, args.yaml_sha256,
+                    use_modeled_error_margin=not args.no_modeled_error_margin)
     localizer = None
     if not args.manual_only:
         from v11_ros import RosLocalizer

@@ -83,7 +83,7 @@ static void publish_speed(Drive *d,uint32_t value,uint32_t tick){
   if(d->flow==FLOW_STOP&&d->flow_step==2){
     if(!elapsed(d->now,tick,250)&&magnitude((int16_t)value)<=2u&&magnitude((int16_t)(value>>16))<=2u)d->zero_count++;
     else d->zero_count=0;
-    if(d->zero_count>=3)d->stationary_ok=true;
+    if(d->zero_count>=2u)d->stationary_ok=true;
   }
 }
 

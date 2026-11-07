@@ -25,6 +25,8 @@ python3 -B app/v11_map_runtime.py --port CURRENT_RK_PORT --map-pgm map/final.pgm
 
 默认雷达话题为 `/lidar1/laser_fan`，可用 `--scan-topic` 指定。地图定位使用前 180° 及 1 m 有效下限。仅使用手动对齐时可加 `--manual-only`。现场进入行驶阶段时以 `--mode drive` 启动运行端。
 
+精度调试时可加 `--no-modeled-error-margin`。预览和上传前校验此时按标称路径及车体包络检查障碍和地图边界。实际偏差可能侵入标称路径之外的空间。
+
 PC 使用仓库现有的 `requirements-pc.txt`，启动网页入口后在本机浏览器打开 8766。已知主机键按别名保存时，另传 `--host-key-alias`。
 
 ```text

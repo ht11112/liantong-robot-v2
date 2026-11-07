@@ -94,6 +94,31 @@ static void test_stop_sampling_and_inflight(void){
   assert(p.d.view.stop_verified&&p.d.view.state==MQ_DRIVE_STOPPED);assert(p.zero_writes>z);assert(p.sample_count>before+5);assert(p.max_speed_gap<=65);
   puts("PASS drive STOP keeps fresh speed samples and cannot consume old target ACK as flow ACK");
 }
+static void stop_speed_sample(Peer *p,int16_t left,int16_t right){
+  p->speed=(uint16_t)left|((uint32_t)(uint16_t)right<<16);
+  unsigned before=p->sample_count;
+  for(unsigned i=0;i<100u&&p->sample_count==before;i++)tick(p);
+  assert(p->sample_count==before+1u);
+  const MQSample *sample=&p->samples[before];
+  assert(sample->valid&&sample->left_tenths_rpm==left&&sample->right_tenths_rpm==right);
+}
+static void test_stop_requires_two_consecutive_zero_samples(void){
+  Peer p;armed(&p);p.force_speed=true;
+  drive_ops()->stop(&p.d,p.now);
+  for(unsigned i=0;i<100u&&!p.d.shutdown_ok;i++)tick(&p);
+  assert(p.d.shutdown_ok&&!p.d.stationary_ok&&p.d.zero_count==0u);
+  stop_speed_sample(&p,2,-2);
+  assert(p.d.zero_count==1u&&!p.d.stationary_ok&&!p.d.view.stop_verified);
+  stop_speed_sample(&p,2,-3);
+  assert(p.d.zero_count==0u&&!p.d.stationary_ok);
+  stop_speed_sample(&p,-2,2);
+  assert(p.d.zero_count==1u&&!p.d.stationary_ok);
+  stop_speed_sample(&p,2,-2);
+  assert(p.d.zero_count==2u&&p.d.stationary_ok&&!p.d.view.stop_verified);
+  run(&p,20);
+  assert(p.d.view.stop_verified&&p.d.view.state==MQ_DRIVE_STOPPED);
+  puts("PASS drive STOP needs two consecutive fresh samples within 0.2 RPM on both wheels");
+}
 static void test_speed_feedback_and_failed_stop(void){
   Peer p;armed(&p);p.force_speed=true;p.speed=151u|((uint32_t)(uint16_t)-173<<16);
   unsigned sample_count=p.sample_count;
@@ -179,7 +204,8 @@ static void test_unavailable_tx_is_bounded(void){
   puts("PASS drive unavailable CAN TX cannot leave boot STOP pending indefinitely");
 }
 int main(void){
-  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
+  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_stop_requires_two_consecutive_zero_samples();
+  test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
   puts("PASS all production drive C tests (memory-only CAN peer)");return 0;
 }
