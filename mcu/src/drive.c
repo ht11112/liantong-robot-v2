@@ -41,6 +41,14 @@ static bool elapsed(uint32_t now,uint32_t then,uint32_t ms){return (uint32_t)(no
 static bool statuses(uint32_t v,uint32_t n){return (v&15u)==n&&((v>>16)&15u)==n;}
 
 static void begin_stop(Drive *d,bool explicit_stop);
+static void sdo_error(Drive *d,const DriveTransaction *t,uint8_t reason,uint32_t tick,uint32_t abort_code){
+  if(reason==DRIVE_SDO_TIMEOUT && !d->sdo_timeout_index){
+    d->sdo_timeout_index=t->index;d->sdo_timeout_sub=t->sub;d->sdo_timeout_tick=tick;
+  }
+  if(d->sdo_error_reason)return;
+  d->sdo_error_index=t->index;d->sdo_error_sub=t->sub;
+  d->sdo_error_reason=reason;d->sdo_error_tick=tick;d->sdo_abort_code=abort_code;
+}
 static void fault(Drive *d,uint32_t error){
   if(!d->view.error){d->view.error=error;d->first_error_tick=d->now;}
   if(d->flow!=FLOW_STOP&&!d->tx_suppressed&&d->view.state!=MQ_DRIVE_FAILED)begin_stop(d,false);
@@ -53,7 +61,7 @@ static bool start(Drive *d,uint16_t index,uint8_t sub,uint8_t bytes,bool write,u
   if(owner==OWNER_FLOW)generation=((uint32_t)d->flow<<16)|d->flow_step;
   DriveTransaction t={index,sub,bytes,write?WRITE:READ,owner,value,d->now,generation,0,true,false,false};
   d->transaction=t;
-  if(!d->bus.send(d->bus_user,b)){d->transaction.pending=false;d->transaction.done=true;return false;}
+  if(!d->bus.send(d->bus_user,b)){sdo_error(d,&d->transaction,DRIVE_SDO_SEND,d->now,0);d->transaction.pending=false;d->transaction.done=true;return false;}
   return true;
 }
 
@@ -64,19 +72,20 @@ void drive_receive_can(Drive *d,uint32_t id,uint32_t dlc,const uint8_t b[8],uint
   if(!t->pending){d->late_replies++;return;}
   if((uint16_t)(b[1]|((uint16_t)b[2]<<8))!=t->index||b[3]!=t->sub){d->late_replies++;return;}
   t->completed_ms=now;
-  if(elapsed(now,t->started_ms,50u)){d->late_replies++;d->sdo_ambiguous=true;t->pending=false;t->done=true;t->ok=false;return;}
-  if(b[0]==0x80u){t->pending=false;t->done=true;t->ok=false;return;}
+  if(elapsed(now,t->started_ms,50u)){sdo_error(d,t,DRIVE_SDO_TIMEOUT,now,0);d->late_replies++;d->sdo_ambiguous=true;t->pending=false;t->done=true;t->ok=false;return;}
+  if(d->sdo_ambiguous){d->late_replies++;t->pending=false;t->done=true;t->ok=false;return;}
+  if(b[0]==0x80u){sdo_error(d,t,DRIVE_SDO_ABORT,now,u32(b+4));t->pending=false;t->done=true;t->ok=false;return;}
   bool valid=t->kind==WRITE?b[0]==0x60u:((b[0]&0xe3u)==0x43u&&(4u-((b[0]>>2)&3u))==t->bytes);
-  if(!valid){d->malformed_replies++;t->pending=false;t->done=true;t->ok=false;return;}
+  if(!valid){sdo_error(d,t,DRIVE_SDO_MALFORMED,now,0);d->malformed_replies++;t->pending=false;t->done=true;t->ok=false;return;}
   if(t->kind==READ){t->value=u32(b+4);if(t->bytes<4)t->value&=(1u<<(8u*t->bytes))-1u;}
   t->pending=false;t->done=true;t->ok=true;
 }
 
 static void publish_speed(Drive *d,uint32_t value,uint32_t tick){
   d->speed_raw=value;d->speed_tick=tick;d->cache_mask|=C_SPEED;
-  bool fresh=(d->cache_mask&(C_LEFT|C_RIGHT|C_STATUS|C_FAULT))==(C_LEFT|C_RIGHT|C_STATUS|C_FAULT)
-    &&!elapsed(d->now,d->left_tick,250)&&!elapsed(d->now,d->right_tick,250)
-    &&!elapsed(d->now,d->status_tick,250)&&!elapsed(d->now,d->fault_tick,250)&&!elapsed(d->now,tick,250)&&!d->fault_raw&&!d->sdo_ambiguous;
+  bool fresh=(d->cache_mask&(C_STATUS|C_FAULT|C_CURRENT))==(C_STATUS|C_FAULT|C_CURRENT)
+    &&!elapsed(d->now,d->status_tick,250)&&!elapsed(d->now,d->fault_tick,250)
+    &&!elapsed(d->now,d->current_tick,250)&&!elapsed(d->now,tick,250)&&!d->fault_raw&&!d->sdo_ambiguous;
   if(d->sample_ready)d->sample_overruns++;
   d->sample=(MQSample){++d->sample_sequence,tick,(int16_t)value,(int16_t)(value>>16),d->position_left,d->position_right,fresh};
   d->sample_ready=true;
@@ -249,12 +258,15 @@ static bool auxiliary(Drive *d,uint32_t interval){
 void drive_poll(Drive *d,uint32_t now){
   d->now=now;
   uint32_t errors=d->bus.bus_errors(d->bus_user);
-  if(errors){if(!d->first_can_error)d->first_can_error=errors;fault(d,DRIVE_ERR_CAN);}
+  d->last_can_status=errors;
+  if(errors && !d->first_can_error)d->first_can_error=errors;
+  if(errors&1u)fault(d,DRIVE_ERR_CAN); /* PSR.BO, not the ECR counters. */
   if(d->transaction.pending&&elapsed(now,d->transaction.started_ms,50)){
     /* CANopen SDO has no transaction id. A reply after a timeout can match a
      * later request for the same object; no timed silence proves otherwise.
      * Keep physical STOP attempts, but never upgrade ACK/odom/stop evidence. */
     d->sdo_ambiguous=true;
+    sdo_error(d,&d->transaction,DRIVE_SDO_TIMEOUT,now,0);
     d->transaction.pending=false;d->transaction.done=true;d->transaction.ok=false;d->transaction.completed_ms=now;
   }
   if(d->transaction.done)completed(d);
@@ -269,7 +281,7 @@ void drive_poll(Drive *d,uint32_t now){
   }
   if(d->flow==FLOW_ARM&&elapsed(now,d->flow_started_ms,3000))fault(d,DRIVE_ERR_ARM_TIMEOUT);
   if(d->view.state==MQ_DRIVE_ENABLED){
-    if((d->cache_mask&63u)!=63u||elapsed(now,d->speed_tick,250)||elapsed(now,d->left_tick,250)||elapsed(now,d->right_tick,250)
+    if((d->cache_mask&(C_SPEED|C_STATUS|C_FAULT|C_CURRENT))!=(C_SPEED|C_STATUS|C_FAULT|C_CURRENT)||elapsed(now,d->speed_tick,250)
         ||elapsed(now,d->status_tick,250)||elapsed(now,d->fault_tick,250)||elapsed(now,d->current_tick,250))fault(d,DRIVE_ERR_SAMPLE);
     else if(d->fault_raw||!statuses(d->status_raw,7)||magnitude((int16_t)d->current_raw)>40u||magnitude((int16_t)(d->current_raw>>16))>40u)fault(d,DRIVE_ERR_CAN);
   }

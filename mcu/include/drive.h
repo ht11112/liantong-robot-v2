@@ -11,6 +11,7 @@ typedef struct {
 enum { DRIVE_ERR_STOP=40,DRIVE_ERR_STARTUP=52,DRIVE_ERR_CAN=72,
   DRIVE_ERR_UART=81,DRIVE_ERR_LIMIT=82,DRIVE_ERR_ARM_TIMEOUT=83,
   DRIVE_ERR_GUARD=86,DRIVE_ERR_SAMPLE=87 };
+enum { DRIVE_SDO_NONE=0,DRIVE_SDO_TIMEOUT,DRIVE_SDO_ABORT,DRIVE_SDO_MALFORMED,DRIVE_SDO_SEND };
 
 typedef struct {
   uint16_t index;
@@ -29,6 +30,10 @@ typedef struct {
   uint32_t speed_tick,left_tick,right_tick,status_tick,fault_tick,current_tick;
   uint32_t position_left,position_right,speed_raw,status_raw,fault_raw,current_raw;
   uint32_t sample_sequence,sample_overruns,late_replies,malformed_replies;
+  uint32_t last_can_status,sdo_error_tick,sdo_abort_code;
+  uint32_t sdo_timeout_tick;
+  uint16_t sdo_error_index,sdo_timeout_index;
+  uint8_t sdo_error_sub,sdo_error_reason,sdo_timeout_sub;
   uint32_t limit_values[5],generation,desired_generation,last_target_ms;
   uint32_t flow_started_ms,stop_wait_started_ms,zero_sequence,zero_count;
   uint32_t last_speed_start,last_aux_start,last_guard_start,last_rx_ms;

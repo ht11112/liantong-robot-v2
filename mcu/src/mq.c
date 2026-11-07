@@ -52,7 +52,14 @@ void mq_fault(MQ *q,uint32_t error,uint32_t now) {
 void mq_sample(MQ *q,const MQSample *s) {
   MQOdom *o=&q->odom;
   if(!s->valid) {
+    MQDriveView d=view(q);
+    bool safe=o->valid && o->initialized && zero_sample(o) &&
+      !mq_is_executing(q) && d.state==MQ_DRIVE_STOPPED && d.stop_verified &&
+      d.guard_valid && !d.error && s->tick_ms-o->measurement_tick_ms<=MQ_SAMPLE_TIMEOUT_MS;
     o->valid=false;o->discontinuities++;
+    o->recovery_allowed=safe;o->recovery_count=0;
+    o->recovery_sequence=s->sequence;o->recovery_tick=s->tick_ms;
+    o->recovery_start_tick=o->measurement_tick_ms;
     if(mq_is_executing(q))mq_fault(q,MQ_ERR_ODOM,s->tick_ms);
     return;
   }
@@ -60,8 +67,24 @@ void mq_sample(MQ *q,const MQSample *s) {
   float l=(float)s->left_tenths_rpm*(MQ_PI*MQ_DIAMETER_M/600.f);
   float r=-(float)s->right_tenths_rpm*(MQ_PI*MQ_DIAMETER_M/600.f);
   float v=(l+r)*.5f,w=(r-l)/MQ_SEPARATION_M;
+  bool recovering=o->initialized && !o->valid;
+  if(recovering) {
+    MQDriveView d=view(q);
+    bool stationary=s->left_tenths_rpm>=-2 && s->left_tenths_rpm<=2 &&
+      s->right_tenths_rpm>=-2 && s->right_tenths_rpm<=2;
+    if(!o->recovery_allowed || mq_is_executing(q) || d.state!=MQ_DRIVE_STOPPED ||
+       !d.stop_verified || !d.guard_valid || d.error || !stationary ||
+       s->sequence-o->recovery_sequence!=1u ||
+       s->tick_ms-o->recovery_tick==0u || s->tick_ms-o->recovery_tick>MQ_SAMPLE_TIMEOUT_MS ||
+       s->tick_ms-o->recovery_start_tick>MQ_SAMPLE_TIMEOUT_MS) {
+      o->recovery_allowed=false;o->recovery_count=0;
+    } else {
+      o->recovery_sequence=s->sequence;o->recovery_tick=s->tick_ms;
+      if(++o->recovery_count>=3u){o->valid=true;o->recovery_allowed=false;}
+    }
+  }
   bool continuous=true;
-  if(o->initialized) {
+  if(o->initialized && !recovering) {
     uint32_t dt=s->tick_ms-o->measurement_tick_ms;
     continuous=s->sequence-o->sample_sequence==1u && dt>0 && dt<=MQ_SAMPLE_TIMEOUT_MS;
     if(continuous && o->valid) {
@@ -72,7 +95,7 @@ void mq_sample(MQ *q,const MQSample *s) {
       o->x+=ds*scale*cosf(o->yaw+half);o->y+=ds*scale*sinf(o->yaw+half);
       o->travel+=ds;o->yaw_total+=angle;o->yaw=wrap(o->yaw+angle);
     } else if(!continuous) { o->valid=false;o->discontinuities++; }
-  } else { o->valid=true;o->initialized=true; }
+  } else if(!o->initialized) { o->valid=true;o->initialized=true; }
   o->previous_v=v;o->previous_w=w;o->v=v;o->w=w;
   o->sample_sequence=s->sequence;o->measurement_tick_ms=s->tick_ms;
   o->left_tenths_rpm=s->left_tenths_rpm;o->right_tenths_rpm=s->right_tenths_rpm;

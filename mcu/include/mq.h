@@ -47,7 +47,8 @@ typedef struct {
   uint32_t sample_sequence, measurement_tick_ms, epoch, discontinuities;
   int16_t left_tenths_rpm,right_tenths_rpm;
   uint32_t position_left,position_right;
-  bool initialized,valid;
+  uint32_t recovery_sequence,recovery_tick,recovery_start_tick,recovery_count;
+  bool initialized,valid,recovery_allowed;
 } MQOdom;
 typedef struct {
   MQOdom odom;

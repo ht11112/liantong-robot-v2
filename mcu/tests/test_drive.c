@@ -162,10 +162,11 @@ static void test_arm_keeps_aux_sources(void){
 static void test_ambiguous_late_target_ack(void){
   Peer p;armed(&p);p.drop_next=true;uint32_t generation=drive_ops()->target(&p.d,2,-2,p.now);assert(generation);
   while(!p.d.sdo_ambiguous)tick(&p);
+  assert(p.d.sdo_timeout_index==0x60ff&&p.d.sdo_timeout_sub==3&&p.d.sdo_error_reason==DRIVE_SDO_TIMEOUT);
   while(!p.d.transaction.pending||p.d.transaction.index!=0x60ff)tick(&p);
   uint8_t late[8]={0x60,0xff,0x60,3,0,0,0,0};
   /* Drop the new zero's real reply and deliver only the indistinguishable old ACK. */
-  p.waiting=false;drive_receive_can(&p.d,0x581,8,late,p.now);drive_poll(&p.d,p.now);
+  p.waiting=false;drive_receive_can(&p.d,0x581,8,late,p.now);assert(!p.d.transaction.ok);drive_poll(&p.d,p.now);
   assert(!p.d.zero_ok);run(&p,1000);
   assert(p.d.view.error&&p.d.sdo_ambiguous&&p.d.tx_suppressed&&!p.d.view.stop_verified);
   drive_ops()->stop(&p.d,p.now);run(&p,1000);
@@ -178,8 +179,22 @@ static void test_unavailable_tx_is_bounded(void){
   assert(p.sends==0);run(&p,500);assert(p.sends==0);
   puts("PASS drive unavailable CAN TX cannot leave boot STOP pending indefinitely");
 }
+static void test_counters_and_required_sources(void){
+  Peer p;armed(&p);p.bus_error=2u|(1u<<9);run(&p,100);
+  assert(!p.d.view.error&&p.d.last_can_status==p.bus_error);
+  p.bus_error=0;run(&p,20);assert(!p.d.view.error);
+  p.d.left_tick=p.d.right_tick=p.now-250u;drive_poll(&p.d,p.now);
+  assert(!p.d.view.error);
+  while(!p.d.transaction.pending||p.d.transaction.index!=0x606c)tick(&p);
+  p.d.left_tick=p.d.right_tick=p.now-250u;tick(&p);
+  assert(p.samples[p.sample_count-1].valid);
+  p.bus_error=1;drive_poll(&p.d,p.now);assert(p.d.view.error==DRIVE_ERR_CAN&&p.d.view.state==MQ_DRIVE_STOPPING);
+  armed(&p);p.d.current_tick=p.now-250u;drive_poll(&p.d,p.now);assert(p.d.view.error==DRIVE_ERR_SAMPLE);
+  puts("PASS ECR counters, immediate bus-off, optional position and required current freshness");
+}
 int main(void){
   test_boot_arm_refresh();test_stop_sampling_and_inflight();test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
+  test_counters_and_required_sources();
   puts("PASS all production drive C tests (memory-only CAN peer)");return 0;
 }
