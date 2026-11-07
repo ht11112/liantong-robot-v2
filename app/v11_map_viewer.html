@@ -22,9 +22,10 @@
     .cardhead{display:flex;align-items:center;justify-content:space-between;gap:9px;border-bottom:1px solid var(--line);padding:12px 15px}.body{padding:12px 15px}.map-controls,.actions,.legend{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.map-controls button{padding:5px 9px;font-size:12px}.map-controls button[aria-pressed="true"]{background:#eaf0ff;border-color:#cbd9fd;color:#254ba8}
     .canvas-box{position:relative;height:clamp(430px,64vh,680px);background:#e8edf4}.canvas-box canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.map-help{position:absolute;top:9px;left:10px;right:10px;width:fit-content;max-width:calc(100% - 20px);padding:5px 8px;border-radius:6px;background:#fffffff2;color:var(--muted);font-size:12px;pointer-events:none}.map-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;padding:10px 13px;color:var(--muted)}.legend span{display:inline-flex;align-items:center;gap:5px}.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--blue)}.legend .trail{background:var(--green)}.legend .goal{background:#d58626}.legend .seed{background:var(--violet)}
     .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 10px}.fields.two{grid-template-columns:repeat(2,minmax(0,1fr))}.fields label{font-size:12px;color:var(--muted)}input{width:100%;min-width:0;background:white;color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 8px;margin-top:3px}.actions button{flex:1}.summary,.message{margin:9px 0 0;background:#f4f7fc;padding:7px 9px;border-radius:7px;font-size:12px;overflow-wrap:anywhere}.message.error{color:var(--red);background:#ffeff1}.body small{display:block;color:var(--muted);line-height:1.55}.body dl{margin:0}.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #eef2f7;font-size:12px}.kv dt{color:var(--muted)}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}progress{width:100%;height:8px;margin-top:9px;accent-color:var(--blue)}
-    .costmap-content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.costmap-box{display:grid;place-items:center;height:148px;background:#e8edf4}.costmap-box img{display:block;width:100%;height:100%;min-height:0;object-fit:contain;image-rendering:pixelated}.costmap-box p{margin:12px;color:var(--muted);text-align:center}
+    .costmap-content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.costmap-box{display:grid;place-items:center;height:148px;background:#e8edf4}.costmap-box canvas{display:block;width:100%;height:100%;min-height:0}.costmap-box p{margin:12px;color:var(--muted);text-align:center}
     .costmap-content .map-foot{display:grid;align-content:center;justify-content:start}.costmap .cardhead a{color:var(--blue);font-size:12px;white-space:nowrap}
     .costmap-legend i{width:11px;height:11px;border-radius:2px;border:1px solid #c4cfdd}.costmap-legend .occupied{background:#000}.costmap-legend .inflated{background:#646464}.costmap-legend .unknown{background:#afafaf}.costmap-legend .free{background:#fff}
+    .legend .radar{background:#e45b30}
     @media(max-width:850px){.layout{grid-template-columns:1fr;grid-template-areas:"map" "side" "costmap"}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
     @media(max-width:540px){main{padding:16px 12px}.heading{align-items:flex-start}.side{grid-template-columns:1fr}.canvas-box{height:390px}.cardhead{align-items:flex-start}.map-controls{justify-content:flex-end}h1{font-size:21px}}
   </style>
@@ -41,7 +42,7 @@
       <section class="card navigation-map" aria-label="保存地图与轨迹">
         <div class="cardhead"><h2>保存地图</h2><div class="map-controls" aria-label="地图选点模式"><button id="pick-goal" type="button" aria-pressed="true">选目标</button><button id="pick-seed" type="button" aria-pressed="false">设起点与车头</button></div></div>
         <div class="canvas-box"><canvas id="map" aria-label="保存地图、预览路径与车辆轨迹；可使用右侧坐标输入替代选点"></canvas><div class="map-help" id="map-help">等待地图信息</div></div>
-        <div class="map-foot"><div class="legend"><span><i></i>车辆 / 预览</span><span><i class="trail"></i>轨迹</span><span><i class="goal"></i>目标</span><span><i class="seed"></i>定位起点</span></div><span id="map-details">等待已校验地图</span></div>
+        <div class="map-foot"><div class="legend"><span><i></i>车辆 / 预览</span><span><i class="trail"></i>轨迹</span><span><i class="goal"></i>目标</span><span><i class="seed"></i>定位起点</span><span id="map-radar-legend" hidden><i class="radar"></i>雷达障碍</span></div><span id="map-details">等待已校验地图</span></div>
       </section>
       <aside class="side" aria-label="定位与任务控制">
         <section class="card">
@@ -71,17 +72,19 @@
             <div class="kv"><dt>STOP 回应</dt><dd id="stop-ack">—</dd></div>
             <div class="kv"><dt>实测停稳</dt><dd id="stop-proof">—</dd></div>
           </dl>
+          <p class="message" id="avoidance-status" role="status" hidden></p>
           <p class="message error" id="task-error" hidden></p><div class="actions" style="margin-top:10px"><button id="stop" type="button" class="stop" disabled>停车</button></div></div>
         </section>
       </aside>
       <section class="card costmap" aria-labelledby="costmap-title">
         <div class="cardhead"><h2 id="costmap-title">导航代价地图</h2><a id="costmap-open" target="_blank" rel="noopener" hidden>查看原图</a></div>
         <div class="costmap-content">
-          <div class="costmap-box" id="costmap-box"><p id="costmap-note">等待代价地图</p></div>
+          <div class="costmap-box"><canvas id="costmap-view" role="img" aria-label="基础代价地图与实时雷达障碍" hidden></canvas><p id="costmap-note">等待代价地图</p></div>
           <div class="map-foot">
             <div class="legend costmap-legend" aria-label="代价地图图例">
               <span><i class="occupied"></i>障碍</span><span><i class="inflated"></i>车体净空</span>
               <span><i class="unknown"></i>未知区</span><span><i class="free"></i>可通行</span>
+              <span id="costmap-radar-legend" hidden><i class="radar"></i>雷达障碍</span>
             </div>
             <span>显示基础净空，规划时可能使用额外边距</span>
           </div>
@@ -94,10 +97,12 @@
     'use strict';
     const $ = id => document.getElementById(id);
     const canvas = $('map'), ctx = canvas.getContext('2d');
-    const costmapBox = $('costmap-box'), costmapNote = $('costmap-note'), costmapOpen = $('costmap-open');
+    const costmapCanvas = $('costmap-view'), costmapCtx = costmapCanvas.getContext('2d');
+    const costmapNote = $('costmap-note'), costmapOpen = $('costmap-open');
     const seedFields = ['seed-x','seed-y','seed-yaw'].map($);
     const goalFields = ['goal-x','goal-y'].map($);
     const phaseNames = {idle:'待命',uploading:'上传队列',ready:'READY',starting:'启动中',arming:'使能中',move:'直行',turn:'转向',barrier:'段间停车',stopping:'停车中',complete:'已完成',failed:'失败',unknown:'未知'};
+    const avoidanceNames = {watching:'监测路线',stopping:'遇障停车',replanning:'重规划中',waiting:'停车等待',resuming:'继续行驶',cancelled:'避障已结束'};
     const locNames = {amcl:'AMCL 已定位',manual:'手动位姿',unlocalized:'未定位'};
     let state = {connected:false}, image = null, imageKey = '', view = null;
     let costmapImage = null, costmapKey = '', costmapError = false;
@@ -111,8 +116,8 @@
       const values = seedFields.map(input => input.valueAsNumber);
       return values.every(finite) ? {x:values[0],y:values[1],yaw:angle(values[2]*Math.PI/180)} : null;
     }
-    function screen(p) {
-      const {map,left,top,scale} = view;
+    function screen(p, projection=view) {
+      const {map,left,top,scale} = projection;
       const [ox,oy,yaw] = map.origin, c=Math.cos(yaw),s=Math.sin(yaw);
       const x=p.x-ox,y=p.y-oy;
       return {x:left+scale*(c*x+s*y)/map.resolution,
@@ -143,19 +148,43 @@
       }else ctx.arc(0,0,6,0,2*Math.PI);
       ctx.fill();ctx.stroke();ctx.restore();
     }
-    function draw() {
-      const w=canvas.clientWidth,h=canvas.clientHeight,dpr=window.devicePixelRatio||1;
-      if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){
-        canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+    function drawBase(surface, context, background, map) {
+      const w=surface.clientWidth,h=surface.clientHeight,dpr=window.devicePixelRatio||1;
+      if(surface.width!==Math.round(w*dpr)||surface.height!==Math.round(h*dpr)){
+        surface.width=Math.round(w*dpr);surface.height=Math.round(h*dpr);
       }
-      ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);view=null;
-      const map=state.map;
-      if(!image || !map || state.map_image_available!==true || imageKey!==map.pgm_sha256) return;
+      context.setTransform(dpr,0,0,dpr,0,0);context.clearRect(0,0,w,h);
+      if(!background) return null;
       const scale=Math.min(w/map.width,h/map.height);
       const left=(w-map.width*scale)/2,top=(h-map.height*scale)/2;
-      view={map,scale,left,top};ctx.imageSmoothingEnabled=false;
-      ctx.drawImage(image,left,top,map.width*scale,map.height*scale);
-      ctx.save();ctx.beginPath();ctx.rect(left,top,map.width*scale,map.height*scale);ctx.clip();
+      context.imageSmoothingEnabled=false;
+      context.drawImage(background,left,top,map.width*scale,map.height*scale);
+      return {map,scale,left,top};
+    }
+    function clipMap(context, {map,scale,left,top}) {
+      context.beginPath();context.rect(left,top,map.width*scale,map.height*scale);context.clip();
+    }
+    function drawRadar(context, projection, points, size) {
+      context.fillStyle='#e45b30';
+      for(const point of points){
+        const p=screen(point,projection);
+        context.fillRect(p.x-size/2,p.y-size/2,size,size);
+      }
+    }
+    function draw() {
+      const map=state.map;
+      const points=state.connected===true && state.source_fresh===true ? state.avoidance?.points||[] : [];
+      if(!costmapCanvas.hidden){
+        const projection=drawBase(costmapCanvas,costmapCtx,costmapImage,map);
+        costmapCtx.save();clipMap(costmapCtx,projection);
+        drawRadar(costmapCtx,projection,points,2.5);
+        costmapCtx.restore();
+      }
+      const background=map && state.map_image_available===true && imageKey===map.pgm_sha256 ? image : null;
+      view=drawBase(canvas,ctx,background,map);
+      if(!view) return;
+      ctx.save();clipMap(ctx,view);
+      drawRadar(ctx,view,points,3.5);
       line(state.trail,'#16866d');
       const route=state.preview||state.route;
       if(route) line(route.path,'#3767ea',[6,4]);
@@ -180,15 +209,12 @@
       if (!map || state.connected!==true || state.costmap_image_available!==true || costmapKey===map.map_id) return;
       costmapKey=map.map_id;
       costmapError=false;
-      costmapImage?.remove();
       costmapImage=null;
       const next=new Image();
-      next.alt='导航代价地图，标出障碍、净空范围、未知区和可通行区域';
       next.onload=() => {
         if (costmapKey!==map.map_id) return;
         if (next.naturalWidth===map.width && next.naturalHeight===map.height) {
           costmapImage=next;
-          costmapBox.prepend(next);
           costmapOpen.href=next.src;
         } else {
           costmapError=true;
@@ -212,12 +238,20 @@
       const matched=state.map_image_available===true && image && map && imageKey===map.pgm_sha256;
       const costmapAvailable=state.costmap_image_available===true && map;
       const costmapVisible=Boolean(costmapAvailable && costmapImage && costmapKey===map.map_id);
-      if(costmapImage) costmapImage.hidden=!costmapVisible;
+      costmapCanvas.hidden=!costmapVisible;
       costmapOpen.hidden=!costmapVisible;
       costmapNote.hidden=costmapVisible;
       costmapNote.textContent=!costmapAvailable?'等待代价地图':costmapError?'代价地图加载失败':'正在加载代价地图';
       const editable=online && matched && Boolean(state.csrf_token) && !action && !stopping;
       const loc=state.localization||{}, task=state.task||{}, preview=state.preview, route=preview||state.route;
+      const avoidance=online ? state.avoidance : null;
+      $('map-radar-legend').hidden=!avoidance;
+      $('costmap-radar-legend').hidden=!avoidance;
+      const avoidanceStatus=$('avoidance-status');
+      avoidanceStatus.hidden=!avoidance;
+      const avoidanceText=avoidance && ['避障测试',avoidanceNames[avoidance.phase],
+        avoidance.replans ? `已重规划 ${avoidance.replans} 次` : '',avoidance.message].filter(Boolean).join(' · ');
+      if(avoidanceStatus.textContent!==(avoidanceText||'')) avoidanceStatus.textContent=avoidanceText||'';
       const canPrepare=editable && state.can_prepare===true;
       $('connection').textContent=online?'RK 已连接':'RK 未连接';$('connection').className='pill'+(online?' on':'');
       $('run-mode').textContent=ready?'静止验收：上传至 READY':state.mode==='drive'?'行驶模式':'模式待确认';
@@ -241,7 +275,11 @@
       const crc=route && typeof route.queue_crc32==='number'?route.queue_crc32.toString(16).padStart(8,'0'):route?.queue_crc32;
       $('plan').textContent=!route?'尚无预览':route.no_motion?'目标已在容差内，无需上传动作':
         `${preview?'预览':'已提交路线'} · ${route.segments.length} 段 · 预计 ${route.nominal_duration_s.toFixed(1)} s · CRC32 ${crc ?? '—'}`;
-      $('task-phase').textContent=phaseNames[task.phase]||task.phase||'待命';$('task-id').textContent=task.id??'—';
+      const obstaclePause=['waiting','replanning','resuming'].includes(avoidance?.phase)
+        && task.phase==='failed' && task.stop_verified===true && task.error==='MCU 错误 1 / 驱动 0';
+      const taskError=obstaclePause?'':task.error;
+      $('task-phase').textContent=obstaclePause?'遇障暂停':phaseNames[task.phase]||task.phase||'待命';
+      $('task-id').textContent=task.id??'—';
       $('task-index').textContent=task.count?`${Math.min(task.index+1,task.count)} / ${task.count}`:'—';
       $('arrival').textContent=task.arrival?'已报告到点':'未报告';
       $('stop-ack').textContent=task.stop_ack==null?'—':task.stop_ack?'已收到':'未收到';
@@ -249,7 +287,7 @@
       $('task-progress').textContent=!finite(task.progress)?'—':task.phase==='move'?`${task.progress.toFixed(3)} m`:
         task.phase==='turn'?`${(task.progress*180/Math.PI).toFixed(1)}°`:'—';
       $('task-lease').textContent=finite(task.lease_remaining_s)?`${task.lease_remaining_s.toFixed(1)} s`:'—';
-      $('task-error').textContent=task.error||'';$('task-error').hidden=!task.error;
+      $('task-error').textContent=taskError||'';$('task-error').hidden=!taskError;
       draw();
     }
     async function poll() {

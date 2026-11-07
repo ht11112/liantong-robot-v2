@@ -15,13 +15,16 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
 from mcu_v11 import (EXECUTING, LEASE_STATES, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, Rejected,
                      RkMaster, error_record, open_port)
-from v11_map_plan import load_map
+from v11_map_plan import PlanningError, load_map
 
 
 PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
           'barrier', 'stopping', 'complete', 'failed')
 SOURCE_MAX_AGE_S = .250
 RENEW_BEFORE_S = 5.
+REPLAN_INTERVAL_S = 1.
+MCU_CANCELLED = 1
+ARRIVAL_REACHED = 8
 
 
 def angle(value):
@@ -53,8 +56,11 @@ def inverse(pose):
 
 
 class Navigation:
-    def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic):
+    def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None):
         self.grid, self.localizer, self.mode, self.clock = grid, localizer, mode, clock
+        self.scanner = scanner
+        self.avoidance_phase, self.avoidance_message, self.replans = 'watching', None, 0
+        self.detour = None
         self.lock = threading.RLock()
         self.latest = None
         self.connected = False
@@ -73,6 +79,8 @@ class Navigation:
         self.error = None
 
     def _invalidate(self, reason):
+        if self.detour is not None:
+            self._cancel_detour(reason)
         self.alignment = self.origin = self.plan = self.route = None
         self.trail.clear()
         self.localization = dict(mode='unlocalized', reason=reason)
@@ -127,11 +135,38 @@ class Navigation:
                     self.trail.append(pose)
         if self.localizer is not None:
             self.localizer.publish(exchange)
+        if self.scanner is not None:
+            self.scanner.publish(exchange)
+
+    def _scan_points(self):
+        if self.scanner is None or self.alignment is None or not self._fresh():
+            return None
+        frame = self.scanner.latest()
+        if frame is None:
+            return None
+        odom, points = frame
+        status = self.latest.status
+        if (odom['boot'], odom['epoch']) != (status.boot, status.epoch):
+            return None
+        pose = compose(self.alignment, odom)
+        c, s = math.cos(pose['yaw']), math.sin(pose['yaw'])
+        return tuple((pose['x'] + c*x - s*y, pose['y'] + s*x + c*y) for x, y in points)
+
+    def _upload_obstacles(self):
+        points = self._scan_points()
+        if points is None:
+            raise ValueError('避障测试需要定位后有效的雷达数据')
+        cells = self.grid.obstacle_cells(points)
+        return cells | self.detour['blockers'] if self.detour is not None else cells
+
+    def _cancel_detour(self, reason):
+        self.detour = None
+        self.avoidance_phase, self.avoidance_message = 'cancelled', reason
 
     @contextmanager
     def _stationary_work(self, name):
         with self.lock:
-            if self.work or self.stop_requested:
+            if self.work or self.stop_requested or self.detour is not None:
                 raise ValueError('当前操作正在处理')
             self._require_stationary()
             self.work, self.error = name, None
@@ -183,7 +218,9 @@ class Navigation:
                 self.plan = None
                 if pose is None:
                     raise ValueError('请先完成地图定位')
-            plan = self.grid.plan(pose, goal)
+                points = self._scan_points()
+            plan = (self.grid.plan(pose, goal, obstacle_cells=self.grid.obstacle_cells(points))
+                    if points is not None else self.grid.plan(pose, goal))
             with self.lock:
                 if (self.stop_revision != stop_revision or anchor is not self.alignment
                         or not same_pose(self._map_pose(), pose)):
@@ -193,10 +230,13 @@ class Navigation:
     def request_start(self, plan_id):
         with self.lock:
             self._require_stationary()
-            if self.work or self.stop_requested:
+            if self.work or self.stop_requested or self.detour is not None:
                 raise ValueError('当前操作正在处理')
             if self.plan is None or self.plan['id'] != plan_id or not self.plan['segments']:
                 raise ValueError('请预览一条可执行的新路径')
+            if self.scanner is not None and self._scan_points() is None:
+                raise ValueError('避障测试需要定位后有效的雷达数据')
+            self.avoidance_phase, self.avoidance_message, self.replans = 'watching', None, 0
             self.pending = self.route = self.plan
             self.plan = None
             self.work, self.error = 'uploading', None
@@ -209,12 +249,16 @@ class Navigation:
                 raise ValueError('静止验收模式使用查询和上传')
             if not self.connected:
                 raise ValueError('串口状态未知，请在现场停车')
-            self.plan = None
-            self.lease_task = None
-            self.stop_requested = True
-            self.stop_revision += 1
-            self.stop_ack = self.stop_verified = None
-            self.stop_evidence = None
+            self._cancel_detour('已人工取消')
+            self._queue_stop()
+
+    def _queue_stop(self):
+        self.plan = self.pending = None
+        self.lease_task = None
+        self.stop_requested = True
+        self.stop_revision += 1
+        self.stop_ack = self.stop_verified = None
+        self.stop_evidence = None
 
     def _observe_upload(self, exchange):
         self.observe(exchange)
@@ -230,7 +274,11 @@ class Navigation:
                 raise ValueError('地图定位已失效，请重新定位')
             if not same_pose(pose, plan['start']):
                 raise ValueError('起点已变化，请重新预览')
-        self.grid.validate_plan(pose, plan)
+            cells = self._upload_obstacles() if self.scanner is not None else frozenset()
+        if cells:
+            self.grid.validate_plan(pose, plan, obstacle_cells=cells)
+        else:
+            self.grid.validate_plan(pose, plan)
         with self.lock:
             if self.stop_requested:
                 return
@@ -241,6 +289,10 @@ class Navigation:
             self._require_stationary()
             if not same_pose(self._map_pose(), pose):
                 raise ValueError('上传期间起点已变化，请重新预览')
+            if self.scanner is not None:
+                current_cells = self._upload_obstacles()
+                if current_cells != cells:
+                    self.grid.validate_plan(pose, plan, obstacle_cells=current_cells)
             self.work = 'starting'
         started = master.start(reply.status.task)
         self.observe(started)
@@ -248,6 +300,13 @@ class Navigation:
         with self.lock:
             if not self.stop_requested and status.state in LEASE_STATES and status.lease_remaining_ms:
                 self.lease_task = status.boot, status.epoch, status.task
+                if self.detour is not None:
+                    self.detour = None
+                    self.replans += 1
+                    self.stop_ack = self.stop_verified = self.stop_evidence = None
+                    self.avoidance_phase, self.avoidance_message = 'watching', '已换路线，继续前往原目标'
+            elif self.detour is not None:
+                self._cancel_detour('底盘未进入续行状态，请人工处理')
 
     def _lease_seconds(self, exchange):
         # The MCU computes its remaining time after this send, so this is a lower bound.
@@ -287,6 +346,84 @@ class Navigation:
             else:
                 self.error = error.get('message', '停车未确认')
 
+            if self.detour is not None:
+                if self.stop_verified:
+                    self.avoidance_phase, self.avoidance_message = 'waiting', '已停稳，等待重新规划'
+                else:
+                    self._cancel_detour(self.error)
+
+    def _check_route(self, reply):
+        status = reply.status
+        identity = status.boot, status.epoch, status.task
+        if (self.stop_requested or self.lease_task != identity or status.state not in LEASE_STATES
+                or status.first_error or status.first_drive_error):
+            return
+        pose, points = self._map_pose(), self._scan_points()
+        if points is None:
+            return
+        cells = self.grid.obstacle_cells(points)
+        # In the handoff state the reported segment has already finished.
+        index = status.index + (status.state == 6)
+        progress = status.progress if status.state in (4, 5) else 0.
+        if self.grid.route_blocked(pose, self.route, index, progress, cells):
+            # Keep the blocking scan during replanning if the object leaves the front fan.
+            self.detour = dict(goal=self.route['goal'], blockers=cells, attempt=None, retry_at=0.)
+            self.avoidance_phase, self.avoidance_message = 'stopping', '前方路线被挡，正在停车'
+            self._queue_stop()
+
+    def _avoidance_cycle(self, master, reply):
+        with self.lock:
+            detour = self.detour
+            if detour is None:
+                self._check_route(reply)
+                return
+            if not self.stop_verified or self.stop_requested or not self._stationary():
+                return
+            status = reply.status
+            if status.first_error not in (0, MCU_CANCELLED):
+                self._cancel_detour('底盘有故障，取消自动续行')
+                return
+            if status.flags & ARRIVAL_REACHED:
+                self.detour = None
+                self.avoidance_phase, self.avoidance_message = 'watching', '原任务已到点'
+                return
+            points = self._scan_points()
+            if points is None or self.clock() < detour['retry_at']:
+                return
+            cells = self.grid.obstacle_cells(points) | detour['blockers']
+            if cells == detour['attempt']:
+                return
+            detour['attempt'], detour['retry_at'] = cells, self.clock() + REPLAN_INTERVAL_S
+            pose = self._map_pose()
+            self.avoidance_phase, self.avoidance_message = 'replanning', '正在重新规划到原目标'
+
+        try:
+            plan = self.grid.plan(pose, detour['goal'], obstacle_cells=cells)
+        except PlanningError:
+            with self.lock:
+                if self.detour is detour:
+                    self.avoidance_phase, self.avoidance_message = 'waiting', '暂无绕行路线，保持停车'
+            return
+
+        # A* can outlast the freshness window while this owner is stopped.
+        fresh = master.query()
+        if fresh is not None:
+            self.observe(fresh)
+        with self.lock:
+            if self.detour is not detour:
+                return
+            if fresh is None or not self._stationary() or not same_pose(self._map_pose(), pose):
+                detour['attempt'] = None
+                self.avoidance_phase, self.avoidance_message = 'waiting', '等待新鲜停稳位姿'
+                return
+            if plan['no_motion']:
+                self.detour = None
+                self.avoidance_phase, self.avoidance_message = 'watching', '当前位置已在目标容差内'
+                return
+            self.pending = self.route = plan
+            self.work, self.error = 'uploading', None
+            self.avoidance_phase, self.avoidance_message = 'resuming', '已找到绕行路线，正在下发'
+
     def run(self, device, closed):
         try:
             with open_port(device, .1) as port:
@@ -307,6 +444,8 @@ class Navigation:
                             reply = master.query()
                             if reply is not None:
                                 self.observe(reply)
+                                if self.scanner is not None and self.mode == 'drive':
+                                    self._avoidance_cycle(master, reply)
                                 self._renew_if_due(master, reply)
                         if master.failed:
                             raise LinkError(self.error or 'V12 会话已失效')
@@ -317,6 +456,8 @@ class Navigation:
                             self.observe(exc.exchange)
                         with self.lock:
                             self.error = str(exc)
+                            if self.detour is not None:
+                                self._cancel_detour(self.error)
                             if stop:
                                 self.stop_ack, self.stop_verified = False, False
                     finally:
@@ -346,7 +487,16 @@ class Navigation:
             fresh = self._fresh()
             status_fresh = (self.connected and self.latest is not None
                             and 0 <= self.clock() - self.latest.sent_at < SOURCE_MAX_AGE_S)
-            preparing = not self.work and not self.stop_requested and self._stationary()
+            preparing = not self.work and not self.stop_requested and self.detour is None and self._stationary()
+            avoidance = None
+            points = None
+            if self.scanner is not None:
+                points = self._scan_points()
+                message = self.avoidance_message
+                if points is None and self.avoidance_phase == 'watching':
+                    message = '等待定位和有效雷达数据'
+                avoidance = dict(phase=self.avoidance_phase, message=message, replans=self.replans,
+                                 points=[dict(x=x, y=y) for x, y in points or ()])
             task = dict(id=str(status.task) if status else None,
                         phase=(self.work if self.work in ('uploading', 'starting', 'stopping')
                                else PHASES[status.state] if status_fresh else 'unknown'),
@@ -354,7 +504,7 @@ class Navigation:
                         progress=status.progress if status else 0,
                         lease_remaining_s=self._lease_seconds(self.latest) if status_fresh
                                           and status.lease_remaining_ms else None,
-                        arrival=bool(status_fresh and status.flags & 8),
+                        arrival=bool(status_fresh and status.flags & ARRIVAL_REACHED),
                         stop_ack=self.stop_ack,
                         stop_verified=(None if not status_fresh or
                                        (self.stop_requested and self.stop_ack is None) else
@@ -370,8 +520,9 @@ class Navigation:
                         trail=list(self.trail), preview=self.plan, route=self.route,
                         connected=self.connected,
                         source_fresh=fresh, busy=bool(self.work or self.stop_requested), mode=self.mode,
-                        task=task, can_prepare=preparing,
-                        can_start=bool(preparing and pose and self.plan and self.plan['segments']),
+                        task=task, avoidance=avoidance, can_prepare=preparing,
+                        can_start=bool(preparing and pose and self.plan and self.plan['segments']
+                                       and (self.scanner is None or points is not None)),
                         can_stop=self.connected and self.mode == 'drive', error=self.error)
 
 
@@ -452,6 +603,7 @@ def main(argv=None):
     parser.add_argument('--manual-only', action='store_true', help='只启用地图手动对齐')
     parser.add_argument('--no-modeled-error-margin', action='store_true',
                         help='路线扫掠只检查车体包络，不叠加动作结束误差')
+    parser.add_argument('--obstacle-test', action='store_true', help='启用前方雷达挡路停车与自动重规划')
     args = parser.parse_args(argv)
     grid = load_map(args.map_pgm, args.map_yaml, args.map_sha256, args.yaml_sha256,
                     use_modeled_error_margin=not args.no_modeled_error_margin)
@@ -459,7 +611,11 @@ def main(argv=None):
     if not args.manual_only:
         from v11_ros import RosLocalizer
         localizer = RosLocalizer(args.map_yaml, args.scan_topic)
-    nav = Navigation(grid, localizer, mode=args.mode)
+    scanner = None
+    if args.obstacle_test:
+        from v11_ros import RosObstacleScanner
+        scanner = RosObstacleScanner(args.scan_topic)
+    nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner)
     closed = threading.Event()
     owner = threading.Thread(target=nav.run, args=(args.port, closed), name='v12-owner')
     try:
@@ -475,6 +631,8 @@ def main(argv=None):
             owner.join()
         if localizer is not None:
             localizer.close()
+        if scanner is not None:
+            scanner.close()
 
 
 if __name__ == '__main__':

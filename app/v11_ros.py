@@ -1,4 +1,4 @@
-"""ROS1 bridge for V11 measured odom and a temporary AMCL session."""
+"""ROS1 bridge for measured odom, AMCL and the obstacle test."""
 from collections import deque
 from copy import copy
 import math
@@ -15,6 +15,8 @@ from simple_p2p_history import PoseHistory, PoseHistoryError
 
 NS = 1_000_000_000
 SOURCE_MAX_AGE_S = .25
+LASER_X_M = .13
+MIN_RANGE_M = 1.
 
 
 class OdomHistory:
@@ -69,7 +71,7 @@ class OdomHistory:
             latest = self.history.latest(now_mono, SOURCE_MAX_AGE_S)
             pose = self.history.sample_at((stamp_ns - self.ros_offset_ns) / NS)
             if not 0 <= now_mono - pose['source_monotonic_s'] < SOURCE_MAX_AGE_S:
-                raise PoseHistoryError('AMCL stamp has no fresh odometry bracket')
+                raise PoseHistoryError('Scan stamp has no fresh odometry bracket')
             return dict(pose, stamp_ns=stamp_ns, boot=latest['boot'], epoch=latest['epoch'])
 
 
@@ -86,6 +88,79 @@ def front_scan(raw, laser_frame, laser_yaw, min_range_m):
     if sum(math.isfinite(r) and scan.range_min < r < scan.range_max for r in scan.ranges) < 10:
         raise ValueError('Not enough measured front-sector ranges for AMCL')
     return scan
+
+
+class ObstacleScans:
+    def __init__(self, odom):
+        self.odom = odom
+        # A newer scan can arrive before its upper odometry bracket.
+        self.frames = deque(maxlen=4)
+        self.lock = threading.Lock()
+
+    def add(self, raw, now_mono):
+        scan, _ = crop_front_scan(raw, raw.header.frame_id)
+        stamp = scan.header.stamp.to_nsec()
+        source = (stamp - self.odom.ros_offset_ns) / NS
+        if not 0 <= now_mono - source < SOURCE_MAX_AGE_S:
+            return
+        points = []
+        minimum = max(MIN_RANGE_M, scan.range_min)
+        for index, distance in enumerate(scan.ranges):
+            if minimum <= distance < scan.range_max:
+                angle = scan.angle_min + index * scan.angle_increment
+                points.append((LASER_X_M + distance * math.cos(angle), distance * math.sin(angle)))
+        with self.lock:
+            if not self.frames or stamp > self.frames[-1][0]:
+                self.frames.append((stamp, tuple(points)))
+
+    def latest(self, now_mono):
+        with self.lock:
+            frames = tuple(self.frames)
+        for stamp, points in reversed(frames):
+            try:
+                pose = self.odom.at(stamp, now_mono)
+            except PoseHistoryError:
+                continue
+            return pose, points
+        return None
+
+
+def ros_odom_history(rospy):
+    if not rospy.core.is_initialized():
+        rospy.init_node('v11_rk_bridge', anonymous=True, disable_signals=True)
+    if rospy.get_param('/use_sim_time', False):
+        raise RuntimeError('V11 ROS bridge requires real ROS time')
+    before = time.monotonic_ns()
+    ros_now = rospy.Time.now()
+    offset_ns = ros_now.to_nsec() - (before + time.monotonic_ns()) // 2
+    return ros_now, OdomHistory(offset_ns)
+
+
+class RosObstacleScanner:
+    """Continuously pair real front-sector returns with measured odometry."""
+    def __init__(self, scan_topic='/lidar1/laser_fan'):
+        import rospy
+        from sensor_msgs.msg import LaserScan
+
+        _, odom = ros_odom_history(rospy)
+        self.scans = ObstacleScans(odom)
+        self.subscriber = rospy.Subscriber(scan_topic, LaserScan, self._received,
+                                           queue_size=1, tcp_nodelay=True)
+
+    def _received(self, scan):
+        try:
+            self.scans.add(scan, time.monotonic())
+        except ValueError:
+            pass
+
+    def publish(self, exchange):
+        self.scans.odom.add(exchange)
+
+    def latest(self):
+        return self.scans.latest(time.monotonic())
+
+    def close(self):
+        self.subscriber.unregister()
 
 
 def amcl_pose(message):
@@ -119,7 +194,7 @@ class RosLocalizer:
     the application can calculate and retain its own fixed alignment.
     """
     def __init__(self, map_yaml, scan_topic='/lidar1/laser_fan', *, timeout_s=25.,
-                 laser_x=.13, laser_y=0., laser_z=.2, laser_yaw=0., min_range_m=1.):
+                 laser_x=LASER_X_M, laser_y=0., laser_z=.2, laser_yaw=0., min_range_m=MIN_RANGE_M):
         self.map_yaml = Path(map_yaml).resolve(strict=True)
         if not self.map_yaml.is_file():
             raise ValueError('AMCL requires an existing map YAML file')
@@ -133,10 +208,7 @@ class RosLocalizer:
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import LaserScan
 
-        if not rospy.core.is_initialized():
-            rospy.init_node('v11_rk_bridge', anonymous=True, disable_signals=True)
-        if rospy.get_param('/use_sim_time', False):
-            raise RuntimeError('V11 localization requires real ROS time')
+        ros_now, self.odom = ros_odom_history(rospy)
 
         self.rospy = rospy
         self.PoseWithCovarianceStamped = PoseWithCovarianceStamped
@@ -148,10 +220,6 @@ class RosLocalizer:
         name = 'v11_' + uuid.uuid4().hex[:10]
         self.namespace = '/' + name
         self.frames = {frame: name + '_' + frame for frame in ('map', 'odom', 'base', 'laser')}
-        before = time.monotonic_ns()
-        ros_now = rospy.Time.now()
-        offset_ns = ros_now.to_nsec() - (before + time.monotonic_ns()) // 2
-        self.odom = OdomHistory(offset_ns)
         self.odom_pub = rospy.Publisher(self.namespace+'/wheel_odom', Odometry, queue_size=1)
         self.tf = tf2_ros.TransformBroadcaster()
         self.static_tf = tf2_ros.StaticTransformBroadcaster()

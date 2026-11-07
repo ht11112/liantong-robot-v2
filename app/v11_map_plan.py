@@ -213,9 +213,13 @@ def _capsule_hits_cell(a, b, radius_sq, i, j):
 
 
 class _Costmap:
-    def __init__(self, grid, search_padding=0.):
+    def __init__(self, grid, search_padding=0., *, obstacle_cells=()):
         self.width, self.height = grid.width, grid.height
         self.rows = grid.blocked_rows
+        if obstacle_cells:
+            self.rows = list(self.rows)
+            for x, y in obstacle_cells:
+                self.rows[y] |= 1 << x
         self.radius = (BODY_RADIUS_M + search_padding) / grid.resolution
         self._walkable = bytearray(self.width * self.height)
         self._disk_spans = []
@@ -365,6 +369,39 @@ class GridMap:
         return (self.origin[0] + self.resolution*(self._cos*x-self._sin*y),
                 self.origin[1] + self.resolution*(self._sin*x+self._cos*y))
 
+    def obstacle_cells(self, points):
+        """Place measured map points in the free cells of a temporary overlay."""
+        cells = set()
+        for x, y in points:
+            i, j = map(math.floor, self._to_grid(x, y))
+            if 0 <= i < self.width and 0 <= j < self.height and not self.blocked_rows[j] & (1 << i):
+                cells.add((i, j))
+        return frozenset(cells)
+
+    def route_blocked(self, pose, plan, index, progress, obstacle_cells):
+        """Test only new obstacles against the remaining queue from measured pose."""
+        if not obstacle_cells:
+            return False
+        x, y = self._to_grid(pose['x'], pose['y'])
+        yaw = pose['yaw'] - self.origin[2]
+        radius = BODY_RADIUS_M / self.resolution
+        for segment in plan['segments'][index:]:
+            a = x, y
+            if segment['kind'] == 'turn':
+                turn = segment['angle_rad']
+                yaw += math.copysign(max(0., abs(turn)-progress), turn)
+            else:
+                length = max(0., segment['distance_m']-progress) / self.resolution
+                x, y = x + length*math.cos(yaw), y + length*math.sin(yaw)
+            b = x, y
+            left, right = min(a[0], x)-radius-_EPS, max(a[0], x)+radius+_EPS
+            bottom, top = min(a[1], y)-radius-_EPS, max(a[1], y)+radius+_EPS
+            if any(left-1. <= i <= right and bottom-1. <= j <= top
+                   and _capsule_hits_cell(a, b, radius*radius, i, j) for i, j in obstacle_cells):
+                return True
+            progress = 0.
+        return False
+
     def _endpoints(self, costmap, pose, goal):
         a, b = self._to_grid(*pose[:2]), self._to_grid(*goal)
         if not costmap.sweep(a, a):
@@ -427,9 +464,9 @@ class GridMap:
             x, y = x+length*math.cos(yaw), y+length*math.sin(yaw)
         return _queue(segments)
 
-    def plan(self, pose, goal):
+    def plan(self, pose, goal, *, obstacle_cells=()):
         start, target = _point(pose, ('x', 'y', 'yaw')), _point(goal)
-        costmap = _Costmap(self)
+        costmap = _Costmap(self, obstacle_cells=obstacle_cells)
         a, b = self._endpoints(costmap, start, target)
         result = dict(map_id=self.map_id, start=dict(zip(('x', 'y', 'yaw'), start)),
                       goal=dict(zip(('x', 'y'), target)),
@@ -443,7 +480,7 @@ class GridMap:
         # Try wider candidate routes only during preview. Check each encoded
         # route with the same sweep policy used before uploading it.
         for padding in (0., .10, .25, .50):
-            search = costmap if not padding else _Costmap(self, padding)
+            search = costmap if not padding else _Costmap(self, padding, obstacle_cells=obstacle_cells)
             if not search.sweep(a, a) or not search.sweep(b, b):
                 break  # Larger search disks cannot reconnect these endpoints.
             try:
@@ -462,7 +499,7 @@ class GridMap:
                         search_padding_m=padding, **checked)
         raise last_error or PlanningError('No collision-checked executable action queue')
 
-    def validate_plan(self, pose, plan):
+    def validate_plan(self, pose, plan, *, obstacle_cells=()):
         """Recheck the same committed bytes from a current pose and costmap."""
         if not isinstance(plan, dict) or plan.get('map_id') != self.map_id or plan.get('no_motion') is not False:
             raise PlanningError('Expected an executable preview for this exact map')
@@ -470,6 +507,6 @@ class GridMap:
         segments, crc = _queue(plan.get('segments'))
         if type(plan.get('queue_crc32')) is not int or crc != plan['queue_crc32']:
             raise PlanningError('Preview queue CRC does not match the exact action bytes')
-        costmap = _Costmap(self)
+        costmap = _Costmap(self, obstacle_cells=obstacle_cells)
         self._endpoints(costmap, start, target)
         return self._verify(costmap, start, target, segments)
