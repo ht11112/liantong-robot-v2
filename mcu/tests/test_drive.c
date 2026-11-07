@@ -119,6 +119,39 @@ static void test_stop_requires_two_consecutive_zero_samples(void){
   assert(p.d.view.stop_verified&&p.d.view.state==MQ_DRIVE_STOPPED);
   puts("PASS drive STOP needs two consecutive fresh samples within 0.2 RPM on both wheels");
 }
+static void begin_stop_with_moving_feedback(Peer *p){
+  armed(p);p->force_speed=true;p->speed=3u;
+  drive_ops()->stop(&p->d,p->now);
+  for(unsigned i=0;i<100u&&!p->d.shutdown_ok;i++)tick(p);
+  assert(p->d.shutdown_ok&&!p->d.stationary_ok&&p->d.zero_count==0u);
+}
+static void test_stop_stationary_window(void){
+  Peer p;begin_stop_with_moving_feedback(&p);
+  run(&p,650);
+  stop_speed_sample(&p,0,0);
+  assert(p.d.zero_count==1u&&!p.d.stationary_ok);
+  stop_speed_sample(&p,0,0);
+  assert(p.d.stationary_ok&&p.now-p.d.stop_wait_started_ms<1200u);
+  run(&p,20);
+  assert(p.d.view.stop_verified&&p.d.view.state==MQ_DRIVE_STOPPED);
+
+  begin_stop_with_moving_feedback(&p);
+  run(&p,1100);
+  stop_speed_sample(&p,0,0);
+  assert(p.d.zero_count==1u&&!p.d.stationary_ok);
+  for(unsigned i=0;i<50u&&(!p.waiting||p.d.transaction.index!=0x606c);i++)tick(&p);
+  assert(p.waiting&&p.d.transaction.index==0x606c);
+  uint32_t request_age=p.sent_at-p.d.stop_wait_started_ms;
+  assert(request_age>1150u&&request_age<1200u);
+  p.delay=1200u-request_age;
+  run(&p,p.delay);
+  assert(p.now-p.d.stop_wait_started_ms==1200u);
+  assert(p.samples[p.sample_count-1u].left_tenths_rpm==0&&!p.d.stationary_ok);
+  p.delay=1;
+  run(&p,20);
+  assert(!p.d.view.stop_verified&&p.d.view.error==DRIVE_ERR_STOP);
+  puts("PASS drive STOP accepts late-in-window samples and rejects a pending reply at 1200 ms");
+}
 static void test_speed_feedback_and_failed_stop(void){
   Peer p;armed(&p);p.force_speed=true;p.speed=151u|((uint32_t)(uint16_t)-173<<16);
   unsigned sample_count=p.sample_count;
@@ -128,7 +161,7 @@ static void test_speed_feedback_and_failed_stop(void){
   assert(p.sample_count>sample_count);
   const MQSample *sample=&p.samples[p.sample_count-1];
   assert(sample->valid&&sample->left_tenths_rpm==151&&sample->right_tenths_rpm==-173);
-  drive_ops()->stop(&p.d,p.now);run(&p,800);
+  drive_ops()->stop(&p.d,p.now);run(&p,1400);
   assert(p.d.zero_ok&&p.d.shutdown_ok&&p.d.disable_ok&&!p.d.stationary_ok);
   assert(p.d.view.state==MQ_DRIVE_FAILED&&p.d.view.error==DRIVE_ERR_STOP);
   assert(!p.d.view.stop_verified&&p.d.tx_suppressed&&p.target==0&&p.fallback_writes==1&&p.guard==500);
@@ -151,7 +184,7 @@ static void test_bad_config_timeout_and_late_reply(void){
   Peer p;boot(&p);p.pole_override=16;drive_ops()->arm(&p.d,p.now);run(&p,100);assert(p.d.view.error==DRIVE_ERR_CAN);
   boot(&p);while(!p.d.transaction.pending)tick(&p);
   uint8_t bad[8]={0x43,0x99,0x99,0,0,0,0,0};drive_receive_can(&p.d,0x581,8,bad,p.now);assert(p.d.transaction.pending&&p.d.late_replies);
-  p.drop_all=true;run(&p,1400);assert(p.d.view.error==DRIVE_ERR_CAN&&p.d.tx_suppressed&&!p.d.view.stop_verified);
+  p.drop_all=true;run(&p,2200);assert(p.d.view.error==DRIVE_ERR_CAN&&p.d.tx_suppressed&&!p.d.view.stop_verified);
   uint32_t sends=p.sends;run(&p,500);assert(p.sends==sends);
   puts("PASS drive wrong-index reply, CAN timeout, invalid preflight and bounded failed-STOP silence");
 }
@@ -191,9 +224,9 @@ static void test_ambiguous_late_target_ack(void){
   uint8_t late[8]={0x60,0xff,0x60,3,0,0,0,0};
   /* Drop the new zero's real reply and deliver only the indistinguishable old ACK. */
   p.waiting=false;drive_receive_can(&p.d,0x581,8,late,p.now);drive_poll(&p.d,p.now);
-  assert(!p.d.zero_ok);run(&p,1000);
+  assert(!p.d.zero_ok);run(&p,1500);
   assert(p.d.view.error&&p.d.sdo_ambiguous&&p.d.tx_suppressed&&!p.d.view.stop_verified);
-  drive_ops()->stop(&p.d,p.now);run(&p,1000);
+  drive_ops()->stop(&p.d,p.now);run(&p,1500);
   assert(p.d.sdo_ambiguous&&!p.d.view.stop_verified&&p.d.view.state==MQ_DRIVE_FAILED);
   puts("PASS drive same-object late ACK cannot upgrade STOP after any SDO timeout, including explicit recovery");
 }
@@ -204,7 +237,7 @@ static void test_unavailable_tx_is_bounded(void){
   puts("PASS drive unavailable CAN TX cannot leave boot STOP pending indefinitely");
 }
 int main(void){
-  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_stop_requires_two_consecutive_zero_samples();
+  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_stop_requires_two_consecutive_zero_samples();test_stop_stationary_window();
   test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
   puts("PASS all production drive C tests (memory-only CAN peer)");return 0;
