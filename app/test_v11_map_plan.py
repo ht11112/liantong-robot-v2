@@ -122,6 +122,45 @@ class MapPlanTests(unittest.TestCase):
         self.assertEqual(plan,grid.plan(start,goal))
         self.assertEqual(grid.validate_plan(start,plan)['path'],plan['path'])
 
+    def test_dynamic_cells_respect_rotated_map_and_saved_occupancy(self):
+        grid = self.make_map(((1, 1, 0), (2, 2, 205)), origin=(10., 20., math.pi/2.))
+        points = [(9.85, 20.15), (9.75, 20.25), (9.65, 20.35), (9.66, 20.36), (10.1, 20.1)]
+        self.assertEqual(grid.obstacle_cells(points), frozenset({(3, 3)}))
+
+    def test_dynamic_obstacle_detours_without_changing_saved_costmap(self):
+        grid = self.make_map()
+        start, goal = pose(1.5, 3.05), pose(4.5, 3.05)
+        direct = grid.plan(start, goal)
+        costmap = grid.costmap_pgm()
+        cells = grid.obstacle_cells([(3.05, 3.05)])
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept capsule'):
+            grid.validate_plan(start, direct, obstacle_cells=cells)
+        detour = grid.plan(start, goal, obstacle_cells=cells)
+        self.assertGreater(detour['distance_m'], direct['distance_m'])
+        self.assertEqual(grid.validate_plan(start, detour, obstacle_cells=cells)['path'], detour['path'])
+        self.assertEqual(grid.costmap_pgm(), costmap)
+        self.assertEqual(grid.plan(start, goal), direct)
+
+    def test_remaining_move_ignores_passed_cells_and_motion_past_goal(self):
+        grid = self.make_map()
+        plan = grid.plan(pose(1.5, 3.05), pose(3.5, 3.05))
+        current = pose(2.5, 3.05)
+        off_route = grid.obstacle_cells([(1.85, 3.05), (3.85, 3.05), (3.05, 3.65)])
+        self.assertFalse(grid.route_blocked(current, plan, 0, 1., off_route))
+        ahead = grid.obstacle_cells([(3.25, 3.05)])
+        self.assertTrue(grid.route_blocked(current, plan, 0, 1., ahead))
+
+    def test_remaining_turn_uses_direction_and_progress_before_later_move(self):
+        grid = self.make_map()
+        plan = grid.plan(pose(2.5, 3.5), pose(2.5, 2.))
+        self.assertLess(plan['segments'][0]['angle_rad'], 0.)
+        partway = pose(2.5, 3.5, -math.pi/4.)
+        after_turn = pose(2.5, 3.5, -math.pi/2.)
+        ahead = grid.obstacle_cells([(2.5, 2.5)])
+        self.assertTrue(grid.route_blocked(partway, plan, 0, math.pi/4., ahead))
+        self.assertTrue(grid.route_blocked(after_turn, plan, 1, 0., ahead))
+        self.assertFalse(grid.route_blocked(after_turn, plan, 2, 0., ahead))
+
     def test_straight_sweep_detects_closed_cell_edge_not_only_centers(self):
         grid = self.make_map(((20,20,0),))
         y = 2.-BODY_RADIUS_M  # Exact swept disk tangency at cell y=2 m.
@@ -148,6 +187,12 @@ class MapPlanTests(unittest.TestCase):
         # beyond the body radius, but the 3° TURN shortfall envelope reaches it.
         with self.assertRaisesRegex(PlanningError,'MOVE swept capsule'):
             grid.validate_plan(start,plan)
+        nominal_grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        nominal_grid.validate_plan(start, plan)
+        crossing = pose(2.1, 2.)
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept capsule'):
+            nominal_grid.validate_plan(crossing, wire_preview(
+                nominal_grid, pose(2.1, 3.5), plan['segments']))
 
     def test_small_turn_omission_does_not_invent_a_heading_change(self):
         grid = self.make_map()

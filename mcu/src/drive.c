@@ -6,6 +6,7 @@ enum { FLOW_STOP=1,FLOW_ARM=2 };
 enum { OWNER_FLOW=1,OWNER_SPEED,OWNER_AUX,OWNER_GUARD,OWNER_TARGET,OWNER_REFRESH };
 enum { READ=0,WRITE=1 };
 enum { C_LEFT=1,C_RIGHT=2,C_SPEED=4,C_STATUS=8,C_FAULT=16,C_CURRENT=32 };
+enum { STOP_STATIONARY_WINDOW_MS=1200 };
 
 typedef struct { uint16_t index;uint8_t sub,bytes,check;uint32_t value; } ArmStep;
 enum { EQ=0,BUS_RANGE,SPEED_ZERO,STATUS_ZERO,HALL_RANGE,LE500,POSITIVE,LIMIT_WRITE,LIMIT_VERIFY,STATUS1,STATUS3,STATUS7 };
@@ -90,9 +91,10 @@ static void publish_speed(Drive *d,uint32_t value,uint32_t tick){
   d->sample=(MQSample){++d->sample_sequence,tick,(int16_t)value,(int16_t)(value>>16),d->position_left,d->position_right,fresh};
   d->sample_ready=true;
   if(d->flow==FLOW_STOP&&d->flow_step==2){
-    if(!elapsed(d->now,tick,250)&&magnitude((int16_t)value)<=2u&&magnitude((int16_t)(value>>16))<=2u)d->zero_count++;
+    if(!elapsed(tick,d->stop_wait_started_ms,STOP_STATIONARY_WINDOW_MS)&&!elapsed(d->now,tick,250)&&
+       magnitude((int16_t)value)<=2u&&magnitude((int16_t)(value>>16))<=2u)d->zero_count++;
     else d->zero_count=0;
-    if(d->zero_count>=3)d->stationary_ok=true;
+    if(d->zero_count>=2u)d->stationary_ok=true;
   }
 }
 
@@ -234,7 +236,7 @@ static bool stop_step(Drive *d){
   case 0:return start(d,0x60ff,3,4,true,0,OWNER_FLOW,0);
   case 1:return start(d,0x6040,0,2,true,6,OWNER_FLOW,0);
   case 2:
-    if(d->stationary_ok||elapsed(d->now,d->stop_wait_started_ms,600)){d->flow_step=3;return stop_step(d);}return false;
+    if(d->stationary_ok||elapsed(d->now,d->stop_wait_started_ms,STOP_STATIONARY_WINDOW_MS)){d->flow_step=3;return stop_step(d);}return false;
   case 3:return start(d,0x6040,0,2,true,0,OWNER_FLOW,0);
   case 4:return start(d,0x6041,0,4,false,0,OWNER_FLOW,0);
   case 5:return start(d,0x603f,0,4,false,0,OWNER_FLOW,0);
@@ -287,7 +289,8 @@ void drive_poll(Drive *d,uint32_t now){
   }
   if(d->transaction.pending||d->transaction.done||d->tx_suppressed)return;
   /* STOP's first physical commands precede background queries. */
-  if(d->flow==FLOW_STOP&&d->flow_step==2&&(d->stationary_ok||elapsed(now,d->stop_wait_started_ms,600)))d->flow_step=3;
+  if(d->flow==FLOW_STOP&&d->flow_step==2&&
+     (d->stationary_ok||elapsed(now,d->stop_wait_started_ms,STOP_STATIONARY_WINDOW_MS)))d->flow_step=3;
   if(d->flow==FLOW_STOP&&d->flow_step!=2){stop_step(d);return;}
   if(elapsed(now,d->last_speed_start,50)){
     if(start(d,0x606c,3,4,false,0,OWNER_SPEED,0))d->last_speed_start=now;

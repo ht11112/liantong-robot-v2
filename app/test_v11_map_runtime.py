@@ -7,8 +7,8 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
-from v11_map_runtime import Navigation, load_map
-from mcu_v11 import (ACK_VALID, EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RENEW,
+from v11_map_runtime import Navigation, load_map, same_pose
+from mcu_v11 import (ACK_VALID, EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RENEW, STOP_CONFIRMED,
                      Exchange, LinkError, QueuePlan, Telemetry)
 
 
@@ -183,10 +183,16 @@ class NavigationTest(unittest.TestCase):
         self.assertEqual(state['task']['phase'], 'unknown')
         self.assertEqual(state['error'], 'Serial exchange failed')
 
-    def test_manual_zero_accepts_wrapped_yaw_roundoff_but_not_motion(self):
+    def test_same_pose_checks_distance_and_wrapped_heading_at_the_boundary(self):
+        reference = dict(x=0., y=0., yaw=math.radians(179.))
+        self.assertTrue(same_pose(dict(x=.02, y=0., yaw=math.radians(-179.)), reference))
+        self.assertFalse(same_pose(dict(x=.015, y=.015, yaw=reference['yaw']), reference))
+        self.assertFalse(same_pose(dict(x=0., y=0., yaw=math.radians(-178.9)), reference))
+
+    def test_manual_zero_accepts_small_pose_changes_but_rejects_displacement_over_limit(self):
         seed = dict(x=1., y=1., yaw=0.)
         require_stationary = self.nav._require_stationary
-        for displacement in (0., .002):
+        for displacement, success in ((.019, True), (.021, False)):
             with self.subTest(displacement=displacement):
                 self.observe(x=0., yaw=math.pi - 1e-7)
 
@@ -196,20 +202,22 @@ class NavigationTest(unittest.TestCase):
                     return require_stationary()
 
                 with patch.object(self.nav, '_require_stationary', side_effect=new_sample):
-                    if displacement:
+                    if not success:
                         with self.assertRaisesRegex(ValueError, '置零期间车体位置发生变化'):
                             self.nav.align(seed, 'manual')
                     else:
                         self.nav.align(seed, 'manual')
                         self.assertEqual(self.nav.snapshot()['local_pose'], dict(x=0., y=0., yaw=0.))
 
-    def test_preview_accepts_roundoff_but_rejects_heading_change_during_planning(self):
+    def test_preview_accepts_small_heading_change_but_rejects_over_limit(self):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
         goal = dict(x=1.5, y=1.)
         plan = self.grid.plan
 
-        for yaw, success in ((2e-7, True), (.002, False)):
+        for yaw, success in ((math.radians(1.9), True), (math.radians(2.1), False)):
             with self.subTest(yaw=yaw):
+                self.observe(x=0., yaw=0.)
+
                 def plan_after_sample(pose, target):
                     self.observe(x=4e-7, y=4e-7, yaw=yaw)
                     return plan(pose, target)
@@ -223,9 +231,9 @@ class NavigationTest(unittest.TestCase):
                 self.assertEqual(self.nav.snapshot()['can_start'], success)
 
     def test_upload_validates_current_pose_and_checks_motion_before_and_after_upload(self):
-        for before, after, error in ((4e-7, 7e-7, None),
-                                     (.002, .002, '^起点已变化'),
-                                     (4e-7, .002, '^上传期间起点已变化')):
+        for before, after, error in ((.010, .025, None),
+                                     (.021, .021, '^起点已变化'),
+                                     (.010, .031, '^上传期间起点已变化')):
             with self.subTest(before=before, after=after):
                 self.nav = Navigation(self.grid, mode='drive', clock=lambda: self.now)
                 self.observe(x=0., yaw=0., task=0, state=0)
@@ -252,11 +260,16 @@ class NavigationTest(unittest.TestCase):
                             self.nav._upload(master, plan)
                     else:
                         self.nav._upload(master, plan)
-                    if before == .002:
+                    if before > .02:
                         validate.assert_not_called()
                         master.upload.assert_not_called()
                     else:
-                        validate.assert_called_once_with(current_pose, plan)
+                        self.assertEqual(validate.call_args_list[0].args, (current_pose, plan))
+                        if error:
+                            self.assertEqual(validate.call_count, 1)
+                        else:
+                            self.assertEqual(validate.call_count, 2)
+                            self.assertAlmostEqual(validate.call_args.args[0]['x'], 1. + after)
                         master.upload.assert_called_once()
                 if error:
                     master.start.assert_not_called()
@@ -322,6 +335,97 @@ class NavigationTest(unittest.TestCase):
             self.nav.request_stop()
         with self.assertRaises(ValueError):
             self.nav.request_start(plan['id'])
+
+    def obstacle_test_start(self):
+        self.grid.use_modeled_error_margin = False
+        scanner = Mock()
+        scanner.latest.return_value = (dict(boot=42, epoch=1, x=0., y=0., yaw=0.), ())
+        self.nav = Navigation(self.grid, mode='drive', clock=lambda: self.now, scanner=scanner)
+        self.observe()
+        self.nav.align(dict(x=.6, y=2., yaw=0.), 'manual')
+        self.nav.preview(dict(x=3.45, y=2.))
+        self.nav.request_start(self.nav.plan['id'])
+        self.nav.pending = self.nav.work = None
+        self.nav.lease_task = (42, 1, 1)
+        self.observe(task=1, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=25000)
+        return scanner
+
+    def test_blocked_route_stops_then_replans_from_stopped_pose_and_starts_new_task(self):
+        scanner = self.obstacle_test_start()
+        master = Mock()
+        scanner.latest.return_value[0]['x'] = .10
+        scanner.latest.return_value = (scanner.latest.return_value[0], ((1.20, 0.),))
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertTrue(self.nav.stop_requested)
+        self.assertIsNone(self.nav.lease_task)
+        self.assertEqual(self.nav.snapshot()['avoidance']['phase'], 'stopping')
+        self.assertAlmostEqual(self.nav.snapshot()['avoidance']['points'][0]['x'], 1.90)
+        master.upload.assert_not_called()
+
+        self.observe(state=9, flags=self.sample.flags & ~EXECUTING | STOP_CONFIRMED,
+                     first_error=1, lease_remaining_ms=0, x=.20)
+        master.stop.return_value = dict(stop_verified=True)
+        self.nav._stop(master)
+        self.nav.stop_requested = False
+        master.stop.assert_called_once()
+        # The triggering return can be absent from the next front scan.
+        scanner.latest.return_value = (scanner.latest.return_value[0], ())
+        master.query.return_value = self.nav.latest
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        route = self.nav.pending
+        self.assertEqual(route['goal'], dict(x=3.45, y=2.))
+        self.assertAlmostEqual(route['start']['x'], .8)
+        self.assertGreater(len(route['path']), 2)
+        self.assertEqual(self.nav.snapshot()['avoidance']['phase'], 'resuming')
+
+        def upload(plan, on_ack):
+            self.assertIs(plan, route)
+            ready = replace(self.nav.latest, status=replace(self.sample, task=2, state=2, first_error=0))
+            on_ack(ready)
+            return [ready]
+
+        master.upload.side_effect = upload
+        master.start.return_value = replace(self.nav.latest, status=replace(
+            self.sample, task=2, state=3, first_error=0, lease_remaining_ms=30000,
+            flags=self.sample.flags & ~STOP_CONFIRMED | EXECUTING))
+        self.nav._upload(master, route)
+        master.start.assert_called_once_with(2)
+        self.assertEqual(self.nav.lease_task, (42, 1, 2))
+        self.assertEqual(self.nav.snapshot()['avoidance']['replans'], 1)
+
+    def test_blocked_goal_waits_and_manual_stop_discards_auto_restart(self):
+        scanner = self.obstacle_test_start()
+        master = Mock()
+        scanner.latest.return_value = (scanner.latest.return_value[0], ((2.85, 0.),))
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertTrue(self.nav.stop_requested)
+        self.observe(state=9, flags=self.sample.flags & ~EXECUTING | STOP_CONFIRMED,
+                     first_error=1, lease_remaining_ms=0)
+        master.stop.return_value = dict(stop_verified=True)
+        self.nav._stop(master)
+        self.nav.stop_requested = False
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertEqual(self.nav.snapshot()['avoidance']['phase'], 'waiting')
+        self.assertIsNone(self.nav.pending)
+        self.nav.request_stop()
+        self.assertIsNone(self.nav.detour)
+        self.assertEqual(self.nav.snapshot()['avoidance']['phase'], 'cancelled')
+        master.query.assert_not_called()
+        master.upload.assert_not_called()
+        master.start.assert_not_called()
+
+    def test_obstacle_stop_without_measured_proof_does_not_plan_a_restart(self):
+        scanner = self.obstacle_test_start()
+        master = Mock()
+        scanner.latest.return_value = (scanner.latest.return_value[0], ((1.5, 0.),))
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertTrue(self.nav.stop_requested)
+        master.stop.return_value = dict(stop_verified=False, error=dict(code='stop_proof_deadline'))
+        self.nav._stop(master)
+        self.assertIsNone(self.nav.detour)
+        self.assertEqual(self.nav.snapshot()['avoidance']['phase'], 'cancelled')
+        master.query.assert_not_called()
+        master.start.assert_not_called()
 
 
 if __name__ == '__main__':

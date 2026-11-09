@@ -3,7 +3,7 @@ import math
 from types import SimpleNamespace as NSObj
 import unittest
 
-from v11_ros import NS, OdomHistory, amcl_pose, front_scan
+from v11_ros import NS, ObstacleScans, OdomHistory, amcl_pose, front_scan
 from simple_p2p_history import PoseHistoryError
 
 
@@ -23,6 +23,12 @@ class Stamp:
 
     def to_nsec(self):
         return self.secs*NS + self.nsecs
+
+
+def obstacle_scan(first_ray_s, ranges):
+    return NSObj(header=NSObj(frame_id='original', seq=1, stamp=Stamp(OFFSET + round(first_ray_s*NS))),
+                 angle_min=-math.pi, angle_max=math.pi, angle_increment=math.pi/4,
+                 range_min=.1, range_max=50., time_increment=.005, intensities=[], ranges=ranges)
 
 
 class V11RosTests(unittest.TestCase):
@@ -101,6 +107,55 @@ class V11RosTests(unittest.TestCase):
         message.pose.covariance[35] = -1.
         with self.assertRaises(ValueError):
             amcl_pose(message)
+
+
+class ObstacleScanTests(unittest.TestCase):
+    def test_front_returns_at_measured_scan_pose_use_vehicle_offset(self):
+        odom = OdomHistory(OFFSET)
+        scans = ObstacleScans(odom)
+        odom.add(exchange(1, 100, 10.021, x=1.))
+        odom.add(exchange(2, 150, 10.071, x=3.))
+        raw = obstacle_scan(10.01, [4., 4., 2., math.nan, 1., .999, 3., 4., 4.])
+        scans.add(raw, 10.08)
+
+        pose, points = scans.latest(10.09)
+        self.assertAlmostEqual(pose['x'], 1.8)
+        self.assertEqual((pose['boot'], pose['epoch']), (12, 1))
+        self.assertEqual(pose['stamp_ns'], OFFSET + 10*NS + 20_000_000)
+        self.assertEqual(len(points), 3)
+        for actual, expected in zip(points, ((.13, -2.), (1.13, 0.), (.13, 3.))):
+            self.assertAlmostEqual(actual[0], expected[0])
+            self.assertAlmostEqual(actual[1], expected[1])
+        self.assertEqual(raw.header.stamp.to_nsec(), OFFSET + 10*NS + 10_000_000)
+
+    def test_new_scan_waits_for_bracket_and_valid_empty_scan_replaces_returns(self):
+        odom = OdomHistory(OFFSET)
+        scans = ObstacleScans(odom)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(2, 150, 10.071))
+        scans.add(obstacle_scan(10.01, [2.]*9), 10.08)
+        previous = scans.latest(10.09)
+        scans.add(obstacle_scan(10.07, [math.inf]*9), 10.09)
+        self.assertEqual(scans.latest(10.1), previous)
+
+        odom.add(exchange(3, 200, 10.121))
+        pose, points = scans.latest(10.14)
+        self.assertEqual(pose['stamp_ns'], OFFSET + 10*NS + 80_000_000)
+        self.assertEqual(points, ())
+        self.assertEqual(scans.latest(10.15), (pose, points))
+
+    def test_duplicate_frames_do_not_renew_and_odom_epoch_cuts_bracket(self):
+        odom = OdomHistory(OFFSET)
+        scans = ObstacleScans(odom)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(2, 150, 10.071))
+        scans.add(obstacle_scan(10.01, [2.]*9), 10.08)
+        scans.add(obstacle_scan(10.01, [math.inf]*9), 10.09)
+        self.assertEqual(len(scans.latest(10.1)[1]), 5)
+        self.assertIsNone(scans.latest(10.3))
+
+        odom.add(exchange(1, 100, 10.121, epoch=2))
+        self.assertIsNone(scans.latest(10.14))
 
 
 if __name__ == '__main__':
