@@ -25,6 +25,11 @@ static bool zero_sample(const MQOdom *o) {
          o->right_tenths_rpm>=-2 && o->right_tenths_rpm<=2;
 }
 static MQDriveView view(MQ *q) { return q->drive.view(q->drive_user); }
+static bool verified_stopped(MQ *q) {
+  MQDriveView d=view(q);
+  return !mq_is_executing(q) && d.state==MQ_DRIVE_STOPPED && d.stop_verified &&
+    d.guard_valid && !d.error;
+}
 bool mq_is_executing(const MQ *q) {
   return q->state==MQ_ARMING || q->state==MQ_MOVE || q->state==MQ_TURN ||
          q->state==MQ_BARRIER || q->state==MQ_STOPPING;
@@ -51,29 +56,44 @@ void mq_fault(MQ *q,uint32_t error,uint32_t now) {
 }
 void mq_sample(MQ *q,const MQSample *s) {
   MQOdom *o=&q->odom;
+  bool stationary=s->left_tenths_rpm>=-2 && s->left_tenths_rpm<=2 &&
+    s->right_tenths_rpm>=-2 && s->right_tenths_rpm<=2;
   if(!s->valid) {
-    MQDriveView d=view(q);
-    bool safe=o->valid && o->initialized && zero_sample(o) &&
-      !mq_is_executing(q) && d.state==MQ_DRIVE_STOPPED && d.stop_verified &&
-      d.guard_valid && !d.error && s->tick_ms-o->measurement_tick_ms<=MQ_SAMPLE_TIMEOUT_MS;
+    uint32_t previous_sequence=o->valid?o->sample_sequence:o->recovery_sequence;
+    uint32_t previous_tick=o->valid?o->measurement_tick_ms:o->recovery_tick;
+    /* Repeated invalid sources reset the good count, never move the window. */
+    if(o->valid)o->recovery_start_tick=o->measurement_tick_ms;
+    bool safe=o->initialized && (o->valid || o->recovery_allowed) && zero_sample(o) &&
+      stationary && verified_stopped(q) && s->sequence-previous_sequence==1u &&
+      s->tick_ms-previous_tick>0u && s->tick_ms-previous_tick<=MQ_SAMPLE_TIMEOUT_MS &&
+      s->tick_ms-o->recovery_start_tick<=MQ_SAMPLE_TIMEOUT_MS;
     o->valid=false;o->discontinuities++;
     o->recovery_allowed=safe;o->recovery_count=0;
     o->recovery_sequence=s->sequence;o->recovery_tick=s->tick_ms;
-    o->recovery_start_tick=o->measurement_tick_ms;
     if(mq_is_executing(q))mq_fault(q,MQ_ERR_ODOM,s->tick_ms);
     return;
   }
+  /* The boot STOP must finish before a real zero-speed source sets the origin. */
+  if(!o->initialized && (!stationary || !verified_stopped(q)))return;
   if(o->initialized && s->sequence==o->sample_sequence) return;
   float l=(float)s->left_tenths_rpm*(MQ_PI*MQ_DIAMETER_M/600.f);
   float r=-(float)s->right_tenths_rpm*(MQ_PI*MQ_DIAMETER_M/600.f);
   float v=(l+r)*.5f,w=(r-l)/MQ_SEPARATION_M;
+  uint32_t dt=s->tick_ms-o->measurement_tick_ms;
+  uint32_t sequence_step=s->sequence-o->sample_sequence;
+  bool continuous=sequence_step==1u && dt>0u && dt<=MQ_SAMPLE_TIMEOUT_MS;
   bool recovering=o->initialized && !o->valid;
-  if(recovering) {
-    MQDriveView d=view(q);
-    bool stationary=s->left_tenths_rpm>=-2 && s->left_tenths_rpm<=2 &&
-      s->right_tenths_rpm>=-2 && s->right_tenths_rpm<=2;
-    if(!o->recovery_allowed || mq_is_executing(q) || d.state!=MQ_DRIVE_STOPPED ||
-       !d.stop_verified || !d.guard_valid || d.error || !stationary ||
+  if(o->initialized && o->valid && !continuous) {
+    /* Discard a forward source gap while parked. This is only recovery sample
+       one; neither this gap nor the later recovery samples are integrated. */
+    o->recovery_allowed=sequence_step>1u && sequence_step<0x80000000u &&
+      dt>0u && dt<=MQ_SAMPLE_TIMEOUT_MS && zero_sample(o) && stationary && verified_stopped(q);
+    o->recovery_start_tick=o->measurement_tick_ms;
+    o->recovery_sequence=s->sequence;o->recovery_tick=s->tick_ms;
+    o->recovery_count=o->recovery_allowed?1u:0u;
+    o->valid=false;o->discontinuities++;recovering=true;
+  } else if(recovering) {
+    if(!o->recovery_allowed || !verified_stopped(q) || !stationary ||
        s->sequence-o->recovery_sequence!=1u ||
        s->tick_ms-o->recovery_tick==0u || s->tick_ms-o->recovery_tick>MQ_SAMPLE_TIMEOUT_MS ||
        s->tick_ms-o->recovery_start_tick>MQ_SAMPLE_TIMEOUT_MS) {
@@ -83,10 +103,7 @@ void mq_sample(MQ *q,const MQSample *s) {
       if(++o->recovery_count>=3u){o->valid=true;o->recovery_allowed=false;}
     }
   }
-  bool continuous=true;
   if(o->initialized && !recovering) {
-    uint32_t dt=s->tick_ms-o->measurement_tick_ms;
-    continuous=s->sequence-o->sample_sequence==1u && dt>0 && dt<=MQ_SAMPLE_TIMEOUT_MS;
     if(continuous && o->valid) {
       float seconds=(float)dt*.001f;
       float ds=(o->previous_v+v)*.5f*seconds;

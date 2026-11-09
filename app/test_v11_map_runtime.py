@@ -1,5 +1,7 @@
 import math
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
+import io
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
@@ -91,8 +93,12 @@ class NavigationTest(unittest.TestCase):
 
     def test_duplicate_source_does_not_refresh_pose_or_invalidate_alignment(self):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        original_source_time = self.nav.source_time
         self.now += .260
         self.observe(publication_sequence=2, publication_tick_ms=101)
+        self.assertTrue(self.nav.snapshot()['source_fresh'])
+        self.assertEqual(self.nav.source_time, original_source_time)
+        self.now = original_source_time + .500
         state = self.nav.snapshot()
         self.assertFalse(state['source_fresh'])
         self.assertEqual(state['localization']['mode'], 'manual')
@@ -123,7 +129,7 @@ class NavigationTest(unittest.TestCase):
                 self.assertTrue(state['connected'])
                 self.assertTrue(state['source_fresh'])
                 self.assertIsNone(state['error'])
-                self.now += .16
+                self.now += .41
                 return None
             if step == 'receive':
                 state = self.nav.snapshot()
@@ -339,11 +345,12 @@ class NavigationTest(unittest.TestCase):
     def obstacle_test_start(self):
         self.grid.use_modeled_error_margin = False
         scanner = Mock()
+        scanner.diagnostics.return_value = dict(failure_reason=None, paired=True)
         self.scan_id = 0
-        self.scan_observation(scanner)
         self.nav = Navigation(self.grid, mode='drive', clock=lambda: self.now, scanner=scanner)
         self.observe()
         self.nav.align(dict(x=.6, y=2., yaw=0.), 'manual')
+        self.scan_observation(scanner)
         self.nav.preview(dict(x=3.45, y=2.))
         self.nav.request_start(self.nav.plan['id'])
         self.nav.pending = self.nav.work = None
@@ -351,7 +358,7 @@ class NavigationTest(unittest.TestCase):
         self.observe(task=1, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=25000)
         return scanner
 
-    def scan_observation(self, scanner, points=None, rays=(), *, usable=True, x=0.):
+    def scan_observation(self, scanner, points=None, rays=(), *, usable=True, x=0., clear=True):
         self.scan_id += 1
         if points is None:
             # A real usable frame has a finite return, here outside this map
@@ -360,7 +367,11 @@ class NavigationTest(unittest.TestCase):
             rays = ((0., 1., 0., 3.),) if usable else ()
         scanner.latest_observation.return_value = dict(
             pose=dict(boot=42, epoch=1, x=x, y=0., yaw=0.), points=points,
-            clear_rays=rays, stamp_ns=self.scan_id, usable=usable)
+            clear_rays=rays, stamp_ns=self.scan_id, usable=usable,
+            source_mono=self.now, expires_mono=self.now + .25)
+        self.nav.update_scan()
+        if clear:
+            self.nav.clear_obstacle_rays()
 
     def test_blocked_route_stops_then_replans_from_stopped_pose_and_starts_new_task(self):
         scanner = self.obstacle_test_start()
@@ -502,6 +513,7 @@ class NavigationTest(unittest.TestCase):
         master = Mock()
         seen = self.nav.last_usable_scan
         self.fresh_tick(.2)
+        self.nav.update_scan()
         self.nav.snapshot()
         self.assertEqual(self.nav.last_usable_scan, seen)
         self.scan_observation(scanner, usable=False)
@@ -520,6 +532,133 @@ class NavigationTest(unittest.TestCase):
         self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
         self.assertFalse(self.nav.obstacles.cells)
         self.assertIsNone(self.nav.scan_stamp)
+
+    def test_slow_clearance_leaves_serial_and_web_free_and_preserves_newer_hit(self):
+        scanner = self.obstacle_test_start()
+        hit = ((1.20, 0.),)
+        self.scan_observation(scanner, hit)
+        remembered = self.nav.obstacles.cells
+        self.assertTrue(remembered)
+        self.scan_observation(scanner, ((3.4, 0.),), ((1., 0., 3.4, 0.),), clear=False)
+        entered, release, done = Event(), Event(), Event()
+        calculate = self.nav.obstacles.cleared_cells
+        cleared = []
+
+        def slow_clear(cells, rays):
+            cleared.append(calculate(cells, rays))
+            entered.set()
+            release.wait(2.)
+            return cleared[0]
+
+        def accept_feedback_and_new_hit():
+            self.fresh_tick(.1)
+            self.nav.snapshot()
+            self.scan_observation(scanner, hit, clear=False)
+            done.set()
+
+        with patch.object(self.nav.obstacles, 'cleared_cells', side_effect=slow_clear):
+            worker = Thread(target=self.nav.clear_obstacle_rays)
+            reader = Thread(target=accept_feedback_and_new_hit)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1.))
+                reader.start()
+                self.assertTrue(done.wait(1.))
+            finally:
+                release.set()
+                worker.join(2.)
+                if reader.ident is not None:
+                    reader.join(2.)
+        self.assertTrue(remembered.issubset(cleared[0]))
+        self.assertTrue(remembered.issubset(self.nav.obstacles.cells))
+
+    def test_start_waits_for_scan_and_respects_timeout_and_stop(self):
+        initial = self.sample
+        for outcome in ('paired', 'timeout', 'stop', 'expires_after_upload'):
+            with self.subTest(outcome=outcome):
+                self.sample = initial
+                scanner = self.obstacle_test_start()
+                self.observe(task=0, state=0, flags=self.sample.flags & ~EXECUTING, lease_remaining_ms=0)
+                self.nav.lease_task = None
+                self.nav.preview(dict(x=3.45, y=2.))
+                self.fresh_tick(.26)
+                state = self.nav.snapshot()
+                self.assertEqual(state['avoidance']['scan_status'], 'unavailable')
+                self.assertTrue(state['can_start'])
+                self.nav.request_start(self.nav.plan['id'])
+                self.assertIn('启动前等待', self.nav.snapshot()['avoidance']['message'])
+                master = Mock(reply_timeout=.1)
+                master.sleep.side_effect = lambda seconds: setattr(self, 'now', self.now + seconds)
+                began = self.now
+
+                def query(*, start_before):
+                    self.assertLess(self.now, start_before)
+                    self.fresh_tick(.05)
+                    if outcome == 'stop':
+                        self.nav.request_stop()
+                    elif outcome != 'timeout':
+                        self.scan_observation(scanner)
+                    return self.nav.latest
+
+                def upload(plan, *, on_ack):
+                    self.assertIsNotNone(self.nav._scan_points())
+                    if outcome == 'expires_after_upload':
+                        self.fresh_tick(.26)
+                        self.assertIsNone(self.nav._scan_points())
+                    on_ack(self.nav.latest)
+                    return [self.nav.latest]
+
+                def start(task):
+                    self.assertIsNotNone(self.nav._scan_points())
+                    return self.nav.latest
+
+                master.query.side_effect = query
+                master.upload.side_effect = upload
+                master.start.side_effect = start
+                if outcome == 'timeout':
+                    with self.assertRaisesRegex(ValueError, '配对超时'):
+                        self.nav._upload(master, self.nav.pending)
+                    self.assertAlmostEqual(self.now - began, .75)
+                else:
+                    self.nav._upload(master, self.nav.pending)
+                if outcome in ('timeout', 'stop'):
+                    master.upload.assert_not_called()
+                    master.start.assert_not_called()
+                    self.assertEqual(self.nav.stop_requested, outcome == 'stop')
+                else:
+                    master.upload.assert_called_once()
+                    master.start.assert_called_once()
+                    self.assertEqual(master.query.call_count, 2 if outcome == 'expires_after_upload' else 1)
+
+    def test_scan_wait_accepts_current_pair_at_deadline_but_stop_and_stale_still_block(self):
+        initial = self.sample
+        for lateness, condition in ((0., 'fresh'), (.01, 'fresh'), (.01, 'stale'), (0., 'stop')):
+            with self.subTest(lateness=lateness, condition=condition):
+                self.sample = initial
+                self.obstacle_test_start()
+                self.observe(task=0, state=0, flags=self.sample.flags & ~EXECUTING, lease_remaining_ms=0)
+                if condition == 'stale':
+                    self.fresh_tick(.25)
+                    self.assertIsNone(self.nav._scan_points())
+                else:
+                    self.assertIsNotNone(self.nav._scan_points())
+                if condition == 'stop':
+                    self.nav.request_stop()
+                deadline = self.now - lateness
+                checked_at = self.now
+                master = Mock(reply_timeout=.1)
+                with redirect_stdout(io.StringIO()):
+                    if condition == 'stale':
+                        with self.assertRaisesRegex(ValueError, '配对超时'):
+                            self.nav._wait_start_scan(master, deadline, 'before_upload')
+                    else:
+                        self.assertEqual(self.nav._wait_start_scan(master, deadline, 'before_upload'),
+                                         condition == 'fresh')
+                self.assertEqual(self.now, checked_at)
+                master.query.assert_not_called()
+                master.sleep.assert_not_called()
+                master.upload.assert_not_called()
+                master.start.assert_not_called()
 
     def test_cancel_cannot_be_accepted_before_inflight_start_finishes(self):
         self.nav.mode = 'drive'
@@ -553,6 +692,96 @@ class NavigationTest(unittest.TestCase):
         self.assertTrue(accepted.is_set())
         self.assertEqual(order, ['start completed', 'cancel accepted'])
         self.assertTrue(self.nav.stop_requested)
+
+    def test_detour_resume_waits_for_pairing_and_keeps_stopped_on_timeout(self):
+        initial = self.sample
+        for outcome in ('paired', 'timeout', 'stop', 'expires_after_upload', 'timeout_after_upload'):
+            with self.subTest(outcome=outcome):
+                self.sample = initial
+                scanner = self.obstacle_test_start()
+                master = Mock(reply_timeout=.1)
+                self.nav.detour = dict(goal=self.nav.route['goal'], attempt=None, retry_at=0.)
+                self.stopped_detour(master)
+                self.scan_observation(scanner)
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                route = self.nav.pending
+                self.assertIsNotNone(route)
+                self.fresh_tick(.26)
+                self.assertIsNone(self.nav._scan_points())
+                master.reset_mock()
+                master.sleep.side_effect = lambda seconds: setattr(self, 'now', self.now + seconds)
+                began = self.now
+                uploaded = False
+
+                def query(*, start_before):
+                    self.assertLess(self.now, start_before)
+                    self.fresh_tick(.05)
+                    if outcome == 'stop':
+                        self.nav.request_stop()
+                    elif outcome != 'timeout' and not (uploaded and outcome == 'timeout_after_upload'):
+                        self.scan_observation(scanner)
+                    return self.nav.latest
+
+                def upload(plan, *, on_ack):
+                    nonlocal uploaded
+                    uploaded = True
+                    self.assertIsNotNone(self.nav._scan_points())
+                    if outcome in ('expires_after_upload', 'timeout_after_upload'):
+                        self.fresh_tick(.26)
+                        self.assertIsNone(self.nav._scan_points())
+                    self.observe(task=2, state=2, first_error=0)
+                    on_ack(self.nav.latest)
+                    return [self.nav.latest]
+
+                def start(task):
+                    self.assertEqual(task, 2)
+                    self.assertIsNotNone(self.nav._scan_points())
+                    return replace(self.nav.latest, status=replace(self.sample, state=3,
+                                   flags=self.sample.flags & ~STOP_CONFIRMED | EXECUTING,
+                                   lease_remaining_ms=30000))
+
+                master.query.side_effect = query
+                master.upload.side_effect = upload
+                master.start.side_effect = start
+                captured = io.StringIO()
+                with redirect_stdout(captured):
+                    self.nav._upload(master, route)
+                if outcome in ('timeout', 'timeout_after_upload'):
+                    self.assertAlmostEqual(self.now-began, .75)
+                    self.assertEqual(self.nav.avoidance_phase, 'waiting')
+                    self.assertEqual(self.nav.detour['goal'], route['goal'])
+                    self.assertIsNone(self.nav.detour['attempt'])
+                    self.assertAlmostEqual(self.nav.detour['retry_at'], self.now+1.)
+                    self.assertIsNone(self.nav.pending)
+                    self.assertIsNone(self.nav.work)
+                    self.assertTrue(self.nav.stop_verified)
+                    master.start.assert_not_called()
+                    event = json.loads(captured.getvalue())
+                    self.assertEqual(event['event'], 'v12_scan_wait_expired')
+                    self.assertTrue(event['automatic_resume'])
+                    self.assertEqual(event['stage'], 'before_start' if uploaded else 'before_upload')
+                    self.assertEqual(self.nav.snapshot()['avoidance']['last_failure'], event)
+                    master.query.side_effect = None
+                    master.query.return_value = self.nav.latest
+                    self.nav._avoidance_cycle(master, self.nav.latest)
+                    self.assertIsNone(self.nav.pending)
+                    self.fresh_tick(1.01)
+                    self.scan_observation(scanner)
+                    master.query.return_value = self.nav.latest
+                    self.nav._avoidance_cycle(master, self.nav.latest)
+                    self.assertIsNotNone(self.nav.pending)
+                    self.assertEqual(self.nav.pending['goal'], route['goal'])
+                elif outcome == 'stop':
+                    self.assertIsNone(self.nav.detour)
+                    self.assertIsNone(self.nav.pending)
+                    self.assertTrue(self.nav.stop_requested)
+                    master.start.assert_not_called()
+                else:
+                    master.start.assert_called_once_with(2)
+                    self.assertIsNone(self.nav.detour)
+                    self.assertEqual(self.nav.replans, 1)
+                    self.assertEqual(master.query.call_count, 2 if outcome == 'expires_after_upload' else 1)
+                self.assertEqual(master.upload.call_count, int(outcome not in ('timeout', 'stop')))
 
 
 if __name__ == '__main__':

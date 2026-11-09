@@ -54,9 +54,16 @@ def speed_flags(args, *, explicit=False):
 
 def host_tests(args, out):
     sources = [ROOT/'src'/n for n in ('mq.c', 'drive.c', 'wire.c') if (ROOT/'src'/n).is_file()]
+    # Compile the actual board loop in a RAM-only clock/CAN fixture. HAL setup
+    # stays outside the host build; do not maintain a second copy of the loop.
+    board = (ROOT/'src/board_g474.c').read_text(encoding='utf-8')
+    opening, closing = '  for(;;){\n', '\n  }\n}'
+    if board.count(opening) != 1 or closing not in board:
+        raise ValueError('Board loop boundary changed; update the offline fixture extractor')
+    (out/'board_iteration.inc').write_text(board.split(opening)[1].rsplit(closing, 1)[0], encoding='utf-8')
     native = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     common = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-DMQ_HOST_TEST=1',
-              '-I'+str(ROOT/'include'), '-I'+str(ROOT/'tests')]
+              '-I'+str(ROOT/'include'), '-I'+str(ROOT/'tests'), '-I'+str(out)]
     env = dict(os.environ)
     if native:
         compiler = [native]

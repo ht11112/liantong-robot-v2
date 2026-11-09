@@ -110,10 +110,73 @@ static void recovery_window(void){
   assert(!f.queue.odom.recovery_allowed&&!f.queue.odom.valid);
   puts("PASS MQ stopped recovery excludes gaps and moving loss requires reset");
 }
+static void repeated_invalid_keeps_original_window(void){
+  Fixture f;setup(&f);
+  MQSample s={.sequence=2,.tick_ms=150,.valid=false};mq_sample(&f.queue,&s);
+  s.sequence++;s.tick_ms=200;mq_sample(&f.queue,&s);
+  assert(f.queue.odom.recovery_allowed&&f.queue.odom.recovery_start_tick==100u);
+  for(unsigned i=0;i<3;i++){
+    s.sequence++;s.tick_ms+=50;s.valid=true;mq_sample(&f.queue,&s);
+    assert(f.queue.odom.valid==(i==2));
+  }
+  assert(f.queue.odom.travel==0.f&&f.queue.odom.measurement_tick_ms==350u);
+  setup(&f);s=(MQSample){.sequence=2,.tick_ms=150,.valid=false};mq_sample(&f.queue,&s);
+  s.sequence++;s.tick_ms=200;s.valid=true;mq_sample(&f.queue,&s);
+  s.sequence++;s.tick_ms=250;s.valid=false;mq_sample(&f.queue,&s);
+  assert(f.queue.odom.recovery_allowed&&f.queue.odom.recovery_count==0u);
+  assert(f.queue.odom.recovery_start_tick==100u);
+  for(unsigned i=0;i<3;i++){s.sequence++;s.tick_ms+=50;s.valid=true;mq_sample(&f.queue,&s);}
+  assert(!f.queue.odom.valid&&!f.queue.odom.recovery_allowed&&f.queue.odom.travel==0.f);
+  puts("PASS MQ repeated invalid sources preserve the fixed 250ms window without integration");
+}
+static void invalid_source_order_and_motion_cancel_recovery(void){
+  const MQSample bad[]={
+    {.sequence=1,.tick_ms=150}, {.sequence=0,.tick_ms=150}, {.sequence=3,.tick_ms=150},
+    {.sequence=2,.tick_ms=100}, {.sequence=2,.tick_ms=99}, {.sequence=2,.tick_ms=351},
+    {.sequence=2,.tick_ms=150,.left_tenths_rpm=3}
+  };
+  for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++){
+    Fixture f;setup(&f);mq_sample(&f.queue,&bad[i]);
+    assert(!f.queue.odom.valid&&!f.queue.odom.recovery_allowed);
+  }
+  Fixture f;setup(&f);MQSample s={.sequence=2,.tick_ms=150};mq_sample(&f.queue,&s);
+  f.motor.view.guard_valid=false;s.sequence++;s.tick_ms+=50;mq_sample(&f.queue,&s);
+  assert(!f.queue.odom.recovery_allowed);
+  puts("PASS MQ malformed source order, time, nonzero speed or lost stop guard cannot recover");
+}
+static void stopped_forward_sequence_gap_rebases_without_integrating(void){
+  Fixture f;setup(&f);
+  MQSample s={.sequence=3,.tick_ms=200,.valid=true};mq_sample(&f.queue,&s);
+  assert(!f.queue.odom.valid&&f.queue.odom.recovery_allowed);
+  assert(f.queue.odom.recovery_start_tick==100u&&f.queue.odom.recovery_count==1u);
+  for(unsigned i=0;i<2;i++){s.sequence++;s.tick_ms+=50;mq_sample(&f.queue,&s);}
+  assert(f.queue.odom.valid&&f.queue.odom.travel==0.f);
+  s.sequence++;s.tick_ms+=50;s.left_tenths_rpm=10;s.right_tenths_rpm=-10;
+  mq_sample(&f.queue,&s);assert(f.queue.odom.travel>0.f);
+  setup(&f);assert(mq_start(&f.queue,42,100)==MQ_OK);
+  s=(MQSample){.sequence=3,.tick_ms=200,.valid=true};mq_sample(&f.queue,&s);
+  assert(!f.queue.odom.recovery_allowed&&f.queue.state==MQ_STOPPING&&f.queue.first_error==MQ_ERR_ODOM);
+  puts("PASS MQ stopped forward gap can recover, execution gap still stops");
+}
+static void startup_waits_for_verified_stationary_drive(void){
+  Fixture f;setup(&f);mq_init(&f.queue,1,&drive_ops,&f.motor);
+  f.motor.view.state=MQ_DRIVE_STOPPING;f.motor.view.stop_verified=false;
+  MQSample s={.sequence=1,.tick_ms=100,.valid=true};mq_sample(&f.queue,&s);
+  assert(!f.queue.odom.initialized&&!f.queue.odom.valid);
+  s.sequence++;s.tick_ms=500;s.valid=false;mq_sample(&f.queue,&s);
+  f.motor.view.state=MQ_DRIVE_STOPPED;f.motor.view.stop_verified=true;
+  s.sequence++;s.tick_ms=550;s.valid=true;s.left_tenths_rpm=3;mq_sample(&f.queue,&s);
+  assert(!f.queue.odom.initialized);
+  s.sequence++;s.tick_ms=600;s.left_tenths_rpm=0;mq_sample(&f.queue,&s);
+  assert(f.queue.odom.initialized&&f.queue.odom.valid&&f.queue.odom.travel==0.f);
+  puts("PASS MQ startup origin waits for verified STOP and an actual zero-speed sample");
+}
 int main(void){
   healthy_repeat_stays_inert();latched_ready_cannot_start();
   critical_fault_rejects_first_and_repeated_start();stop_and_reset_cannot_unlock();
   identity_and_first_cause_are_preserved();noncritical_repeat_does_not_rearm();
   recovery_window();
-  puts("MQ FAULT COMPLETE 6 queue-only scenarios");return 0;
+  repeated_invalid_keeps_original_window();invalid_source_order_and_motion_cancel_recovery();
+  stopped_forward_sequence_gap_rebases_without_integrating();startup_waits_for_verified_stationary_drive();
+  puts("MQ FAULT COMPLETE 11 queue-only scenarios");return 0;
 }

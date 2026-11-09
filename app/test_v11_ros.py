@@ -1,4 +1,5 @@
 """Pure ROS bridge checks: no ROS master or hardware needed."""
+import json
 import math
 from types import SimpleNamespace as NSObj
 import unittest
@@ -63,23 +64,28 @@ class V11RosTests(unittest.TestCase):
                 first = odom.add(exchange(1, 100, 10.02))
                 if cause == 'invalid':
                     self.assertIsNone(odom.add(exchange(1, 100, 10.03, valid=False)))
-                sequence = 4 if cause == 'sequence' else 5 if cause == 'hidden_recovery' else 2
+                sequence = 6 if cause == 'sequence' else 5 if cause == 'hidden_recovery' else 2
                 sample = odom.add(exchange(sequence,
                     400 if cause == 'tick' else 150, 10.07, epoch=2 if cause == 'epoch' else 1))
                 self.assertEqual(odom.at(sample['stamp_ns'], 10.1)['epoch'], sample['epoch'])
                 with self.assertRaises(PoseHistoryError):
                     odom.at(first['stamp_ns']+1, 10.1)
 
-    def test_one_missed_query_pairs_accumulated_poses_and_preserves_source_ids(self):
-        odom = OdomHistory(OFFSET)
-        odom.add(exchange(10, 100, 10.021, x=1.))
-        second = odom.add(exchange(12, 200, 10.121, x=3.))
-        matched = odom.at(OFFSET + 10*NS + 50_000_000, 10.15)
-        self.assertAlmostEqual(matched['x'], 2.)
-        self.assertIsNone(matched['sample_sequence'])
-        self.assertEqual((matched['lower_sample_sequence'], matched['upper_sample_sequence']), (10, 12))
-        self.assertEqual(odom.at(second['stamp_ns'], 10.15), second)
-        self.assertIsNone(odom.add(exchange(12, 200, 10.16)))
+    def test_skipped_queries_pair_accumulated_poses_and_preserve_source_ids(self):
+        for step in (2, 3):
+            with self.subTest(step=step):
+                odom = OdomHistory(OFFSET)
+                odom.add(exchange(10, 100, 10.021, x=1.))
+                tick = 100 + 50 * step
+                sent = 10.021 + .05 * step
+                second = odom.add(exchange(10 + step, tick, sent, x=3.))
+                matched = odom.at(OFFSET + 10*NS + 25_000_000*step, sent + .03)
+                self.assertAlmostEqual(matched['x'], 2.)
+                self.assertIsNone(matched['sample_sequence'])
+                self.assertEqual((matched['lower_sample_sequence'], matched['upper_sample_sequence']),
+                                 (10, 10 + step))
+                self.assertEqual(odom.at(second['stamp_ns'], sent + .03), second)
+                self.assertIsNone(odom.add(exchange(10 + step, tick, sent + .04)))
 
     def test_query_skip_does_not_bridge_invalid_or_long_time_gap(self):
         for invalid in (False, True):
@@ -152,6 +158,74 @@ class V11RosTests(unittest.TestCase):
 
 
 class ObstacleScanTests(unittest.TestCase):
+    def test_pair_diagnostics_distinguish_missing_bracket_recovery_and_expiry(self):
+        odom = OdomHistory(OFFSET)
+        scans = ObstacleScans(odom)
+        self.assertEqual(scans.diagnostics(10.)['failure_reason'], 'no scan received')
+        odom.add(exchange(1, 100, 10.021))
+        scans.add(obstacle_scan(10.01, [2.]*9), 10.04)
+        missing = scans.diagnostics(10.04)
+        self.assertFalse(missing['paired'])
+        self.assertEqual(missing['failure_reason'], 'query is outside the observed segment')
+        self.assertEqual(missing['odom']['count'], 1)
+        self.assertEqual(missing['odom']['newest_sample_sequence'], 1)
+        self.assertGreater(missing['scan_stamp_ns'], missing['odom']['newest_stamp_ns'])
+
+        odom.add(exchange(2, 150, 10.071))
+        paired = scans.diagnostics(10.09)
+        self.assertTrue(paired['paired'])
+        self.assertTrue(paired['usable'])
+        self.assertIsNone(paired['failure_reason'])
+        self.assertEqual((paired['lower_sample_sequence'], paired['upper_sample_sequence']), (1, 2))
+        self.assertAlmostEqual(paired['scan_age_ms'], 70.)
+
+        expired = scans.diagnostics(10.31)
+        self.assertFalse(expired['paired'])
+        self.assertEqual(expired['failure_reason'], 'latest original source is future or expired')
+        self.assertEqual(expired['last_usable_stamp_ns'], paired['scan_stamp_ns'])
+        json.dumps(expired, allow_nan=False)
+
+    def test_gap_diagnostics_show_fresh_sample_but_lost_scan_bracket(self):
+        odom = OdomHistory(OFFSET)
+        scans = ObstacleScans(odom)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(2, 150, 10.071))
+        odom.add(exchange(8, 450, 10.371))
+        scans.add(obstacle_scan(10.31, [2.]*9), 10.38)
+        diagnostic = scans.diagnostics(10.39)
+        self.assertEqual(diagnostic['odom']['count'], 1)
+        self.assertEqual(diagnostic['odom']['gap_count'], 1)
+        self.assertEqual(diagnostic['odom']['newest_sample_sequence'], 8)
+        self.assertAlmostEqual(diagnostic['odom']['source_age_ms'], 40.)
+        self.assertLess(diagnostic['scan_stamp_ns'], diagnostic['odom']['oldest_stamp_ns'])
+        self.assertEqual(diagnostic['failure_reason'], 'query is outside the observed segment')
+
+    def test_rejected_raw_scan_diagnostics_do_not_create_a_frame(self):
+        for now, reason in ((10.4, 'scan expired on receipt'), (10., 'scan timestamp is in the future')):
+            with self.subTest(now=now):
+                scans = ObstacleScans(OdomHistory(OFFSET))
+                scans.add(obstacle_scan(10.01, [2.]*9), now)
+                diagnostic = scans.diagnostics(now)
+                self.assertEqual(len(scans.frames), 0)
+                self.assertEqual(diagnostic['failure_reason'], reason)
+                self.assertEqual(diagnostic['latest_received']['rejection'], reason)
+                json.dumps(diagnostic, allow_nan=False)
+
+    def test_range_diagnostics_remain_separate_from_pairing_failure(self):
+        for distance, reason in ((.9, 'filtered_ranges'), (math.nan, 'invalid_ranges'), (math.inf, 'no_return')):
+            with self.subTest(distance=distance):
+                odom = OdomHistory(OFFSET)
+                odom.add(exchange(1, 100, 10.021))
+                odom.add(exchange(2, 150, 10.071))
+                scans = ObstacleScans(odom)
+                scans.add(obstacle_scan(10.01, [distance]*9), 10.08)
+                diagnostic = scans.diagnostics(10.09)
+                self.assertTrue(diagnostic['paired'])
+                self.assertFalse(diagnostic['usable'])
+                self.assertEqual(diagnostic['failure_reason'], reason)
+                self.assertIsNone(diagnostic['last_usable_stamp_ns'])
+                json.dumps(diagnostic, allow_nan=False)
+
     def test_front_returns_at_measured_scan_pose_use_vehicle_offset(self):
         odom = OdomHistory(OFFSET)
         scans = ObstacleScans(odom)

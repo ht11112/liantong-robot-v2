@@ -63,16 +63,14 @@ class OdomHistory:
                         mcu_speed_tick_ms=status.measurement_tick_ms,
                         stamp_ns=self.ros_offset_ns + mono_ns)
             try:
-                # V12 publishes accumulated poses. One missed QUERY is not a
-                # missing MCU integration. Permit just one skipped source:
-                # current mq.c needs an invalid sample plus three valid samples
-                # to recover, so that hidden recovery requires a step >= 4.
-                # Larger jumps still cut the bracket, even within 250 ms.
+                # V12 publishes accumulated poses. A stationary recovery can
+                # first hide a discontinuity at a source sequence step of four.
+                # Smaller skips can still bracket a scan with real samples.
                 # The history index is local bookkeeping, never a fake source.
                 observation = (self.observation_sequence + 1) & 0xffffffff
                 self.history.push(dict(pose, sample_sequence=observation),
                                   epoch='{}:{}'.format(*identity),
-                                  gap=tick_step > 250 or sequence_step > 2)
+                                  gap=tick_step > 250 or sequence_step >= 4)
             except PoseHistoryError:
                 self.history.invalidate()
                 return None
@@ -93,6 +91,19 @@ class OdomHistory:
                 if pose.get(key) is not None:
                     pose[key] = self.source_sequences[pose[key]]
             return dict(pose, stamp_ns=stamp_ns, boot=latest['boot'], epoch=latest['epoch'])
+
+    def diagnostics(self, now_mono):
+        with self.lock:
+            result = self.history.summary()
+            sequence = result['newest_sample_sequence']
+            result['newest_sample_sequence'] = self.source_sequences.get(sequence)
+            source = result['newest_source_monotonic_s']
+            result['source_age_ms'] = None if source is None else (now_mono-source)*1000
+            for edge in ('oldest', 'newest'):
+                value = result[edge + '_measurement_monotonic_s']
+                result[edge + '_stamp_ns'] = (None if value is None else
+                                            self.ros_offset_ns + round(value*NS))
+            return result
 
 
 def front_scan(raw, laser_frame, laser_yaw, min_range_m):
@@ -121,6 +132,9 @@ class ObstacleScans:
         # A newer scan can arrive before its upper odometry bracket.
         self.frames = deque(maxlen=4)
         self.lock = threading.Lock()
+        self.received = None
+        self.pairing = {}
+        self.last_usable_stamp_ns = None
 
     def add(self, raw, now_mono):
         original = raw
@@ -131,6 +145,11 @@ class ObstacleScans:
         scan, diagnostic = crop_front_scan(raw, raw.header.frame_id)
         stamp = scan.header.stamp.to_nsec()
         source = (stamp - self.odom.ros_offset_ns) / NS
+        age = now_mono - source
+        with self.lock:
+            self.received = dict(stamp_ns=stamp, age_at_receive_ms=age*1000,
+                                 rejection=('scan timestamp is in the future' if age < 0 else
+                                            'scan expired on receipt' if age >= SOURCE_MAX_AGE_S else None))
         if not 0 <= now_mono - source < SOURCE_MAX_AGE_S:
             return
         points, clear_rays = [], []
@@ -146,6 +165,7 @@ class ObstacleScans:
                 points.append(end)
                 clear_rays.append((self.laser_x + minimum*c, self.laser_y + minimum*s, *end))
         observation = dict(points=tuple(points), clear_rays=tuple(clear_rays), stamp_ns=stamp,
+                           source_mono=source, expires_mono=source+SOURCE_MAX_AGE_S,
                            usable=bool(points), finite_count=diagnostic['finite_valid_rays'],
                            invalid_count=diagnostic['invalid_rays_skipped'],
                            no_return_count=diagnostic['positive_infinite_rays'])
@@ -160,13 +180,47 @@ class ObstacleScans:
     def latest_observation(self, now_mono):
         with self.lock:
             frames = tuple(self.frames)
+            received = self.received
+        failure = None
         for stamp, observation in reversed(frames):
             try:
                 pose = self.odom.at(stamp, now_mono)
-            except PoseHistoryError:
+            except PoseHistoryError as exc:
+                if failure is None:
+                    failure = dict(stamp_ns=stamp, reason=str(exc))
                 continue
+            reason = (None if observation['usable'] else
+                      'filtered_ranges' if observation['finite_count'] else
+                      'invalid_ranges' if observation['invalid_count'] else
+                      'no_return' if observation['no_return_count'] else 'no_usable_ranges')
+            with self.lock:
+                self.pairing = dict(checked_monotonic_s=now_mono, paired=True,
+                                    usable=observation['usable'], failure_reason=reason,
+                                    scan_stamp_ns=stamp,
+                                    lower_sample_sequence=pose.get('lower_sample_sequence', pose['sample_sequence']),
+                                    upper_sample_sequence=pose.get('upper_sample_sequence', pose['sample_sequence']))
+                if observation['usable']:
+                    self.last_usable_stamp_ns = stamp
             return dict(observation, pose=pose)
+        with self.lock:
+            self.pairing = dict(checked_monotonic_s=now_mono, paired=False, usable=False,
+                                failure_reason=(failure['reason'] if failure else
+                                                received['rejection'] or 'no accepted scan' if received else
+                                                'no scan received'),
+                                scan_stamp_ns=failure['stamp_ns'] if failure else
+                                              received['stamp_ns'] if received else None,
+                                lower_sample_sequence=None, upper_sample_sequence=None)
         return None
+
+    def diagnostics(self, now_mono):
+        self.latest_observation(now_mono)
+        with self.lock:
+            result = dict(self.pairing, latest_received=None if self.received is None else dict(self.received),
+                          last_usable_stamp_ns=self.last_usable_stamp_ns)
+        stamp = result['scan_stamp_ns']
+        result['scan_age_ms'] = None if stamp is None else (now_mono - (stamp-self.odom.ros_offset_ns)/NS)*1000
+        result['odom'] = self.odom.diagnostics(now_mono)
+        return result
 
 
 def ros_odom_history(rospy):
@@ -196,8 +250,9 @@ class RosObstacleScanner:
     def _received(self, scan):
         try:
             self.scans.add(scan, time.monotonic())
-        except ValueError:
-            pass
+        except ValueError as exc:
+            with self.scans.lock:
+                self.scans.received = dict(stamp_ns=None, age_at_receive_ms=None, rejection=str(exc))
 
     def publish(self, exchange):
         self.scans.odom.add(exchange)
@@ -207,6 +262,9 @@ class RosObstacleScanner:
 
     def latest_observation(self):
         return self.scans.latest_observation(time.monotonic())
+
+    def diagnostics(self):
+        return self.scans.diagnostics(time.monotonic())
 
     def close(self):
         self.subscriber.unregister()

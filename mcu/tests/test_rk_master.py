@@ -333,6 +333,45 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(master.dropped_queries, 0)
         self.assertTrue(master.failed)
 
+    def test_query_write_timeout_preserves_owner_and_requires_on_time_ack(self):
+        for elapsed in (.05, .12):
+            with self.subTest(elapsed=elapsed):
+                master, port = self.make_master()
+                discovery = master.discover()
+                write = port.write
+
+                def write_then_timeout(packet):
+                    write(packet)
+                    master.sleep(elapsed)
+                    raise TimeoutError('Write timeout')
+
+                with patch.object(port, 'write', write_then_timeout):
+                    reply = master.query()
+                if elapsed > master.reply_timeout:
+                    self.assertIsNone(reply)
+                    self.assertIs(master.latest, discovery)
+                    self.assertEqual(master.dropped_queries, 1)
+                else:
+                    self.assertEqual(reply.request, 1)
+                    self.assertEqual(master.dropped_queries, 0)
+                self.assertFalse(master.failed)
+                self.assertEqual(master.query().request, 2)
+                self.assertEqual(master.ignored['unmatched_ack'], int(reply is None))
+                self.assertEqual(len(port.writes), 3)
+
+    def test_discovery_and_stop_write_timeout_close_without_retry(self):
+        for discover in (True, False):
+            with self.subTest(discover=discover):
+                master, port = self.make_master()
+                if not discover:
+                    master.discover()
+                with patch.object(port, 'write', side_effect=TimeoutError('Write timeout')) as write:
+                    with self.assertRaisesRegex(v11.LinkError, 'Serial exchange failed: Write timeout'):
+                        (master.discover if discover else master.stop)()
+                    write.assert_called_once()
+                self.assertTrue(master.failed)
+                self.assertEqual(master.dropped_queries, 0)
+
     def test_start_and_stop_timeouts_close_without_retry(self):
         discovery = telemetry(task=TASK, state=v11.READY, flags=v11.ACK_VALID | 3 | v11.COMMITTED)
         for opcode in (v11.START, v11.STOP):

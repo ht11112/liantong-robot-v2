@@ -238,10 +238,16 @@ class RkMaster:
         deadline = sent_at + self.reply_timeout
         exchange = None
         try:
-            written = self.port.write(packet)
-            details['bytes_written'] = written
-            if written != len(packet):
-                raise LinkError('Partial serial write, command outcome unknown', details=details)
+            try:
+                written = self.port.write(packet)
+            except TimeoutError:
+                if not drop_missing:
+                    raise
+                # A timed-out write can still deliver a QUERY. Honor only an on-time matching ACK.
+            else:
+                details['bytes_written'] = written
+                if written != len(packet):
+                    raise LinkError('Partial serial write, command outcome unknown', details=details)
             while self.clock() < deadline:
                 data = self.port.read(max(1, TELEMETRY_SIZE - len(self.parser.buffer)))
                 arrived = self.clock()
@@ -296,10 +302,10 @@ class RkMaster:
         with self.lock:
             return self._exchange(QUERY, discover=True)
 
-    def query(self):
+    def query(self, *, start_before=None):
         """Return the current exchange or None for a dropped status sample."""
         with self.lock:
-            return self._exchange(QUERY, drop_missing=True)
+            return self._exchange(QUERY, start_before=start_before, drop_missing=True)
 
     def upload(self, document, task=None, *, on_ack=None):
         plan = document if isinstance(document, QueuePlan) else QueuePlan.from_document(document)
@@ -461,9 +467,16 @@ def open_port(device, reply_timeout):
     import serial
     import termios
 
-    port = serial.Serial(port=None, baudrate=BAUD, bytesize=8, parity='N', stopbits=1,
-                         timeout=min(.002, reply_timeout), write_timeout=reply_timeout,
-                         xonxoff=False, rtscts=False, dsrdtr=False, exclusive=True)
+    class RkSerial(serial.Serial):
+        def write(self, data):
+            try:
+                return super().write(data)
+            except serial.SerialTimeoutException as exc:
+                raise TimeoutError(str(exc)) from exc
+
+    port = RkSerial(port=None, baudrate=BAUD, bytesize=8, parity='N', stopbits=1,
+                    timeout=min(.002, reply_timeout), write_timeout=reply_timeout,
+                    xonxoff=False, rtscts=False, dsrdtr=False, exclusive=True)
     port.dtr = False
     port.rts = False
     port.port = device

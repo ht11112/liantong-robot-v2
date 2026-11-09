@@ -93,15 +93,18 @@ class DynamicObstacles:
         Infinite/no-return and invalid rays must not be supplied as clear rays.
         Hits win over clearing evidence within the same observation.
         """
-        # Validate the full observation before mutating state.
         points = tuple(_coordinates(point, 2) for point in points)
-        rays = tuple(_coordinates(ray, 4) for ray in clear_rays)
         hits = self.grid.obstacle_cells(points)
-        remaining = set(self.cells)
+        self.cells = (self.cells - self.cleared_cells(self.cells, clear_rays)) | hits
+        return self.cells
+
+    def cleared_cells(self, cells, clear_rays):
+        """Find cleared members of a snapshot without changing the overlay."""
+        rays = tuple(_coordinates(ray, 4) for ray in clear_rays)
+        remaining = set(cells)
         for sx, sy, ex, ey in rays:
             if not remaining:
                 break
             a, b = self.grid._to_grid(sx, sy), self.grid._to_grid(ex, ey)
             remaining.difference_update(_ray_cells(a, b, self.grid.width, self.grid.height))
-        self.cells = frozenset(remaining | hits)
-        return self.cells
+        return cells - remaining
