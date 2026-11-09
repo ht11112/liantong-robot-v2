@@ -16,7 +16,7 @@ typedef struct {
   uint8_t pending[8];bool waiting,drop_target_ack;
   int16_t actual_left,actual_right,max_move_rpm;
   unsigned sends,motion_writes,turn_writes,move_writes,slow_move_writes,zero_writes,stop_words;
-  uint32_t samples,last_sample,max_gap;
+  uint32_t samples,last_sample,max_gap,reply_delay_ms;
 } ClosedLoop;
 static ClosedLoop p;
 static uint32_t read32(const uint8_t *v){return (uint32_t)v[0]|((uint32_t)v[1]<<8)|((uint32_t)v[2]<<16)|((uint32_t)v[3]<<24);}
@@ -25,7 +25,7 @@ static bool ready(void *u){(void)u;return true;}
 static uint32_t errors(void *u){(void)u;return 0;}
 static bool send(void *u,const uint8_t request[8]){
   ClosedLoop *a=u;assert(!a->waiting);memcpy(a->pending,request,8);
-  a->waiting=true;a->reply_at=a->now+1u;a->sends++;return true;
+  a->waiting=true;a->reply_at=a->now+(a->reply_delay_ms?a->reply_delay_ms:1u);a->sends++;return true;
 }
 static unsigned limit_slot(uint16_t index,uint8_t sub){
   if(index==0x2014)return sub-1u;
@@ -108,6 +108,44 @@ static void boot(void){
   for(unsigned i=0;i<2000u && (p.d.view.state!=MQ_DRIVE_STOPPED||!p.q.odom.initialized||!p.q.odom.valid);i++)tick();
   assert(p.d.view.state==MQ_DRIVE_STOPPED&&p.d.view.stop_verified&&p.q.odom.valid);
 }
+static void delayed_boot_origin(void){
+  /* Fixed simulated response times, not measured hardware timing. The peer
+     starts with residual wheel motion; the existing shutdown model reaches
+     zero after 120 ms. At 20 ms per SDO, auxiliary-current age briefly exceeds
+     250 ms, then three good speed samples fit inside the recovery window. */
+  const uint32_t delays[]={1u,20u,21u};
+  for(unsigned test=0;test<sizeof(delays)/sizeof(delays[0]);test++){
+    memset(&p,0,sizeof(p));p.guard=500u;p.reply_delay_ms=delays[test];
+    p.actual_left=10;p.actual_right=-10;p.decel_until=120u;
+    for(unsigned i=0;i<5;i++)p.limits[i]=i==4?10u:30u;
+    const DriveBusOps bus={send,ready,errors};drive_init(&p.d,&bus,&p,0);
+    mq_init(&p.q,UINT64_C(0xaca5102026110401),drive_ops(),&p.d);
+    unsigned prestop_valid=0,invalid_after_origin=0;
+    for(unsigned i=0;i<2000u;i++){
+      uint32_t samples=p.samples;tick();
+      if(samples!=p.samples){
+        if(p.d.sample.valid&&p.d.view.state!=MQ_DRIVE_STOPPED)prestop_valid++;
+        if(!p.d.sample.valid&&p.q.odom.initialized)invalid_after_origin++;
+      }
+      if(p.q.odom.initialized){
+        assert(p.d.view.state==MQ_DRIVE_STOPPED&&p.d.view.stop_verified&&p.d.view.guard_valid);
+        assert(p.q.odom.x==0.f&&p.q.odom.y==0.f&&p.q.odom.travel==0.f&&p.q.odom.yaw_total==0.f);
+      }
+    }
+    assert(prestop_valid>0u); /* A valid speed source alone is not boot readiness. */
+    if(delays[test]==20u)assert(invalid_after_origin>0u);
+    assert(p.q.odom.initialized&&p.d.view.stop_verified);
+    if(delays[test]==21u){
+      /* Last good 421 ms -> three good samples end at 673 ms: 252 ms.
+         A legal individual SDO delay does not relax the 250 ms ODO window. */
+      assert(invalid_after_origin>0u&&p.d.sample.valid);
+      assert(!p.q.odom.valid&&!p.q.odom.recovery_allowed);
+    }else assert(p.q.odom.valid);
+    assert(!p.d.view.error&&!p.d.sdo_ambiguous&&!p.motion_writes);
+  }
+  puts("PASS integration delayed boot waits for verified stop before origin and recovers bounded stationary cache gaps");
+  puts("PASS integration fixed 21 ms SDO fixture still rejects a 252 ms ODO recovery gap");
+}
 static void upload_start(const MQSegment *s,uint16_t count){
   assert(mq_begin(&p.q,1u,p.q.odom.epoch,count,mq_segments_crc(s,count),MQ_LEASE_MS)==MQ_OK);
   for(uint16_t i=0;i<count;i++)assert(mq_append(&p.q,1u,i,s[i])==MQ_OK);
@@ -157,6 +195,6 @@ static void dropped_target_ack(void){
   puts("PASS integration target may physically apply after lost ACK but queue and STOP evidence stay failed");
 }
 int main(void){
-  closed_queue(MQ_PI*.5f);closed_queue(-MQ_PI*.5f);cancellation();drive_fault();dropped_target_ack();
+  delayed_boot_origin();closed_queue(MQ_PI*.5f);closed_queue(-MQ_PI*.5f);cancellation();drive_fault();dropped_target_ack();
   puts("PASS all independent production Drive+MQ closed-loop tests");return 0;
 }

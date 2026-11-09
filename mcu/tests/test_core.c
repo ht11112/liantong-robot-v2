@@ -24,9 +24,11 @@ static void load(MQ*q,MQSegment*s,uint16_t count,uint64_t task){
   assert(mq_commit(q,task)==MQ_OK);
 }
 static void exact_odom(void){
-  MQ q;Fake f;init(&q,&f);sample(&q,0,0,20,-20);
+  MQ q;Fake f;init(&q,&f);sample(&q,0,0,0,0);
   for(uint32_t i=1;i<=200;i++)sample(&q,i,i*50,20,-20);
-  assert(fabsf(q.odom.x-10.f*2.f*MQ_PI*.2f/60.f)<.00001f);
+  /* After the stationary origin: one 50ms half-speed trapezoid plus 199
+     constant-speed intervals, i.e. 9.975 seconds at the final 2 RPM. */
+  assert(fabsf(q.odom.x-9.975f*2.f*MQ_PI*.2f/60.f)<.00001f);
   assert(fabsf(q.odom.y)<.00001f && fabsf(q.odom.yaw)<.00001f);
   MQ z;init(&z,&f);sample(&z,0,0,1,0);sample(&z,1,50,1,0);
   assert(z.odom.travel>0.f); /* No hidden 0.2RPM odometry deadband. */

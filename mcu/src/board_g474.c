@@ -169,7 +169,10 @@ int main(void){
   for(;;){
     uint32_t now=HAL_GetTick();
     uart_service_fault(now);
-    can_receive();drive_poll(&drive,now);
+    can_receive();
+    /* RX completion uses HAL_GetTick(). Refresh after draining CAN so a
+       SysTick during RX cannot turn a new sample's age into UINT32_MAX. */
+    now=HAL_GetTick();drive_poll(&drive,now);
     uart_service_fault(now);
     MQSample sample;
     while(drive_pop_sample(&drive,&sample))mq_sample(&queue,&sample);
