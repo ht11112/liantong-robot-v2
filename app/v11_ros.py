@@ -25,6 +25,8 @@ class OdomHistory:
         self.ros_offset_ns = ros_offset_ns
         self.history = PoseHistory(capacity=128)
         self.last = None
+        self.observation_sequence = 0
+        self.source_sequences = {}
         self.lock = threading.Lock()
 
     def add(self, exchange):
@@ -38,9 +40,11 @@ class OdomHistory:
             same_epoch = previous is not None and identity == (previous.boot, previous.epoch)
             if same_epoch and status.sample_sequence == previous.sample_sequence:
                 return None
+            sequence_step = ((status.sample_sequence - previous.sample_sequence) & 0xffffffff
+                             if same_epoch else 1)
             tick_step = ((status.measurement_tick_ms - previous.measurement_tick_ms) & 0xffffffff
                          if same_epoch else 0)
-            if same_epoch and not 0 < tick_step < 0x80000000:
+            if same_epoch and (not 0 < tick_step < 0x80000000 or sequence_step >= 0x80000000):
                 self.history.invalidate()
                 return None
             # The actual MCU publication occurs during the exchange. Its oldest
@@ -59,10 +63,23 @@ class OdomHistory:
                         mcu_speed_tick_ms=status.measurement_tick_ms,
                         stamp_ns=self.ros_offset_ns + mono_ns)
             try:
-                self.history.push(pose, epoch='{}:{}'.format(*identity), gap=tick_step > 250)
+                # V12 publishes accumulated poses. One missed QUERY is not a
+                # missing MCU integration. Permit just one skipped source:
+                # current mq.c needs an invalid sample plus three valid samples
+                # to recover, so that hidden recovery requires a step >= 4.
+                # Larger jumps still cut the bracket, even within 250 ms.
+                # The history index is local bookkeeping, never a fake source.
+                observation = (self.observation_sequence + 1) & 0xffffffff
+                self.history.push(dict(pose, sample_sequence=observation),
+                                  epoch='{}:{}'.format(*identity),
+                                  gap=tick_step > 250 or sequence_step > 2)
             except PoseHistoryError:
                 self.history.invalidate()
                 return None
+            self.observation_sequence = observation
+            self.source_sequences[observation] = status.sample_sequence
+            if len(self.source_sequences) > 128:
+                del self.source_sequences[next(iter(self.source_sequences))]
             self.last = status
             return pose
 
@@ -72,6 +89,9 @@ class OdomHistory:
             pose = self.history.sample_at((stamp_ns - self.ros_offset_ns) / NS)
             if not 0 <= now_mono - pose['source_monotonic_s'] < SOURCE_MAX_AGE_S:
                 raise PoseHistoryError('Scan stamp has no fresh odometry bracket')
+            for key in ('sample_sequence', 'lower_sample_sequence', 'upper_sample_sequence'):
+                if pose.get(key) is not None:
+                    pose[key] = self.source_sequences[pose[key]]
             return dict(pose, stamp_ns=stamp_ns, boot=latest['boot'], epoch=latest['epoch'])
 
 
@@ -91,37 +111,61 @@ def front_scan(raw, laser_frame, laser_yaw, min_range_m):
 
 
 class ObstacleScans:
-    def __init__(self, odom):
+    def __init__(self, odom, *, laser_x=LASER_X_M, laser_y=0., laser_yaw=0., min_range_m=MIN_RANGE_M):
+        if (not all(math.isfinite(value) for value in (laser_x, laser_y, laser_yaw, min_range_m))
+                or min_range_m < 0.):
+            raise ValueError('Invalid obstacle laser mounting or minimum range')
         self.odom = odom
+        self.laser_x, self.laser_y, self.laser_yaw = laser_x, laser_y, laser_yaw
+        self.min_range_m = min_range_m
         # A newer scan can arrive before its upper odometry bracket.
         self.frames = deque(maxlen=4)
         self.lock = threading.Lock()
 
     def add(self, raw, now_mono):
-        scan, _ = crop_front_scan(raw, raw.header.frame_id)
+        original = raw
+        if self.laser_yaw:
+            raw = copy(raw)
+            raw.angle_min += self.laser_yaw
+            raw.angle_max += self.laser_yaw
+        scan, diagnostic = crop_front_scan(raw, raw.header.frame_id)
         stamp = scan.header.stamp.to_nsec()
         source = (stamp - self.odom.ros_offset_ns) / NS
         if not 0 <= now_mono - source < SOURCE_MAX_AGE_S:
             return
-        points = []
-        minimum = max(MIN_RANGE_M, scan.range_min)
-        for index, distance in enumerate(scan.ranges):
+        points, clear_rays = [], []
+        minimum = max(self.min_range_m, scan.range_min)
+        # Cropping maps bad rays to +inf for SLAM. Inspect original values so
+        # NaN/negative rays and real no-return rays remain distinct here.
+        selected = original.ranges[diagnostic['first_raw_index']:diagnostic['end_raw_index_exclusive']]
+        for index, distance in enumerate(selected):
             if minimum <= distance < scan.range_max:
                 angle = scan.angle_min + index * scan.angle_increment
-                points.append((LASER_X_M + distance * math.cos(angle), distance * math.sin(angle)))
+                c, s = math.cos(angle), math.sin(angle)
+                end = self.laser_x + distance*c, self.laser_y + distance*s
+                points.append(end)
+                clear_rays.append((self.laser_x + minimum*c, self.laser_y + minimum*s, *end))
+        observation = dict(points=tuple(points), clear_rays=tuple(clear_rays), stamp_ns=stamp,
+                           usable=bool(points), finite_count=diagnostic['finite_valid_rays'],
+                           invalid_count=diagnostic['invalid_rays_skipped'],
+                           no_return_count=diagnostic['positive_infinite_rays'])
         with self.lock:
             if not self.frames or stamp > self.frames[-1][0]:
-                self.frames.append((stamp, tuple(points)))
+                self.frames.append((stamp, observation))
 
     def latest(self, now_mono):
+        observation = self.latest_observation(now_mono)
+        return ((observation['pose'], observation['points']) if observation is not None else None)
+
+    def latest_observation(self, now_mono):
         with self.lock:
             frames = tuple(self.frames)
-        for stamp, points in reversed(frames):
+        for stamp, observation in reversed(frames):
             try:
                 pose = self.odom.at(stamp, now_mono)
             except PoseHistoryError:
                 continue
-            return pose, points
+            return dict(observation, pose=pose)
         return None
 
 
@@ -138,12 +182,14 @@ def ros_odom_history(rospy):
 
 class RosObstacleScanner:
     """Continuously pair real front-sector returns with measured odometry."""
-    def __init__(self, scan_topic='/lidar1/laser_fan'):
+    def __init__(self, scan_topic='/lidar1/laser_fan', *, laser_x=LASER_X_M, laser_y=0.,
+                 laser_yaw=0., min_range_m=MIN_RANGE_M):
         import rospy
         from sensor_msgs.msg import LaserScan
 
         _, odom = ros_odom_history(rospy)
-        self.scans = ObstacleScans(odom)
+        self.scans = ObstacleScans(odom, laser_x=laser_x, laser_y=laser_y,
+                                   laser_yaw=laser_yaw, min_range_m=min_range_m)
         self.subscriber = rospy.Subscriber(scan_topic, LaserScan, self._received,
                                            queue_size=1, tcp_nodelay=True)
 
@@ -158,6 +204,9 @@ class RosObstacleScanner:
 
     def latest(self):
         return self.scans.latest(time.monotonic())
+
+    def latest_observation(self):
+        return self.scans.latest_observation(time.monotonic())
 
     def close(self):
         self.subscriber.unregister()
@@ -200,7 +249,7 @@ class RosLocalizer:
             raise ValueError('AMCL requires an existing map YAML file')
         if (not all(math.isfinite(value) for value in
                     (timeout_s, laser_x, laser_y, laser_z, laser_yaw, min_range_m))
-                or timeout_s <= 0 or min_range_m < 1.):
+                or timeout_s <= 0 or min_range_m < 0.):
             raise ValueError('Invalid localization timing, mounting or minimum range')
         import rospy
         import tf2_ros

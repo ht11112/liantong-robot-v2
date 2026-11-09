@@ -1,5 +1,7 @@
 # 联通机器人：手推建图与简版点到点控制
 
+`feature/rk-obstacle-fixes` 基于第六分支 `feature/mcu-safety-recovery` 的 `0e5223a8`，修复 RK 动态避障：有效激光射线可清除已移开的临时障碍，区分无效扫描与空点集，并允许一次累计里程计遥测漏收。持续缺测通过现有 STOP 流程等待恢复；未更改 MCU、V12 协议或加入 AprilTag 停靠。[改动、参数和离线验证](docs/V12_MAP_NAVIGATION.md#rk-动态避障修复)
+
 第四分支 `feature/rk-task-renewal` 增加 V12 任务续约。STM32 在 START 后授予 30 秒租约，RK 在剩余约 5 秒时自动续约。租约过期时 STM32 执行停车。路径最多 128 段，预览仍显示预计耗时。[线协议](mcu/docs/PROTOCOL_V12.md) · [保存地图导航](docs/V12_MAP_NAVIGATION.md)
 
 第三分支 `feature/rk-master-stm-slave` 增加 V11 问答式串口。RK 以 20 ms 为目标发送 QUERY，STM32 按请求回复，并独立计算 odom 和运行已启动的动作队列。第四分支的构建、RK 命令和静止验收见 [MCU 说明](mcu/README.md)。

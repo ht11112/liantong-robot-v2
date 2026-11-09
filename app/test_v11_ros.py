@@ -56,18 +56,53 @@ class V11RosTests(unittest.TestCase):
         with self.assertRaises(PoseHistoryError):
             odom.at(first['stamp_ns'], 10.25)
 
-    def test_invalid_source_missing_sequence_or_new_epoch_cuts_bracket(self):
-        for cause in ('invalid', 'sequence', 'tick', 'epoch'):
+    def test_invalid_source_large_sequence_gap_or_new_epoch_cuts_bracket(self):
+        for cause in ('invalid', 'sequence', 'hidden_recovery', 'tick', 'epoch'):
             with self.subTest(cause=cause):
                 odom = OdomHistory(OFFSET)
                 first = odom.add(exchange(1, 100, 10.02))
                 if cause == 'invalid':
                     self.assertIsNone(odom.add(exchange(1, 100, 10.03, valid=False)))
-                sample = odom.add(exchange(3 if cause == 'sequence' else 2,
+                sequence = 4 if cause == 'sequence' else 5 if cause == 'hidden_recovery' else 2
+                sample = odom.add(exchange(sequence,
                     400 if cause == 'tick' else 150, 10.07, epoch=2 if cause == 'epoch' else 1))
                 self.assertEqual(odom.at(sample['stamp_ns'], 10.1)['epoch'], sample['epoch'])
                 with self.assertRaises(PoseHistoryError):
                     odom.at(first['stamp_ns']+1, 10.1)
+
+    def test_one_missed_query_pairs_accumulated_poses_and_preserves_source_ids(self):
+        odom = OdomHistory(OFFSET)
+        odom.add(exchange(10, 100, 10.021, x=1.))
+        second = odom.add(exchange(12, 200, 10.121, x=3.))
+        matched = odom.at(OFFSET + 10*NS + 50_000_000, 10.15)
+        self.assertAlmostEqual(matched['x'], 2.)
+        self.assertIsNone(matched['sample_sequence'])
+        self.assertEqual((matched['lower_sample_sequence'], matched['upper_sample_sequence']), (10, 12))
+        self.assertEqual(odom.at(second['stamp_ns'], 10.15), second)
+        self.assertIsNone(odom.add(exchange(12, 200, 10.16)))
+
+    def test_query_skip_does_not_bridge_invalid_or_long_time_gap(self):
+        for invalid in (False, True):
+            with self.subTest(invalid=invalid):
+                odom = OdomHistory(OFFSET)
+                first = odom.add(exchange(1, 100, 10.021))
+                if invalid:
+                    odom.add(exchange(2, 150, 10.071, valid=False))
+                sample = odom.add(exchange(3, 200 if invalid else 351, 10.121))
+                with self.assertRaises(PoseHistoryError):
+                    odom.at(first['stamp_ns']+1, 10.15)
+                self.assertEqual(odom.at(sample['stamp_ns'], 10.15), sample)
+
+    def test_source_sequence_wrap_and_bounded_lookup(self):
+        odom = OdomHistory(OFFSET)
+        odom.add(exchange(0xfffffffe, 100, 10.021))
+        sample = odom.add(exchange(0, 200, 10.121))
+        matched = odom.at(OFFSET + 10*NS + 50_000_000, 10.15)
+        self.assertEqual((matched['lower_sample_sequence'], matched['upper_sample_sequence']), (0xfffffffe, 0))
+        for index in range(1, 150):
+            sample = odom.add(exchange(index, 200 + index*50, 10.121 + index*.05))
+        self.assertLessEqual(len(odom.source_sequences), 128)
+        self.assertEqual(odom.at(sample['stamp_ns'], 17.6), sample)
 
     def test_backwards_mcu_tick_and_source_time_are_not_restamped(self):
         for tick, sent in ((99, 10.07), (150, 10.01)):
@@ -77,6 +112,13 @@ class V11RosTests(unittest.TestCase):
                 self.assertIsNone(odom.add(exchange(2, tick, sent)))
                 with self.assertRaises(PoseHistoryError):
                     odom.at(first['stamp_ns'], 10.1)
+
+    def test_backwards_source_sequence_is_not_hidden_by_local_history_index(self):
+        odom = OdomHistory(OFFSET)
+        first = odom.add(exchange(10, 100, 10.021))
+        self.assertIsNone(odom.add(exchange(9, 150, 10.071)))
+        with self.assertRaises(PoseHistoryError):
+            odom.at(first['stamp_ns'], 10.1)
 
     def test_front_scan_masks_below_one_metre_and_keeps_actual_first_ray_stamp(self):
         raw = NSObj(header=NSObj(frame_id='original', seq=5, stamp=Stamp(OFFSET)),
@@ -156,6 +198,56 @@ class ObstacleScanTests(unittest.TestCase):
 
         odom.add(exchange(1, 100, 10.121, epoch=2))
         self.assertIsNone(scans.latest(10.14))
+
+    def test_invalid_and_no_return_frames_never_provide_clearing_evidence(self):
+        for distance, expected_invalid, expected_no_return in ((math.nan, 5, 0), (-1., 5, 0), (math.inf, 0, 5)):
+            with self.subTest(distance=distance):
+                odom = OdomHistory(OFFSET)
+                odom.add(exchange(1, 100, 10.021))
+                odom.add(exchange(2, 150, 10.071))
+                scans = ObstacleScans(odom)
+                scans.add(obstacle_scan(10.01, [distance]*9), 10.08)
+                frame = scans.latest_observation(10.09)
+                self.assertFalse(frame['usable'])
+                self.assertEqual(frame['clear_rays'], ())
+                self.assertEqual(frame['invalid_count'], expected_invalid)
+                self.assertEqual(frame['no_return_count'], expected_no_return)
+
+    def test_finite_rays_start_outside_blind_range_and_end_at_measured_hit(self):
+        odom = OdomHistory(OFFSET)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(2, 150, 10.071))
+        scans = ObstacleScans(odom)
+        scans.add(obstacle_scan(10.01, [math.inf, math.inf, .9, math.nan, 2., -1., math.inf, math.inf, math.inf]), 10.08)
+        frame = scans.latest_observation(10.09)
+        self.assertTrue(frame['usable'])
+        self.assertEqual(frame['points'], ((2.13, 0.),))
+        self.assertEqual(frame['clear_rays'], ((1.13, 0., 2.13, 0.),))
+        self.assertEqual(frame['invalid_count'], 2)
+        self.assertEqual(frame['finite_count'], 2)
+
+    def test_configured_mount_and_lower_range_apply_to_hits_and_clearing(self):
+        odom = OdomHistory(OFFSET)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(2, 150, 10.071))
+        scans = ObstacleScans(odom, laser_x=.2, laser_y=.3, laser_yaw=math.pi/2, min_range_m=.2)
+        scans.add(obstacle_scan(10.01, [math.inf, math.inf, .8, math.inf, math.inf, math.inf, math.inf, math.inf, math.inf]), 10.08)
+        frame = scans.latest_observation(10.09)
+        self.assertEqual(frame['points'], ((1., .3),))
+        self.assertEqual(frame['clear_rays'], ((.4, .3, 1., .3),))
+        self.assertEqual(frame['stamp_ns'], OFFSET + 10*NS + 10_000_000)
+
+    def test_configured_minimum_respects_sensor_minimum(self):
+        odom = OdomHistory(OFFSET)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(2, 150, 10.071))
+        scans = ObstacleScans(odom, min_range_m=0.)
+        scan = obstacle_scan(10.01, [math.inf]*4 + [.8] + [math.inf]*4)
+        scan.range_min = .25
+        scans.add(scan, 10.08)
+        self.assertEqual(scans.latest_observation(10.09)['clear_rays'], ((.38, 0., .93, 0.),))
+        with self.assertRaises(ValueError):
+            ObstacleScans(odom, min_range_m=-.1)
 
 
 if __name__ == '__main__':

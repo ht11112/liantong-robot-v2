@@ -2,7 +2,7 @@ import math
 from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Event
+from threading import Event, Thread
 import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
@@ -339,7 +339,8 @@ class NavigationTest(unittest.TestCase):
     def obstacle_test_start(self):
         self.grid.use_modeled_error_margin = False
         scanner = Mock()
-        scanner.latest.return_value = (dict(boot=42, epoch=1, x=0., y=0., yaw=0.), ())
+        self.scan_id = 0
+        self.scan_observation(scanner)
         self.nav = Navigation(self.grid, mode='drive', clock=lambda: self.now, scanner=scanner)
         self.observe()
         self.nav.align(dict(x=.6, y=2., yaw=0.), 'manual')
@@ -350,11 +351,21 @@ class NavigationTest(unittest.TestCase):
         self.observe(task=1, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=25000)
         return scanner
 
+    def scan_observation(self, scanner, points=None, rays=(), *, usable=True, x=0.):
+        self.scan_id += 1
+        if points is None:
+            # A real usable frame has a finite return, here outside this map
+            # and away from the planned route. Blank scans are not clear space.
+            points = ((0., 3.),) if usable else ()
+            rays = ((0., 1., 0., 3.),) if usable else ()
+        scanner.latest_observation.return_value = dict(
+            pose=dict(boot=42, epoch=1, x=x, y=0., yaw=0.), points=points,
+            clear_rays=rays, stamp_ns=self.scan_id, usable=usable)
+
     def test_blocked_route_stops_then_replans_from_stopped_pose_and_starts_new_task(self):
         scanner = self.obstacle_test_start()
         master = Mock()
-        scanner.latest.return_value[0]['x'] = .10
-        scanner.latest.return_value = (scanner.latest.return_value[0], ((1.20, 0.),))
+        self.scan_observation(scanner, ((1.20, 0.),), x=.10)
         self.nav._avoidance_cycle(master, self.nav.latest)
         self.assertTrue(self.nav.stop_requested)
         self.assertIsNone(self.nav.lease_task)
@@ -369,7 +380,7 @@ class NavigationTest(unittest.TestCase):
         self.nav.stop_requested = False
         master.stop.assert_called_once()
         # The triggering return can be absent from the next front scan.
-        scanner.latest.return_value = (scanner.latest.return_value[0], ())
+        self.scan_observation(scanner, x=.10)
         master.query.return_value = self.nav.latest
         self.nav._avoidance_cycle(master, self.nav.latest)
         route = self.nav.pending
@@ -396,7 +407,7 @@ class NavigationTest(unittest.TestCase):
     def test_blocked_goal_waits_and_manual_stop_discards_auto_restart(self):
         scanner = self.obstacle_test_start()
         master = Mock()
-        scanner.latest.return_value = (scanner.latest.return_value[0], ((2.85, 0.),))
+        self.scan_observation(scanner, ((2.85, 0.),))
         self.nav._avoidance_cycle(master, self.nav.latest)
         self.assertTrue(self.nav.stop_requested)
         self.observe(state=9, flags=self.sample.flags & ~EXECUTING | STOP_CONFIRMED,
@@ -417,7 +428,7 @@ class NavigationTest(unittest.TestCase):
     def test_obstacle_stop_without_measured_proof_does_not_plan_a_restart(self):
         scanner = self.obstacle_test_start()
         master = Mock()
-        scanner.latest.return_value = (scanner.latest.return_value[0], ((1.5, 0.),))
+        self.scan_observation(scanner, ((1.5, 0.),))
         self.nav._avoidance_cycle(master, self.nav.latest)
         self.assertTrue(self.nav.stop_requested)
         master.stop.return_value = dict(stop_verified=False, error=dict(code='stop_proof_deadline'))
@@ -426,6 +437,122 @@ class NavigationTest(unittest.TestCase):
         self.assertEqual(self.nav.snapshot()['avoidance']['phase'], 'cancelled')
         master.query.assert_not_called()
         master.start.assert_not_called()
+
+    def stopped_detour(self, master):
+        self.observe(state=9, flags=self.sample.flags & ~EXECUTING | STOP_CONFIRMED,
+                     first_error=1, lease_remaining_ms=0)
+        master.stop.return_value = dict(stop_verified=True)
+        self.nav._stop(master)
+        self.nav.stop_requested = False
+        master.query.return_value = self.nav.latest
+
+    def fresh_tick(self, dt):
+        self.now += dt
+        tick = self.sample.measurement_tick_ms + round(dt * 1000)
+        self.observe(sample_sequence=self.sample.sample_sequence + 1,
+                     measurement_tick_ms=tick, publication_tick_ms=tick + 5)
+
+    def test_removed_obstacle_reopens_goal_only_after_measured_clear_ray(self):
+        scanner = self.obstacle_test_start()
+        master = Mock()
+        self.scan_observation(scanner, ((2.85, 0.),))
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.stopped_detour(master)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertEqual(self.nav.avoidance_phase, 'waiting')
+        blocked = self.nav.obstacles.cells
+        self.assertTrue(blocked)
+        # Bad and out-of-view observations never remove the remembered blocker.
+        self.scan_observation(scanner, usable=False)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertEqual(self.nav.obstacles.cells, blocked)
+        self.fresh_tick(1.01)
+        self.scan_observation(scanner)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertIsNone(self.nav.pending)
+        self.assertEqual(self.nav.obstacles.cells, blocked)
+        self.scan_observation(scanner, ((3.4, 0.),), ((1., 0., 3.4, 0.),))
+        master.query.return_value = self.nav.latest
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertIsNotNone(self.nav.pending)
+        self.assertEqual(self.nav.pending['goal'], dict(x=3.45, y=2.))
+        self.assertTrue(blocked.isdisjoint(self.nav.obstacles.cells))
+
+    def test_sustained_missing_scan_stops_once_then_resumes_when_scan_returns(self):
+        scanner = self.obstacle_test_start()
+        master = Mock()
+        scanner.latest_observation.return_value = None
+        self.fresh_tick(.3)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertFalse(self.nav.stop_requested)
+        self.fresh_tick(.5)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertTrue(self.nav.stop_requested)
+        self.assertIsNone(self.nav.lease_task)
+        self.stopped_detour(master)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertIsNone(self.nav.pending)
+        self.scan_observation(scanner)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertIsNotNone(self.nav.pending)
+        self.assertEqual(master.stop.call_count, 1)
+
+    def test_duplicate_scan_does_not_refresh_scan_deadline(self):
+        scanner = self.obstacle_test_start()
+        master = Mock()
+        seen = self.nav.last_usable_scan
+        self.fresh_tick(.2)
+        self.nav.snapshot()
+        self.assertEqual(self.nav.last_usable_scan, seen)
+        self.scan_observation(scanner, usable=False)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertFalse(self.nav.stop_requested)
+        self.fresh_tick(.6)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        self.assertTrue(self.nav.stop_requested)
+
+    def test_alignment_change_clears_dynamic_map_memory(self):
+        scanner = self.obstacle_test_start()
+        self.scan_observation(scanner, ((1.2, 0.),))
+        self.nav.snapshot()
+        self.assertTrue(self.nav.obstacles.cells)
+        self.observe(state=0, flags=self.sample.flags & ~EXECUTING, lease_remaining_ms=0)
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        self.assertFalse(self.nav.obstacles.cells)
+        self.assertIsNone(self.nav.scan_stamp)
+
+    def test_cancel_cannot_be_accepted_before_inflight_start_finishes(self):
+        self.nav.mode = 'drive'
+        self.nav.align(dict(x=.6, y=2., yaw=0.), 'manual')
+        self.nav.preview(dict(x=2., y=2.))
+        plan = self.nav.plan
+        master = Mock()
+        master.upload.return_value = [self.nav.latest]
+        entering, accepted = Event(), Event()
+        order = []
+
+        def cancel():
+            entering.set()
+            self.nav.request_stop()
+            order.append('cancel accepted')
+            accepted.set()
+
+        worker = Thread(target=cancel)
+        def start(task):
+            worker.start()
+            self.assertTrue(entering.wait(1.))
+            # STOP is trying to enter the shared command-ordering section.
+            self.assertFalse(accepted.wait(.02))
+            order.append('start completed')
+            return self.nav.latest
+        master.start.side_effect = start
+        try:
+            self.nav._upload(master, plan)
+        finally:
+            worker.join(1.)
+        self.assertTrue(accepted.is_set())
+        self.assertEqual(order, ['start completed', 'cancel accepted'])
+        self.assertTrue(self.nav.stop_requested)
 
 
 if __name__ == '__main__':

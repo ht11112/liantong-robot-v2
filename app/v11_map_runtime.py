@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
 from mcu_v11 import (EXECUTING, LEASE_STATES, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, Rejected,
                      RkMaster, error_record, open_port)
 from v11_map_plan import PlanningError, load_map
+from v11_obstacles import DynamicObstacles
 
 
 PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
@@ -23,6 +24,8 @@ PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
 SOURCE_MAX_AGE_S = .250
 RENEW_BEFORE_S = 5.
 REPLAN_INTERVAL_S = 1.
+# Reuse the existing simple-p2p host scan timeout, not an MCU fault threshold.
+OBSTACLE_SCAN_TIMEOUT_S = .75
 MCU_CANCELLED = 1
 ARRIVAL_REACHED = 8
 POSE_DISTANCE_TOLERANCE_M = .02
@@ -59,9 +62,16 @@ def inverse(pose):
 
 
 class Navigation:
-    def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None):
+    def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
+                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S):
+        if not math.isfinite(obstacle_scan_timeout_s) or obstacle_scan_timeout_s <= 0:
+            raise ValueError('Obstacle scan timeout must be positive and finite')
         self.grid, self.localizer, self.mode, self.clock = grid, localizer, mode, clock
         self.scanner = scanner
+        self.obstacles = DynamicObstacles(grid)
+        self.obstacle_scan_timeout_s = obstacle_scan_timeout_s
+        self.scan_stamp = self.last_usable_scan = None
+        self.scan_status = 'unavailable'
         self.avoidance_phase, self.avoidance_message, self.replans = 'watching', None, 0
         self.detour = None
         self.lock = threading.RLock()
@@ -85,6 +95,7 @@ class Navigation:
         if self.detour is not None:
             self._cancel_detour(reason)
         self.alignment = self.origin = self.plan = self.route = None
+        self._clear_obstacles()
         self.trail.clear()
         self.localization = dict(mode='unlocalized', reason=reason)
 
@@ -141,26 +152,46 @@ class Navigation:
         if self.scanner is not None:
             self.scanner.publish(exchange)
 
+    def _clear_obstacles(self):
+        self.obstacles.clear()
+        self.scan_stamp = self.last_usable_scan = None
+        self.scan_status = 'unavailable'
+
     def _scan_points(self):
+        self.scan_status = 'unavailable'
         if self.scanner is None or self.alignment is None or not self._fresh():
             return None
-        frame = self.scanner.latest()
+        frame = self.scanner.latest_observation()
         if frame is None:
             return None
-        odom, points = frame
+        if not frame['usable']:
+            self.scan_status = ('filtered_ranges' if frame.get('finite_count', 0) else
+                                'invalid_ranges' if frame.get('invalid_count', 0) else
+                                'no_return' if frame.get('no_return_count', 0) else 'no_usable_ranges')
+            return None
+        odom, points = frame['pose'], frame['points']
         status = self.latest.status
         if (odom['boot'], odom['epoch']) != (status.boot, status.epoch):
             return None
         pose = compose(self.alignment, odom)
         c, s = math.cos(pose['yaw']), math.sin(pose['yaw'])
-        return tuple((pose['x'] + c*x - s*y, pose['y'] + s*x + c*y) for x, y in points)
+        def project(x, y):
+            return pose['x'] + c*x - s*y, pose['y'] + s*x + c*y
+        points = tuple(project(x, y) for x, y in points)
+        if self.scan_stamp is None or frame['stamp_ns'] > self.scan_stamp:
+            rays = tuple((*project(x0, y0), *project(x1, y1))
+                         for x0, y0, x1, y1 in frame['clear_rays'])
+            self.obstacles.update(points, clear_rays=rays)
+            self.scan_stamp = frame['stamp_ns']
+            self.last_usable_scan = self.clock()
+        self.scan_status = 'usable'
+        return points
 
     def _upload_obstacles(self):
         points = self._scan_points()
         if points is None:
             raise ValueError('避障测试需要定位后有效的雷达数据')
-        cells = self.grid.obstacle_cells(points)
-        return cells | self.detour['blockers'] if self.detour is not None else cells
+        return self.obstacles.cells
 
     def _cancel_detour(self, reason):
         self.detour = None
@@ -204,6 +235,7 @@ class Navigation:
                         if not same_pose(odom_pose, initial):
                             raise ValueError('置零期间车体位置发生变化，请停稳后重试')
                     self.alignment = compose(map_pose, inverse(odom_pose))
+                    self._clear_obstacles()
                     self.origin = dict(x=odom_pose['x'], y=odom_pose['y'], yaw=odom_pose['yaw'])
                     self.localization = dict(mode=mode, reason=None, stamp_ns=map_pose.get('stamp_ns'),
                                              boot=str(current.boot), epoch=current.epoch)
@@ -222,8 +254,9 @@ class Navigation:
                 if pose is None:
                     raise ValueError('请先完成地图定位')
                 points = self._scan_points()
-            plan = (self.grid.plan(pose, goal, obstacle_cells=self.grid.obstacle_cells(points))
-                    if points is not None else self.grid.plan(pose, goal))
+                cells = self.obstacles.cells
+            plan = (self.grid.plan(pose, goal, obstacle_cells=cells)
+                    if self.scanner is not None else self.grid.plan(pose, goal))
             with self.lock:
                 if (self.stop_revision != stop_revision or anchor is not self.alignment
                         or not same_pose(self._map_pose(), pose)):
@@ -297,7 +330,10 @@ class Navigation:
             if current_pose != pose or current_cells != cells:
                 self.grid.validate_plan(current_pose, plan, obstacle_cells=current_cells)
             self.work = 'starting'
-        started = master.start(reply.status.task)
+            # Order the single bounded START exchange with accepted HTTP STOPs.
+            # A cancellation cannot return successfully and then be overtaken
+            # by a START that was waiting just outside this critical section.
+            started = master.start(reply.status.task)
         self.observe(started)
         status = started.status
         with self.lock:
@@ -363,14 +399,19 @@ class Navigation:
             return
         pose, points = self._map_pose(), self._scan_points()
         if points is None:
+            if (self.last_usable_scan is None or
+                    self.clock() - self.last_usable_scan >= self.obstacle_scan_timeout_s):
+                self.detour = dict(goal=self.route['goal'], attempt=None, retry_at=0.)
+                self.avoidance_phase, self.avoidance_message = 'stopping', '雷达持续无有效观测，停车等待恢复'
+                self._queue_stop()
             return
-        cells = self.grid.obstacle_cells(points)
+        cells = self.obstacles.cells
         # In the handoff state the reported segment has already finished.
         index = status.index + (status.state == 6)
         progress = status.progress if status.state in (4, 5) else 0.
         if self.grid.route_blocked(pose, self.route, index, progress, cells):
-            # Keep the blocking scan during replanning if the object leaves the front fan.
-            self.detour = dict(goal=self.route['goal'], blockers=cells, attempt=None, retry_at=0.)
+            # Memory survives leaving the fan, but measured free rays can clear it.
+            self.detour = dict(goal=self.route['goal'], attempt=None, retry_at=0.)
             self.avoidance_phase, self.avoidance_message = 'stopping', '前方路线被挡，正在停车'
             self._queue_stop()
 
@@ -393,7 +434,7 @@ class Navigation:
             points = self._scan_points()
             if points is None or self.clock() < detour['retry_at']:
                 return
-            cells = self.grid.obstacle_cells(points) | detour['blockers']
+            cells = self.obstacles.cells
             if cells == detour['attempt']:
                 return
             detour['attempt'], detour['retry_at'] = cells, self.clock() + REPLAN_INTERVAL_S
@@ -497,8 +538,12 @@ class Navigation:
                 points = self._scan_points()
                 message = self.avoidance_message
                 if points is None and self.avoidance_phase == 'watching':
-                    message = '等待定位和有效雷达数据'
+                    message = {'filtered_ranges': '雷达回波被距离配置过滤，等待可用观测',
+                               'invalid_ranges': '雷达观测无效，等待有效数据',
+                               'no_return': '雷达全无回波，暂不能确认通道情况'}.get(
+                                   self.scan_status, '等待定位和有效雷达数据')
                 avoidance = dict(phase=self.avoidance_phase, message=message, replans=self.replans,
+                                 scan_status=self.scan_status, remembered_cells=len(self.obstacles.cells),
                                  points=[dict(x=x, y=y) for x, y in points or ()])
             task = dict(id=str(status.task) if status else None,
                         phase=(self.work if self.work in ('uploading', 'starting', 'stopping')
@@ -602,23 +647,36 @@ def main(argv=None):
     parser.add_argument('--map-sha256', required=True)
     parser.add_argument('--yaml-sha256', required=True)
     parser.add_argument('--scan-topic', default='/lidar1/laser_fan')
+    parser.add_argument('--laser-x', type=float, default=.13, help='雷达相对车体的前向偏移（米）')
+    parser.add_argument('--laser-y', type=float, default=0., help='雷达相对车体的左向偏移（米）')
+    parser.add_argument('--laser-yaw', type=float, default=0., help='雷达相对车体的偏航（弧度）')
+    parser.add_argument('--obstacle-min-range', type=float, default=1.,
+                        help='避障采用的最小雷达距离（米），按实际安装确认后设置')
+    parser.add_argument('--obstacle-scan-timeout', type=float, default=OBSTACLE_SCAN_TIMEOUT_S,
+                        help='持续缺少可用扫描后的 RK 停车等待时间（秒）')
     parser.add_argument('--mode', choices=('ready', 'drive'), default='ready')
     parser.add_argument('--manual-only', action='store_true', help='只启用地图手动对齐')
     parser.add_argument('--no-modeled-error-margin', action='store_true',
                         help='路线扫掠只检查车体包络，不叠加动作结束误差')
     parser.add_argument('--obstacle-test', action='store_true', help='启用前方雷达挡路停车与自动重规划')
     args = parser.parse_args(argv)
+    if (not all(math.isfinite(v) for v in (args.laser_x, args.laser_y, args.laser_yaw,
+                                          args.obstacle_min_range, args.obstacle_scan_timeout))
+            or args.obstacle_min_range < 0 or args.obstacle_scan_timeout <= 0):
+        parser.error('雷达参数必须为有限数；最小距离不能为负，缺测等待时间必须为正')
+    mounting = dict(laser_x=args.laser_x, laser_y=args.laser_y, laser_yaw=args.laser_yaw)
     grid = load_map(args.map_pgm, args.map_yaml, args.map_sha256, args.yaml_sha256,
                     use_modeled_error_margin=not args.no_modeled_error_margin)
     localizer = None
     if not args.manual_only:
         from v11_ros import RosLocalizer
-        localizer = RosLocalizer(args.map_yaml, args.scan_topic)
+        localizer = RosLocalizer(args.map_yaml, args.scan_topic, **mounting)
     scanner = None
     if args.obstacle_test:
         from v11_ros import RosObstacleScanner
-        scanner = RosObstacleScanner(args.scan_topic)
-    nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner)
+        scanner = RosObstacleScanner(args.scan_topic, min_range_m=args.obstacle_min_range, **mounting)
+    nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner,
+                     obstacle_scan_timeout_s=args.obstacle_scan_timeout)
     closed = threading.Event()
     owner = threading.Thread(target=nav.run, args=(args.port, closed), name='v12-owner')
     try:
