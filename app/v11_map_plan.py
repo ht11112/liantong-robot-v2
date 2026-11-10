@@ -55,6 +55,7 @@ def _float32(value):
     return struct.unpack('<f', struct.pack('<f', value))[0]
 
 
+# 路线段转成 MCU 使用的规范格式，计算 CRC 时字节顺序必须一致。
 def _queue(segments):
     # The RK service loads mcu/tools directly; repository unit tests also
     # support its namespace-package path. Use the actual shared wire codec.
@@ -158,6 +159,7 @@ def _sha(raw, expected):
     return actual
 
 
+# 地图和配置按给定哈希核对，坐标以 YAML 的分辨率与原点为准。
 def load_map(pgm_path, yaml_path, expected_pgm_sha256=None, expected_yaml_sha256=None,
              *, use_modeled_error_margin=True):
     pgm_path, yaml_path = Path(pgm_path), Path(yaml_path)
@@ -212,6 +214,7 @@ def _capsule_hits_cell(a, b, radius_sq, i, j):
     return False
 
 
+# 将静态地图与雷达障碍合并；路径检查考虑车体包络而非仅检查中心点。
 class _Costmap:
     def __init__(self, grid, search_padding=0., *, obstacle_cells=()):
         self.width, self.height = grid.width, grid.height
@@ -271,6 +274,7 @@ class _Costmap:
                 if self.center_clear(x, y) and self.sweep(point, self.center((x, y))):
                     yield x, y
 
+    # A* 搜索可通行栅格，起终点到栅格的连接也须检查碰撞。
     def astar(self, start, goal):
         if self.sweep(start, goal):
             return [start, goal]
@@ -309,6 +313,7 @@ class _Costmap:
                     add(neighbor, next_cost, node)
         raise PlanningError('No path through known clear space')
 
+    # 简化路径时仍检查整段扫掠区域，避免直线跨过障碍。
     def simplify(self, chain):
         result, index = [chain[0]], 0
         while index + 1 < len(chain):
@@ -378,6 +383,7 @@ class GridMap:
                 cells.add((i, j))
         return frozenset(cells)
 
+    # 检查当前段剩余部分和后续路线，不把已完成路段当作前方障碍。
     def route_blocked(self, pose, plan, index, progress, obstacle_cells):
         """Test only new obstacles against the remaining queue from measured pose."""
         if not obstacle_cells:
@@ -410,6 +416,7 @@ class GridMap:
             raise PlanningError('Goal footprint intersects occupied, unknown or outside space')
         return a, b
 
+    # 重新检查最终 MOVE/TURN 队列的车体扫掠及终点误差。
     def _verify(self, costmap, pose, goal, segments):
         x, y, yaw = pose
         path, distance, estimated_time = [dict(x=x, y=y)], 0., 4.
@@ -464,6 +471,7 @@ class GridMap:
             x, y = x+length*math.cos(yaw), y+length*math.sin(yaw)
         return _queue(segments)
 
+    # 地图路径编译成 MCU 段队列后，还需验证实际指令。
     def plan(self, pose, goal, *, obstacle_cells=()):
         start, target = _point(pose, ('x', 'y', 'yaw')), _point(goal)
         costmap = _Costmap(self, obstacle_cells=obstacle_cells)
@@ -499,6 +507,7 @@ class GridMap:
                         search_padding_m=padding, **checked)
         raise last_error or PlanningError('No collision-checked executable action queue')
 
+    # 上传前按最新障碍复验，不能直接依赖预览时的地图。
     def validate_plan(self, pose, plan, *, obstacle_cells=()):
         """Recheck the same committed bytes from a current pose and costmap."""
         if not isinstance(plan, dict) or plan.get('map_id') != self.map_id or plan.get('no_motion') is not False:

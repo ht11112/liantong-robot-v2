@@ -19,6 +19,7 @@ LASER_X_M = .13
 MIN_RANGE_M = 1.
 
 
+# 将 MCU 测量时间转换到 ROS 时间，仅保存用于配对的真实位姿。
 class OdomHistory:
     """Align ROS stamps to bounded, contiguous real MCU source samples."""
     def __init__(self, ros_offset_ns):
@@ -29,6 +30,7 @@ class OdomHistory:
         self.source_sequences = {}
         self.lock = threading.Lock()
 
+    # 会话、序号和测量间隔决定连续区间；缺口不能靠插值跨越。
     def add(self, exchange):
         status = exchange.status
         with self.lock:
@@ -106,6 +108,7 @@ class OdomHistory:
             return result
 
 
+# 按雷达安装姿态和有效距离过滤前方扫描，保留原始时间戳。
 def front_scan(raw, laser_frame, laser_yaw, min_range_m):
     # The shared crop preserves the actual time of the first retained ray.
     if laser_yaw:
@@ -121,6 +124,7 @@ def front_scan(raw, laser_frame, laser_yaw, min_range_m):
     return scan
 
 
+# 扫描只与时间两侧的真实里程计样本配对；过期或无配对时不可用于避障。
 class ObstacleScans:
     def __init__(self, odom, *, laser_x=LASER_X_M, laser_y=0., laser_yaw=0., min_range_m=MIN_RANGE_M):
         if (not all(math.isfinite(value) for value in (laser_x, laser_y, laser_yaw, min_range_m))
@@ -223,6 +227,7 @@ class ObstacleScans:
         return result
 
 
+# 建立 ROS 时间和单调时钟的偏移；此桥要求真实时间。
 def ros_odom_history(rospy):
     if not rospy.core.is_initialized():
         rospy.init_node('v11_rk_bridge', anonymous=True, disable_signals=True)
@@ -234,6 +239,7 @@ def ros_odom_history(rospy):
     return ros_now, OdomHistory(offset_ns)
 
 
+# 雷达订阅缓存观测，串口反馈另行写入同一里程计历史。
 class RosObstacleScanner:
     """Continuously pair real front-sector returns with measured odometry."""
     def __init__(self, scan_topic='/lidar1/laser_fan', *, laser_x=LASER_X_M, laser_y=0.,
@@ -294,6 +300,7 @@ def stop_child(child):
             child.wait(timeout=2.)
 
 
+# AMCL 是可选定位流程；手动对齐模式不依赖它。
 class RosLocalizer:
     """Create on RK's main thread; poll odom and localize from separate workers.
 

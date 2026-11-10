@@ -574,7 +574,7 @@ class NavigationTest(unittest.TestCase):
 
     def test_start_waits_for_scan_and_respects_timeout_and_stop(self):
         initial = self.sample
-        for outcome in ('paired', 'timeout', 'stop', 'expires_after_upload'):
+        for outcome in ('paired', 'late_pair', 'timeout', 'stop', 'late_stop', 'expires_after_upload'):
             with self.subTest(outcome=outcome):
                 self.sample = initial
                 scanner = self.obstacle_test_start()
@@ -594,9 +594,9 @@ class NavigationTest(unittest.TestCase):
                 def query(*, start_before):
                     self.assertLess(self.now, start_before)
                     self.fresh_tick(.05)
-                    if outcome == 'stop':
+                    if outcome == 'stop' or (outcome == 'late_stop' and self.now-began >= 1.2):
                         self.nav.request_stop()
-                    elif outcome != 'timeout':
+                    elif outcome not in ('timeout', 'late_stop') and (outcome != 'late_pair' or self.now-began >= 1.2):
                         self.scan_observation(scanner)
                     return self.nav.latest
 
@@ -616,19 +616,23 @@ class NavigationTest(unittest.TestCase):
                 master.upload.side_effect = upload
                 master.start.side_effect = start
                 if outcome == 'timeout':
-                    with self.assertRaisesRegex(ValueError, '配对超时'):
+                    with self.assertRaisesRegex(ValueError, '配对超时（2 s）'):
                         self.nav._upload(master, self.nav.pending)
-                    self.assertAlmostEqual(self.now - began, .75)
+                    self.assertAlmostEqual(self.now - began, 2.)
                 else:
                     self.nav._upload(master, self.nav.pending)
-                if outcome in ('timeout', 'stop'):
+                if outcome in ('timeout', 'stop', 'late_stop'):
                     master.upload.assert_not_called()
                     master.start.assert_not_called()
-                    self.assertEqual(self.nav.stop_requested, outcome == 'stop')
+                    self.assertEqual(self.nav.stop_requested, outcome in ('stop', 'late_stop'))
                 else:
                     master.upload.assert_called_once()
                     master.start.assert_called_once()
-                    self.assertEqual(master.query.call_count, 2 if outcome == 'expires_after_upload' else 1)
+                    if outcome != 'late_pair':
+                        self.assertEqual(master.query.call_count, 2 if outcome == 'expires_after_upload' else 1)
+                if outcome in ('late_pair', 'late_stop'):
+                    self.assertGreaterEqual(self.now-began, 1.2)
+                    self.assertLess(self.now-began, 2.)
 
     def test_scan_wait_accepts_current_pair_at_deadline_but_stop_and_stale_still_block(self):
         initial = self.sample
@@ -747,7 +751,7 @@ class NavigationTest(unittest.TestCase):
                 with redirect_stdout(captured):
                     self.nav._upload(master, route)
                 if outcome in ('timeout', 'timeout_after_upload'):
-                    self.assertAlmostEqual(self.now-began, .75)
+                    self.assertAlmostEqual(self.now-began, 2.)
                     self.assertEqual(self.nav.avoidance_phase, 'waiting')
                     self.assertEqual(self.nav.detour['goal'], route['goal'])
                     self.assertIsNone(self.nav.detour['attempt'])

@@ -26,7 +26,7 @@ RENEW_BEFORE_S = 5.
 REPLAN_INTERVAL_S = 1.
 # Reuse the existing simple-p2p host scan timeout, not an MCU fault threshold.
 OBSTACLE_SCAN_TIMEOUT_S = .75
-START_SCAN_WAIT_S = .75
+START_SCAN_WAIT_S = 2.
 OBSTACLE_WORK_INTERVAL_S = .02
 MCU_CANCELLED = 1
 ARRIVAL_REACHED = 8
@@ -63,6 +63,7 @@ def inverse(pose):
                 y=s * pose['x'] - c * pose['y'], yaw=-pose['yaw'])
 
 
+# 导航状态由串口主线程维护；网页提交请求，扫描投影和清除在后台执行。
 class Navigation:
     def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
                  obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S):
@@ -129,6 +130,7 @@ class Navigation:
             return None
         return compose(self.alignment, pose_of(self.latest.status))
 
+    # 只有新的有效 MCU 测量能续鲜；boot 或 epoch 改变时必须重新定位。
     def observe(self, exchange):
         sample = exchange.status
         identity = sample.boot, sample.epoch
@@ -191,6 +193,7 @@ class Navigation:
                                       monotonic_s=self.clock(), diagnostic=self._scan_diagnostics())
         print(json.dumps(self.last_scan_failure, ensure_ascii=False), flush=True)
 
+    # 按扫描时刻的实测里程计投影障碍；提交前再次核对定位及数据时效。
     def update_scan(self):
         with self.lock:
             if self.alignment is None or not self._fresh():
@@ -234,6 +237,7 @@ class Navigation:
                 if older_cells and rays:
                     self.clear_work = anchor, stamp, frame['source_mono'], older_cells, rays
 
+    # 射线在锁外计算，清除时保留同一帧及更新帧命中的障碍。
     def clear_obstacle_rays(self):
         with self.lock:
             work, self.clear_work = self.clear_work, None
@@ -279,6 +283,7 @@ class Navigation:
             with self.lock:
                 self.work = None
 
+    # 手动对齐建立地图到里程计的变换；对齐期间车体移动则放弃。
     def align(self, seed, mode):
         with self._stationary_work('localizing' if mode == 'amcl' else 'aligning') as stop_revision:
             with self.lock:
@@ -314,6 +319,7 @@ class Navigation:
                     self._invalidate(str(exc))
                 raise
 
+    # 规划后重新核对起点和定位，避免执行过期预览。
     def preview(self, goal):
         with self._stationary_work('planning') as stop_revision:
             with self.lock:
@@ -330,6 +336,7 @@ class Navigation:
                     raise ValueError('规划期间起点已变化，请重新预览')
                 self.plan = dict(plan, id=uuid.uuid4().hex)
 
+    # 开始请求消费预览并排队，真正的串口上传由唯一 owner 完成。
     def request_start(self, plan_id):
         with self.lock:
             self._require_stationary()
@@ -367,6 +374,7 @@ class Navigation:
             if self.stop_requested:
                 raise ValueError('上传已取消')
 
+    # 停车请求优先；截止时已有有效配对仍可使用，等待期间只查询真实反馈。
     def _wait_start_scan(self, master, deadline, stage):
         while True:
             with self.lock:
@@ -376,7 +384,7 @@ class Navigation:
                 if self._scan_points() is not None:
                     return True
                 if now >= deadline:
-                    message = '启动前等待有效的雷达与里程计配对超时（750 ms）'
+                    message = '启动前等待有效的雷达与里程计配对超时（{:g} s）'.format(START_SCAN_WAIT_S)
                     self._record_scan_failure('v12_scan_wait_expired', stage, message)
                     if self.detour is not None:
                         self.pending = self.work = None
@@ -397,6 +405,7 @@ class Navigation:
             if remaining > 0:
                 master.sleep(min(remaining, OBSTACLE_WORK_INTERVAL_S))
 
+    # 上传前和 START 前共用扫描等待期限，并重新核对停稳、起点和障碍。
     def _upload(self, master, plan):
         wait_for_scan = self.scanner is not None
         scan_deadline = self.clock() + START_SCAN_WAIT_S
@@ -458,6 +467,7 @@ class Navigation:
         # The MCU computes its remaining time after this send, so this is a lower bound.
         return max(0., exchange.sent_at + exchange.status.lease_remaining_ms / 1000. - self.clock())
 
+    # 仅为当前会话、当前任务且反馈新鲜的有效租约续期。
     def _renew_if_due(self, master, reply):
         status = reply.status
         with self.lock:
@@ -478,6 +488,7 @@ class Navigation:
                 self.lease_task = None
                 self.error = '任务续约未获底盘接受'
 
+    # STOP 应答与后续新鲜零速证据分别记录；应答不等于实测停稳。
     def _stop(self, master):
         result = master.stop(on_reply=self.observe)
         error = result.get('error', {})
@@ -498,6 +509,7 @@ class Navigation:
                 else:
                     self._cancel_detour(self.error)
 
+    # 扫描持续缺失或剩余路线受阻时先停车，不在行驶中直接换路线。
     def _check_route(self, reply):
         status = reply.status
         identity = status.boot, status.epoch, status.task
@@ -522,6 +534,7 @@ class Navigation:
             self.avoidance_phase, self.avoidance_message = 'stopping', '前方路线被挡，正在停车'
             self._queue_stop()
 
+    # 确认停稳后重规划；A* 可能耗时，上传前需重新核对反馈和位姿。
     def _avoidance_cycle(self, master, reply):
         with self.lock:
             detour = self.detour
@@ -575,6 +588,7 @@ class Navigation:
             self.work, self.error = 'uploading', None
             self.avoidance_phase, self.avoidance_message = 'resuming', '已找到绕行路线，正在下发'
 
+    # 独占串口并串行处理停车、上传、查询和续约；异常后定位失效。
     def run(self, device, closed):
         try:
             with open_port(device, .1) as port:
@@ -634,6 +648,7 @@ class Navigation:
                 self.stop_requested = False
                 self._invalidate('串口已关闭，请重新连接并定位')
 
+    # 网页读取缓存快照；过期反馈不能证明当前位置或停车状态。
     def snapshot(self):
         with self.lock:
             status = self.latest.status if self.latest else None

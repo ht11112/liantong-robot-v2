@@ -116,6 +116,7 @@
       const values = seedFields.map(input => input.valueAsNumber);
       return values.every(finite) ? {x:values[0],y:values[1],yaw:angle(values[2]*Math.PI/180)} : null;
     }
+    // 地图原点可能带旋转；绘制和鼠标选点使用互逆坐标变换。
     function screen(p, projection=view) {
       const {map,left,top,scale} = projection;
       const [ox,oy,yaw] = map.origin, c=Math.cos(yaw),s=Math.sin(yaw);
@@ -171,6 +172,7 @@
         context.fillRect(p.x-size/2,p.y-size/2,size,size);
       }
     }
+    // 雷达点仅在连接和源数据新鲜时显示，避免展示过期观测。
     function draw() {
       const map=state.map;
       const points=state.connected===true && state.source_fresh===true ? state.avoidance?.points||[] : [];
@@ -191,6 +193,7 @@
       marker(seed(),'#7c45ac',true);marker(goal(),'#d58626',false);marker(state.source_fresh===false?null:state.pose,'#245bd4',true);
       ctx.restore();
     }
+    // 图像异步加载后仍核对地图身份，避免旧图覆盖当前图。
     function loadMap() {
       const map=state.map;
       if(!map || state.map_image_available!==true || imageKey===map.pgm_sha256) return;
@@ -290,6 +293,7 @@
       $('task-error').textContent=taskError||'';$('task-error').hidden=!taskError;
       draw();
     }
+    // 状态轮询只读取 RK 状态；实际动作由用户提交。
     async function poll() {
       try {
         const response=await fetch('/api/state',{cache:'no-store'});
@@ -304,6 +308,7 @@
         render();window.setTimeout(poll,650);
       }
     }
+    // 操作请求携带会话令牌；停车和其他操作各有独立界面状态。
     async function submit(op,body) {
       if($(op).disabled) return;
       if(op==='stop') stopping=true;

@@ -3,6 +3,7 @@
 #include "mq.h"
 #include <stddef.h>
 
+/* 串口请求与回复使用 V12；固定长度遥测包含任务和停车状态。 */
 #define WIRE_VERSION 12u
 #define WIRE_BAUD 115200u
 #define WIRE_TELEMETRY_SIZE 110u
@@ -14,6 +15,7 @@ enum { WIRE_INITIALIZED=1, WIRE_ODOM_VALID=2, WIRE_EXECUTING=4,
        WIRE_ARRIVAL=8, WIRE_STOP_CONFIRMED=16, WIRE_RX_FAULT=32,
        WIRE_COMMITTED=64, WIRE_STARTED=128, WIRE_ACK_VALID=256 };
 
+/* 发送、时钟和临界区由板级适配；中断只接收字节，不执行队列。 */
 typedef struct {
   bool (*tx_ready)(void *user);
   /* Nonblocking. Keep data until physical UART TC, then release RS485 DE. */

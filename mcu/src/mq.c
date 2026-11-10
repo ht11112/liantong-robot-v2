@@ -46,6 +46,7 @@ void mq_init(MQ *q,uint64_t boot_id,const MQDriveOps *ops,void *user) {
   q->odom.epoch=1;q->state=MQ_IDLE;
   if(!boot_id){q->first_error=MQ_ERR_BOOT;q->critical_latched=true;}
 }
+/* 保留首个故障并进入停车流程；串口和启动故障还会锁存。 */
 void mq_fault(MQ *q,uint32_t error,uint32_t now) {
   if(error==MQ_ERR_UART || error==MQ_ERR_BOOT)q->critical_latched=true;
   if(!q->first_error){q->first_error=error;q->first_error_tick_ms=now;}
@@ -54,6 +55,7 @@ void mq_fault(MQ *q,uint32_t error,uint32_t now) {
     q->physical_stop_confirmed=false;q->drive.stop(q->drive_user,now);
   }
 }
+/* 里程计只积分连续真实样本；异常恢复要求停稳及连续有效反馈。 */
 void mq_sample(MQ *q,const MQSample *s) {
   MQOdom *o=&q->odom;
   bool stationary=s->left_tenths_rpm>=-2 && s->left_tenths_rpm<=2 &&
@@ -139,6 +141,7 @@ static bool segment_valid(MQSegment s) {
   return isfinite(s.value) && (s.kind==MQ_KIND_MOVE ? s.value>0.f && s.value<=1000.f :
     s.kind==MQ_KIND_TURN && absf(s.value)>0.f && absf(s.value)<=2.f*MQ_PI);
 }
+/* BEGIN 建立待上传队列，不启动电机；任务号在本次启动内单调递增。 */
 MQResult mq_begin(MQ *q,uint64_t task,uint32_t epoch,uint16_t count,
                   uint32_t crc,uint32_t lease_ms) {
   if(!task || !count || count>MQ_CAPACITY || lease_ms!=MQ_LEASE_MS)return MQ_INVALID;
@@ -157,6 +160,7 @@ MQResult mq_begin(MQ *q,uint64_t task,uint32_t epoch,uint16_t count,
   q->target_pending=false;q->zero_count=0;q->progress=q->yaw_deviation=q->lateral_deviation=0.f;
   return MQ_OK;
 }
+/* 相同序号和内容可重复确认；新段必须按顺序上传。 */
 MQResult mq_append(MQ *q,uint64_t task,uint16_t index,MQSegment s) {
   if(task!=q->task_id)return MQ_IDENTITY;
   if(!segment_valid(s) || index>=q->count)return MQ_INVALID;
@@ -167,6 +171,7 @@ MQResult mq_append(MQ *q,uint64_t task,uint16_t index,MQSegment s) {
   if(index!=q->received)return MQ_ORDER;
   q->segments[q->received++]=s;return MQ_OK;
 }
+/* 全部分段及 CRC 校验通过后才进入 READY。 */
 MQResult mq_commit(MQ *q,uint64_t task) {
   if(task!=q->task_id || q->epoch_at_upload!=q->odom.epoch)return MQ_IDENTITY;
   if(q->committed)return MQ_OK;
@@ -174,6 +179,7 @@ MQResult mq_commit(MQ *q,uint64_t task) {
   if(mq_segments_crc(q->segments,q->count)!=q->expected_crc)return MQ_CRC;
   q->committed=true;q->state=MQ_READY;return MQ_OK;
 }
+/* START 仅接受当前 READY 队列，并要求底盘健康、反馈新鲜和实测零速。 */
 MQResult mq_start(MQ *q,uint64_t task,uint32_t now) {
   if(task!=q->task_id || q->epoch_at_upload!=q->odom.epoch)return MQ_IDENTITY;
   /* Critical boot/UART faults also invalidate an old successful START ACK. */
@@ -186,6 +192,7 @@ MQResult mq_start(MQ *q,uint64_t task,uint32_t now) {
   q->has_started=true;q->started_ms=q->lease_started_ms=now;q->index=0;q->state=MQ_ARMING;
   q->drive.arm(q->drive_user,now);return MQ_OK;
 }
+/* 只续当前活动任务；过期租约不能通过迟到续约恢复。 */
 MQResult mq_renew(MQ *q,uint64_t task,uint32_t now) {
   if(task!=q->task_id || q->epoch_at_upload!=q->odom.epoch)return MQ_IDENTITY;
   if(!lease_active(q))return MQ_ORDER;
@@ -200,6 +207,7 @@ MQResult mq_renew(MQ *q,uint64_t task,uint32_t now) {
   q->lease_started_ms=now;
   return MQ_OK;
 }
+/* STOP 作废尚未执行的队列；物理停稳由驱动反馈确认。 */
 void mq_stop(MQ *q,uint32_t now) {
   if(q->has_started && q->state!=MQ_COMPLETE && q->state!=MQ_FAILED)mq_fault(q,MQ_ERR_CANCEL,now);
   else {
@@ -239,6 +247,7 @@ static void request_target(MQ *q,int16_t l,int16_t r,uint32_t now) {
   q->desired_left=l;q->desired_right=r;q->target_generation=generation;
   q->target_requested_ms=q->last_target_ms=now;q->target_pending=true;
 }
+/* 周期状态机检查反馈与租约，段间先下发零速并等待实测停稳。 */
 void mq_tick(MQ *q,uint32_t now) {
   MQDriveView d=view(q);
   if(d.error && !q->first_drive_error)q->first_drive_error=d.error;

@@ -20,6 +20,7 @@ HOST, PC_PORT, RK_PORT = '127.0.0.1', 8766, 8767
 ACTION_PATHS = frozenset(('/api/localize', '/api/zero', '/api/preview', '/api/start', '/api/stop'))
 
 
+# PC 通过已校验主机密钥的 SSH 通道访问 RK 本机 API。
 class SSHHTTP:
     """Reuse the pinned SSH connection; each HTTP request has its own channel."""
     def __init__(self, host, user, known_hosts, alias, password):
@@ -88,6 +89,7 @@ class SSHHTTP:
             connection.close()
 
 
+# 本地地图先核对哈希，并与 RK 返回的地图身份比较。
 class MapGateway:
     def __init__(self, remote, map_pgm, map_sha256, *, costmap_grid=None):
         self.remote = remote
@@ -123,6 +125,7 @@ class MapGateway:
         return status, payload
 
 
+# 网页服务限本机访问，操作请求还需携带当前会话令牌。
 def handler_for(gateway):
     class Handler(BaseHTTPRequestHandler):
         def setup(self):

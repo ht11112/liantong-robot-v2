@@ -77,6 +77,7 @@ def _copy_pose(pose, measurement_monotonic_s):
     return result
 
 
+# 位姿按真实测量时间分段保存；插值不能跨断段，也不向区间外外推。
 class PoseHistory:
     """Owned flat pose copies, bounded by capacity (2..4096 samples).
 
@@ -150,6 +151,7 @@ class PoseHistory:
                 raise PoseHistoryError('latest original source is future or expired')
             return dict(pose)
 
+    # 查找时间两侧的实测样本并插值；缺少有效端点时明确报错。
     def sample_at(self, source_time):
         """Interpolate only between observed measurement-axis endpoints.
 

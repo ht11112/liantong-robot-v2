@@ -75,6 +75,7 @@ static bool sync_fault(Wire *w,uint32_t now){
   uint32_t saved=enter(w);(void)pending(w);
   bool fault=wire_service_fault(w,now);leave(w,saved);return fault;
 }
+/* 相同请求号只有内容也一致时才可复用缓存应答。 */
 static bool same_request(const Wire *w,const uint8_t *f,uint16_t n){
   return n==w->previous_length && !memcmp(f+2,w->previous+2,n-4u);
 }
@@ -87,6 +88,7 @@ static void reject(Wire *w,uint32_t req,MQResult result,uint32_t now){
   /* A malformed or stale STOP must not displace a pending valid reply. */
   if(!w->reply_pending)stage_reply(w,req,result,0,now);
 }
+/* V12 帧经身份、顺序和内容校验后分发给任务队列状态机。 */
 static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
   MQ *q=w->queue;uint8_t op=f[3];bool stop=op==WIRE_STOP;MQResult r;
   if(n<36u||op<WIRE_BEGIN||op>WIRE_RENEW)return;
@@ -148,6 +150,7 @@ static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
   w->last_request=req;w->has_request=true;w->previous_result=(uint8_t)r;
   memcpy(w->previous,f,n);w->previous_length=n;
 }
+/* 从串口字节流拼帧；只有完整且校验通过的帧才会被执行。 */
 static void consume(Wire *w,uint8_t byte,uint32_t now){
   if(!w->used){if(byte==0xa5)w->frame[w->used++]=byte;return;}
   if(w->used==1u && byte!=0x5a){w->used=byte==0xa5?1u:0u;return;}
@@ -167,6 +170,7 @@ static void consume(Wire *w,uint8_t byte,uint32_t now){
     w->used=0;
   }
 }
+/* 主循环处理接收和待发送应答，串口故障进入停车处理。 */
 void wire_poll(Wire *w,uint32_t now){
   if(w->io.now_ms)now=w->io.now_ms(w->user);
   if(w->reply_pending&&(uint32_t)(now-w->reply_queued_ms)>=REPLY_TIMEOUT_MS)w->reply_pending=false;

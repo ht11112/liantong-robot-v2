@@ -15,6 +15,7 @@ import time
 from mcu_v10 import BAUD, canonical_segments, crc16
 
 
+# 文件名沿用 v11，实际请求与回复的线上协议版本为 V12。
 VERSION = 12
 BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, RENEW, TELEMETRY = 1, 2, 3, 4, 5, 6, 7, 8, 128
 LEASE_MS = 30000
@@ -103,6 +104,7 @@ def decode_status(raw):
     return value
 
 
+# 按帧头、长度和 CRC 从串口字节流提取完整 V12 回复。
 class ReplyParser:
     def __init__(self):
         self.buffer = bytearray()
@@ -184,6 +186,7 @@ class ReplyTimeout(LinkError):
     pass
 
 
+# 单个串口 owner 一次只处理一个请求；普通查询可丢样，动作事务不可。
 class RkMaster:
     """One serial owner, one transaction at a time. Ordinary queries may drop."""
 
@@ -203,6 +206,7 @@ class RkMaster:
         self.ignored = Counter(unmatched_ack=0, stale_reply=0)
         self.failed = False
 
+    # 回复须匹配请求号、会话和接受水位；动作结果不确定时关闭会话。
     def _exchange(self, kind, *, task=0, extra=b'', discover=False, start_before=None, drop_missing=False):
         if self.failed:
             raise LinkError('Owner closed to new requests after an uncertain transaction')
@@ -307,6 +311,7 @@ class RkMaster:
         with self.lock:
             return self._exchange(QUERY, start_before=start_before, drop_missing=True)
 
+    # 按 BEGIN、逐段 APPEND、COMMIT 上传；COMMIT 必须证明队列为 READY。
     def upload(self, document, task=None, *, on_ack=None):
         plan = document if isinstance(document, QueuePlan) else QueuePlan.from_document(document)
         with self.lock:
@@ -362,6 +367,7 @@ class RkMaster:
                 raise LinkError('RENEW ACK did not identify the current task', reply)
             return reply
 
+    # 先取得 STOP 应答，再等待应答之后的新鲜实测零速与停车确认。
     def stop(self, *, proof_timeout=3., on_reply=None):
         if not math.isfinite(proof_timeout) or proof_timeout <= 0:
             raise ValueError('Stop proof timeout must be finite and positive')

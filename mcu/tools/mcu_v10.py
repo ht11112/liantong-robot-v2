@@ -19,6 +19,7 @@ BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, TELEMETRY = 1, 2, 3, 4, 5, 6, 
 ACK_VALID = 256
 
 
+# V12 主站复用此 CRC 实现；本文件的 V10 通信入口是历史工具。
 def crc16(raw):
     value = 0xFFFF
     for byte in raw:
@@ -45,6 +46,7 @@ def command(kind, boot, epoch, request, grant, task=0, extra=b''):
     return result
 
 
+# 规范化路线段供当前 V12 队列编码和 CRC 计算共用。
 def canonical_segments(document):
     """Return exact float32 wire bytes; CRC does not depend on C padding."""
     segments = document['segments']

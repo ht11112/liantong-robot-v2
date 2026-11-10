@@ -55,6 +55,7 @@ static void uart_init(void){
   check(HAL_UART_Receive_IT(&uart,&rx_byte,1));
   HAL_NVIC_ClearPendingIRQ(LPUART1_IRQn);HAL_NVIC_EnableIRQ(LPUART1_IRQn);
 }
+/* 中断接收串口字节并重新挂接接收；协议处理留在主循环。 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *h){
   if(h!=&uart)return;
   /* Preserve every received byte, including a complete STOP across TX/TC.
@@ -136,6 +137,7 @@ static uint32_t can_errors(void *u){
   (void)u;uint32_t ecr=can.Instance->ECR&0x7fffu;
   return ((can.Instance->PSR&FDCAN_PSR_BO)?1u:0u)|(ecr<<1);
 }
+/* CAN 数据交给驱动层并保留实际接收时间。 */
 static void can_receive(void){
   unsigned budget=16;
   while(budget--&&HAL_FDCAN_GetRxFifoFillLevel(&can,FDCAN_RX_FIFO0)){
@@ -151,6 +153,7 @@ static void watchdog_init(void){
   IWDG->KR=0xcccc;IWDG->KR=0x5555;IWDG->PR=3;IWDG->RLR=999;IWDG->WINR=0xfff;
   start=HAL_GetTick();while(IWDG->SR){IWDG->KR=0xaaaa;if((uint32_t)(HAL_GetTick()-start)>100u)check(HAL_ERROR);}IWDG->KR=0xaaaa;
 }
+/* 主循环协调 CAN、里程计、协议、驱动和看门狗。 */
 int main(void){
   __disable_irq();SCB->VTOR=FLASH_BASE;SysTick->CTRL=0;
   for(unsigned i=0;i<8;i++){NVIC->ICER[i]=0xffffffffu;NVIC->ICPR[i]=0xffffffffu;}__DSB();__ISB();

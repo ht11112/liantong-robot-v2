@@ -66,6 +66,7 @@ static bool start(Drive *d,uint16_t index,uint8_t sub,uint8_t bytes,bool write,u
   return true;
 }
 
+/* CAN 回复按当前事务匹配，错误和超时由驱动状态机处理。 */
 void drive_receive_can(Drive *d,uint32_t id,uint32_t dlc,const uint8_t b[8],uint32_t now){
   d->last_rx_ms=now;
   DriveTransaction *t=&d->transaction;
@@ -82,6 +83,7 @@ void drive_receive_can(Drive *d,uint32_t id,uint32_t dlc,const uint8_t b[8],uint
   t->pending=false;t->done=true;t->ok=true;
 }
 
+/* 速度样本保留接收时刻，供上层判断新鲜度和连续性。 */
 static void publish_speed(Drive *d,uint32_t value,uint32_t tick){
   d->speed_raw=value;d->speed_tick=tick;d->cache_mask|=C_SPEED;
   bool fresh=(d->cache_mask&(C_STATUS|C_FAULT|C_CURRENT))==(C_STATUS|C_FAULT|C_CURRENT)
@@ -193,6 +195,7 @@ static void completed(Drive *d){
   }
 }
 
+/* 停车是独立驱动流程，停稳确认依赖后续速度回读。 */
 static void begin_stop(Drive *d,bool explicit_stop){
   d->flow=FLOW_STOP;d->flow_step=0;d->flow_started_ms=d->now;
   d->view.state=MQ_DRIVE_STOPPING;d->view.stop_verified=false;
@@ -257,6 +260,7 @@ static bool auxiliary(Drive *d,uint32_t interval){
   d->last_aux_start=d->now;d->aux_index=(uint8_t)((i+1u)%5u);return true;
 }
 
+/* 按事务顺序推进使能、速度设置、反馈查询和停车流程。 */
 void drive_poll(Drive *d,uint32_t now){
   d->now=now;
   uint32_t errors=d->bus.bus_errors(d->bus_user);

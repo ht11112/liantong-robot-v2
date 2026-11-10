@@ -33,6 +33,7 @@ def _clip(a, b, width, height):
         for i, limit in enumerate((width, height)))
 
 
+# 沿有效有限射线遍历栅格，供清除历史障碍使用。
 def _ray_cells(a, b, width, height):
     """Cells crossed by the ray interior, excluding its original endpoint cells.
 
@@ -75,6 +76,7 @@ def _ray_cells(a, b, width, height):
         current = following
 
 
+# 障碍离开视野后仍保留，直到新的有效空闲射线证实可清除。
 class DynamicObstacles:
     """Remember hits only in map-free cells; static occupancy stays unchanged."""
     def __init__(self, grid):

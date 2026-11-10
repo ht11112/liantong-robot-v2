@@ -2,6 +2,7 @@
 #define MQ_DRIVE_H
 #include "mq.h"
 
+/* 驱动层维护 CAN 事务、实测轮速和停车证明，供任务队列读取。 */
 typedef struct {
   bool (*send)(void *user,const uint8_t data[8]);
   bool (*tx_ready)(void *user);
