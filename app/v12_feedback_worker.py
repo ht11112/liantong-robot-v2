@@ -13,7 +13,7 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
-from mcu_v11 import (Exchange, LinkError, PERIOD_S, QUERY, QueuePlan, Rejected,
+from mcu_v11 import (APPEND_REPLY_TIMEOUT_S, Exchange, LinkError, PERIOD_S, QUERY, QueuePlan, Rejected,
                      RequestCancelled, RkMaster, STATUS, STOP, Telemetry,
                      error_record, open_port)
 
@@ -396,8 +396,10 @@ class FeedbackWorker:
 
     def upload(self, document, task=None, *, on_ack=None, revision=None):
         plan = document if isinstance(document, QueuePlan) else QueuePlan.from_document(document)
-        acks = self._submit('upload', (plan, task), revision,
-                            (len(plan.segments) + 2) * (self.reply_timeout + PERIOD_S) + STOP_PROOF_TIMEOUT_S + 2.)
+        append_timeout = max(self.reply_timeout, APPEND_REPLY_TIMEOUT_S)
+        timeout = (len(plan.segments) * (append_timeout + PERIOD_S)
+                   + 2 * (self.reply_timeout + PERIOD_S) + STOP_PROOF_TIMEOUT_S + 2.)
+        acks = self._submit('upload', (plan, task), revision, timeout)
         if on_ack is not None:
             for ack in acks:
                 on_ack(ack)

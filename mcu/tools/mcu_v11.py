@@ -21,6 +21,7 @@ BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, RENEW, TELEMETRY = 1, 2, 3, 4,
 LEASE_MS = 30000
 TELEMETRY_SIZE = 110
 PERIOD_S = .020
+APPEND_REPLY_TIMEOUT_S = .500
 MASK32 = 0xFFFFFFFF
 ODOM_INITIALIZED, ODOM_VALID, EXECUTING = 1, 2, 4
 STOP_CONFIRMED, RX_FAULT, COMMITTED, STARTED, ACK_VALID = 16, 32, 64, 128, 256
@@ -241,6 +242,7 @@ class RkMaster:
             self.sleep(earliest - now)
             now = self.clock()
         details = dict(opcode=kind, request=request, request_hex=packet.hex())
+        reply_timeout = max(self.reply_timeout, APPEND_REPLY_TIMEOUT_S) if kind == APPEND else self.reply_timeout
         exchange = None
         try:
             # STOP acceptance and the actual write share a short gate. Waiting for
@@ -251,7 +253,7 @@ class RkMaster:
                     return None
                 self.last_sent, self.sent = sent_at, self.sent + 1
                 details['sent_at'] = sent_at
-                deadline = sent_at + self.reply_timeout
+                deadline = sent_at + reply_timeout
                 try:
                     written = self.port.write(packet)
                 except TimeoutError:

@@ -444,7 +444,7 @@ class MasterTests(unittest.TestCase):
         self.assertFalse(master.failed)
         self.assertEqual(master.query().request, 8)
 
-    def test_upload_reaches_ready_without_implicit_start_and_serializes_poll(self):
+    def test_upload_accepts_delayed_append_replies_and_serializes_poll(self):
         begin_entered = threading.Event()
         poll_started = threading.Event()
 
@@ -454,7 +454,8 @@ class MasterTests(unittest.TestCase):
                 if not poll_started.wait(1):
                     raise RuntimeError('Poll test did not reach the concurrent call')
             ready = kind == v11.COMMIT
-            return [(.014, telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
+            delay = .450 if kind == v11.APPEND else .014
+            return [(delay, telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
                                      ack_request=request, accepted_request_watermark=request, task=task,
                                      state=v11.READY if ready else 0, count=2 if ready else 0,
                                      flags=v11.ACK_VALID | 3 | (v11.COMMITTED if ready else 0)))]
@@ -478,10 +479,34 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(seen, list(zip(range(2, 6), acks)))
         self.assertEqual(acks[-1].status.state, v11.READY)
         self.assertEqual([ack.opcode for ack in acks], [v11.BEGIN, v11.APPEND, v11.APPEND, v11.COMMIT])
+        for ack in acks[1:3]:
+            self.assertAlmostEqual(ack.received_at - ack.sent_at, .450)
         self.assertEqual([packet[3] for _, packet in port.writes],
                          [v11.QUERY, v11.BEGIN, v11.APPEND, v11.APPEND, v11.COMMIT, v11.QUERY])
         self.assertEqual(len(poll_result), 1)
         self.assertEqual(struct.unpack_from('<HII', port.writes[1][1], 34), (2, 0x615AABE9, 30000))
+
+    def test_upload_does_not_retry_after_opcode_specific_reply_deadline(self):
+        for delayed, delay, expected_wait, prefix in (
+                (v11.APPEND, .501, .500, [v11.BEGIN]),
+                (v11.COMMIT, .150, .100, [v11.BEGIN, v11.APPEND])):
+            with self.subTest(opcode=delayed):
+                master, port = self.make_master()
+
+                def response(index, kind, request, task):
+                    _, frame = port.regular_response(index, kind, request, task)[0]
+                    return [(delay if kind == delayed else .014, frame)]
+
+                port.response = response
+                master.discover()
+                with self.assertRaises(v11.ReplyTimeout) as failure:
+                    master.upload({'segments': [{'kind': 'move', 'distance_m': .5}]})
+                details = failure.exception.details
+                self.assertEqual(details['opcode'], delayed)
+                self.assertEqual([ack['opcode'] for ack in details['accepted_upload_prefix']], prefix)
+                self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, *prefix, delayed])
+                self.assertAlmostEqual(port.clock() - details['sent_at'], expected_wait, delta=.0021)
+                self.assertTrue(master.failed)
 
     def test_upload_failure_preserves_prior_ack_and_never_sends_commit(self):
         def response(index, kind, request, task):
