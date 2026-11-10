@@ -139,7 +139,8 @@ class NavigationTest(unittest.TestCase):
         closed, master = Event(), Mock(failed=False)
         master.discover.return_value = initial
         master.latest = initial
-        master.diagnostics.return_value = {}
+        master.snapshot.side_effect = lambda: dict(latest=master.latest, connected=True, error=None)
+        master.cached_diagnostics.return_value = {}
         history = [initial]
         master.history_since.side_effect = lambda cursor: dict(
             cursor=len(history), exchanges=history[cursor:], missed=0, connected=True, error=None)
@@ -195,13 +196,14 @@ class NavigationTest(unittest.TestCase):
                 patch('builtins.print') as output:
             self.nav.run('/dev/ttyUSB2', closed)
         self.assertTrue(closed.is_set())
-        owner.assert_called_once_with('/dev/ttyUSB2')
+        owner.assert_called_once_with('/dev/ttyUSB2', trace_timing=False)
         master.launch.assert_called_once_with()
         master.close.assert_called_once_with()
         master.start.assert_not_called()
         master.renew.assert_not_called()
         master.upload.assert_not_called()
         master.stop.assert_not_called()
+        master.diagnostics.assert_not_called()
         output.assert_not_called()
         self.assertEqual(self.nav.localizer.publish.call_count, 2)
 
@@ -209,7 +211,8 @@ class NavigationTest(unittest.TestCase):
         master = Mock(failed=True)
         master.discover.return_value = self.nav.latest
         master.latest = self.nav.latest
-        master.diagnostics.return_value = {}
+        master.snapshot.side_effect = lambda: dict(latest=master.latest, connected=False, error=None)
+        master.cached_diagnostics.return_value = {}
         master.history_since.side_effect = lambda cursor: dict(cursor=1,
             exchanges=[master.latest] if not cursor else [], missed=0, connected=True, error=None)
         master.query.side_effect = LinkError('Serial exchange failed')

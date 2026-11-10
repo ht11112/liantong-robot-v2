@@ -671,8 +671,8 @@ class Navigation:
             self.avoidance_phase, self.avoidance_message = 'resuming', '已找到绕行路线，正在下发'
 
     # 导航线程只读缓存并提交命令；串口进程的查询不依赖本循环进度。
-    def run(self, device, closed):
-        master = FeedbackWorker(device)
+    def run(self, device, closed, trace_feedback_timing=False):
+        master = FeedbackWorker(device, trace_timing=trace_feedback_timing)
         self.feedback = master
         self.feedback_cursor = self.feedback_missed = 0
         self.feedback_error = None
@@ -748,8 +748,9 @@ class Navigation:
 
     # 网页读取缓存快照；过期反馈不能证明当前位置或停车状态。
     def snapshot(self):
-        communication = self.feedback.diagnostics() if self.feedback is not None else None
-        cached = self.feedback.latest if self.feedback is not None else None
+        feedback = self.feedback.snapshot() if self.feedback is not None else None
+        communication = self.feedback.cached_diagnostics(feedback) if feedback is not None else None
+        cached = feedback['latest'] if feedback is not None else None
         with self.lock:
             status = self.latest.status if self.latest else None
             pose = self._map_pose()
@@ -838,6 +839,9 @@ def handler_for(nav):
         def do_GET(self):
             if self.path == '/api/state':
                 self.send(200, nav.snapshot())
+            elif (self.path == '/api/feedback-timing' and nav.feedback is not None
+                  and nav.feedback.timing is not None):
+                self.send(200, nav.feedback.timing.snapshot())
             elif self.path == '/map.pgm':
                 self.send(200, nav.grid.pgm_bytes, 'image/x-portable-graymap')
             else:
@@ -894,6 +898,8 @@ def main(argv=None):
     parser.add_argument('--no-modeled-error-margin', action='store_true',
                         help='路线扫掠只检查车体包络，不叠加动作结束误差')
     parser.add_argument('--obstacle-test', action='store_true', help='启用前方雷达挡路停车与自动重规划')
+    parser.add_argument('--trace-feedback-timing', action='store_true',
+                        help='在 RK 本机接口记录最近 4096 条 QUERY 的分段计时')
     args = parser.parse_args(argv)
     if (not all(math.isfinite(v) for v in (args.laser_x, args.laser_y, args.laser_yaw,
                                           args.obstacle_min_range, args.obstacle_scan_timeout))
@@ -913,7 +919,8 @@ def main(argv=None):
     nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner,
                      obstacle_scan_timeout_s=args.obstacle_scan_timeout)
     closed = threading.Event()
-    workers = [threading.Thread(target=nav.run, args=(args.port, closed), name='v12-navigation')]
+    workers = [threading.Thread(target=nav.run, args=(args.port, closed, args.trace_feedback_timing),
+                                name='v12-navigation')]
     if scanner is not None:
         for work in (nav.update_scan, nav.clear_obstacle_rays):
             workers.append(threading.Thread(target=nav.run_obstacle_worker, args=(closed, work), name=work.__name__))

@@ -23,6 +23,12 @@ STOP_PROOF_TIMEOUT_S = 3.
 # Only the serial owner validates wire frames. Consumers copy trusted internal records.
 FRAME = struct.Struct('<BIddH46s110s')
 TRANSMISSION = struct.Struct('<BId')
+TIMING_STAGES = ('cadence_ready', 'write_started', 'write_returned',
+                 'read_returned', 'parsed', 'timeout') + tuple(
+    f'{name}_{phase}' for name in ('publish', 'send_cache', 'drop_cache')
+    for phase in ('waiting', 'acquired', 'released'))
+TIMING_ROW = struct.Struct('<I' + 'd' * len(TIMING_STAGES))
+TIMING_CAPACITY = 4096
 
 
 def _pack(exchange):
@@ -58,6 +64,50 @@ class _Mailbox:
         return pickle.loads(raw) if raw else None
 
 
+class _QueryTiming:
+    """The owner stages marks locally and publishes one row after an exchange."""
+    def __init__(self, ctx):
+        self.data = ctx.RawArray('B', TIMING_CAPACITY * TIMING_ROW.size)
+        self.count = ctx.RawValue('Q', 0)
+        self.lock = ctx.Lock()
+        self.request = None
+        self.marks = {}
+
+    def mark(self, stage, request, at):
+        if stage == 'cadence_ready':
+            self.finish()
+            self.request = request
+        self.marks[stage] = at
+
+    @contextmanager
+    def measure_lock(self, lock, name):
+        self.marks[name + '_waiting'] = time.monotonic()
+        with lock:
+            self.marks[name + '_acquired'] = time.monotonic()
+            yield
+        self.marks[name + '_released'] = time.monotonic()
+
+    def finish(self):
+        if self.request is None:
+            return
+        row = TIMING_ROW.pack(self.request, *(self.marks.get(stage, 0.) for stage in TIMING_STAGES))
+        with self.lock:
+            start = (self.count.value % TIMING_CAPACITY) * TIMING_ROW.size
+            memoryview(self.data).cast('B')[start:start + TIMING_ROW.size] = row
+            self.count.value += 1
+        self.request = None
+        self.marks.clear()
+
+    def snapshot(self):
+        with self.lock:
+            count = self.count.value
+            size = min(count, TIMING_CAPACITY) * TIMING_ROW.size
+            raw = bytes(memoryview(self.data).cast('B')[:size])
+        rows = list(TIMING_ROW.iter_unpack(raw))
+        first = count % TIMING_CAPACITY if count >= TIMING_CAPACITY else 0
+        return dict(stages=('request', *TIMING_STAGES), count=count, rows=rows[first:] + rows[:first])
+
+
 class SharedFeedbackCache:
     def __init__(self, ctx=None, capacity=CAPACITY):
         ctx = ctx or mp.get_context('spawn')
@@ -72,27 +122,33 @@ class SharedFeedbackCache:
         self.failed = ctx.RawValue('b', False)
         self.lock = ctx.Lock()
         self.failure = _Mailbox(ctx)
+        self.timing = None
+
+    def _write_lock(self, name, query):
+        if query and self.timing is not None and self.timing.request is not None:
+            return self.timing.measure_lock(self.lock, name)
+        return self.lock
 
     def publish(self, exchange):
         raw = _pack(exchange)
-        with self.lock:
+        with self._write_lock('publish', exchange.opcode == QUERY):
             index = self.sequence.value % self.capacity
             start = index * FRAME.size
-            self.frames[start:start + FRAME.size] = raw
+            memoryview(self.frames).cast('B')[start:start + FRAME.size] = raw
             self.sequence.value += 1
             self.connected.value = True
 
     def record_send(self, opcode, request, sent_at):
         raw = TRANSMISSION.pack(opcode, request, sent_at)
-        with self.lock:
+        with self._write_lock('send_cache', opcode == QUERY):
             index = self.tx_sequence.value % self.capacity
             start = index * TRANSMISSION.size
-            self.transmissions[start:start + TRANSMISSION.size] = raw
+            memoryview(self.transmissions).cast('B')[start:start + TRANSMISSION.size] = raw
             self.tx_sequence.value += 1
             self.query_count.value += opcode == QUERY
 
     def set_dropped(self, count):
-        with self.lock:
+        with self._write_lock('drop_cache', True):
             self.dropped_queries.value = count
 
     def disconnect(self, error=None):
@@ -109,12 +165,16 @@ class SharedFeedbackCache:
             first = max(cursor + 1, latest - self.capacity + 1, 1)
             missed = max(0, first - cursor - 1)
             data = self.transmissions if transmissions else self.frames
-            records = []
-            for sequence in range(first, latest + 1):
-                index = (sequence - 1) % self.capacity
-                start = index * stride
-                records.append((sequence, bytes(data[start:start + stride])))
+            view = memoryview(data).cast('B')
+            start = ((first - 1) % self.capacity) * stride
+            end = start + max(0, latest - first + 1) * stride
+            # A wrapped ring takes two bulk copies. Walk individual records after releasing.
+            tail = bytes(view[start:end])
+            head = bytes(view[:max(0, end - len(view))])
             connected = bool(self.connected.value)
+        raw = tail + head
+        records = [(first + index // stride, raw[index:index + stride])
+                   for index in range(0, len(raw), stride)]
         return latest, records, missed, connected
 
     def history_since(self, cursor):
@@ -180,10 +240,11 @@ def _distribution(values):
 
 
 def _worker_main(device, reply_timeout, cache, commands, results, stop_results,
-                 stop_revision, send_gate, closed, port_factory):
+                 stop_revision, send_gate, closed, port_factory, timing):
     command_revision = 0
     handled_stop = 0
     master = None
+    cache.timing = timing
 
     @contextmanager
     def guard(kind):
@@ -197,7 +258,8 @@ def _worker_main(device, reply_timeout, cache, commands, results, stop_results,
     try:
         with closing(port_factory(device, reply_timeout)) as port:
             master = RkMaster(port, reply_timeout=reply_timeout, send_guard=guard,
-                              on_send=cache.record_send, on_reply=cache.publish)
+                              on_send=cache.record_send, on_reply=cache.publish,
+                              on_query_timing=timing.mark if timing is not None else None)
             master.discover()
             while not closed.is_set():
                 parent = mp.parent_process()
@@ -239,12 +301,16 @@ def _worker_main(device, reply_timeout, cache, commands, results, stop_results,
                             if master.failed:
                                 raise
                 cache.set_dropped(master.dropped_queries)
+                if timing is not None:
+                    timing.finish()
     except Exception as exc:
         if not closed.is_set():
             cache.disconnect(error_record(exc))
     finally:
         if master is not None:
             cache.set_dropped(master.dropped_queries)
+        if timing is not None:
+            timing.finish()
         with cache.lock:
             cache.connected.value = False
 
@@ -263,12 +329,14 @@ def _raise_error(record):
 
 class FeedbackWorker:
     """Navigation-side proxy. query/discover only wait for shared memory changes."""
-    def __init__(self, device, *, reply_timeout=.100, context=None, port_factory=None):
+    def __init__(self, device, *, reply_timeout=.100, context=None, port_factory=None,
+                 trace_timing=False):
         if not math.isfinite(reply_timeout) or reply_timeout <= 0:
             raise ValueError('Reply timeout must be finite and positive')
         self.device, self.reply_timeout = device, reply_timeout
         self.context = context or mp.get_context('spawn')
         self.cache = SharedFeedbackCache(self.context)
+        self.timing = _QueryTiming(self.context) if trace_timing else None
         self.commands = self.context.Queue(maxsize=1)
         self.results, self.stop_results = _Mailbox(self.context), _Mailbox(self.context)
         self._stop_revision = self.context.RawValue('Q', 0)
@@ -280,15 +348,22 @@ class FeedbackWorker:
         self.query_cursor = self.command_id = self.last_stop_waited = 0
         self.local_error = None
         self.sleep = time.sleep
+        self._statistics = self.cache.diagnostics()
+        self._statistics_closed = threading.Event()
+        self._statistics_thread = None
 
     def launch(self):
         if self.process is not None:
             raise ValueError('Feedback worker already launched')
         self.process = self.context.Process(target=_worker_main,
             args=(self.device, self.reply_timeout, self.cache, self.commands, self.results,
-                  self.stop_results, self._stop_revision, self.send_gate, self.closed, self.port_factory),
+                  self.stop_results, self._stop_revision, self.send_gate, self.closed, self.port_factory,
+                  self.timing),
             name='v12-serial-owner')
         self.process.start()
+        self._statistics_thread = threading.Thread(target=self._refresh_statistics,
+                                                   name='v12-feedback-statistics', daemon=True)
+        self._statistics_thread.start()
         return self
 
     @property
@@ -343,6 +418,15 @@ class FeedbackWorker:
         if not result['worker_alive'] and self.process is not None:
             result['error'] = result['error'] or dict(type='LinkError', message='Feedback worker disconnected')
         return result
+
+    def _refresh_statistics(self):
+        while not self._statistics_closed.is_set():
+            self._statistics = self.cache.diagnostics()
+            self._statistics_closed.wait(1.)
+
+    def cached_diagnostics(self, snapshot):
+        return dict(self._statistics, connected=snapshot['connected'], error=snapshot['error'],
+                    worker_alive=self.process is not None and self.process.is_alive())
 
     def discover(self):
         deadline = time.monotonic() + 5.
@@ -435,11 +519,14 @@ class FeedbackWorker:
         return result
 
     def close(self):
+        self._statistics_closed.set()
         self.closed.set()
         if self.process is not None:
             self.process.join(timeout=4.)
             if self.process.is_alive():
                 self.process.terminate()
                 self.process.join(timeout=2.)
+        if self._statistics_thread is not None:
+            self._statistics_thread.join(timeout=1.)
         self.commands.close()
         self.commands.join_thread()

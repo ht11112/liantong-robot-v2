@@ -30,12 +30,33 @@ class FeedbackProcessTests(unittest.TestCase):
         period = max(PERIOD_S, math.ceil(PERIOD_S/resolution)*resolution)
         return .85/period
 
-    def launch(self, profile='normal'):
-        worker = FeedbackWorker(profile, port_factory=simulated_port)
+    def launch(self, profile='normal', *, trace_timing=False):
+        worker = FeedbackWorker(profile, port_factory=simulated_port, trace_timing=trace_timing)
         worker.launch()
         self.addCleanup(worker.close)
         worker.discover()
         return worker
+
+    def test_query_timing_crosses_process_with_ordered_phases(self):
+        worker = self.launch(trace_timing=True)
+        deadline = time.monotonic() + 2.
+        while True:
+            snapshot = worker.timing.snapshot()
+            if len(snapshot['rows']) >= 3 or time.monotonic() >= deadline:
+                break
+            time.sleep(.01)
+        self.assertGreaterEqual(len(snapshot['rows']), 3)
+        rows = [dict(zip(snapshot['stages'], row)) for row in snapshot['rows']]
+        for previous, following in zip(rows[1:], rows[2:]):
+            stages = ('cadence_ready', 'write_started', 'write_returned', 'read_returned',
+                      'parsed', 'publish_waiting', 'publish_acquired', 'publish_released',
+                      'send_cache_waiting', 'send_cache_acquired', 'send_cache_released',
+                      'drop_cache_waiting', 'drop_cache_acquired', 'drop_cache_released')
+            timestamps = [previous[stage] for stage in stages]
+            self.assertGreater(timestamps[0], 0)
+            self.assertEqual(timestamps, sorted(timestamps))
+            self.assertLessEqual(timestamps[-1], following['write_started'])
+            self.assertEqual(following['request'], previous['request'] + 1)
 
     def free_grid(self):
         folder = TemporaryDirectory()

@@ -196,13 +196,14 @@ class RkMaster:
     """One serial owner, one transaction at a time. Ordinary queries may drop."""
 
     def __init__(self, port, *, reply_timeout=.100, clock=time.monotonic, sleep=time.sleep,
-                 send_guard=None, on_send=None, on_reply=None):
+                 send_guard=None, on_send=None, on_reply=None, on_query_timing=None):
         if not math.isfinite(reply_timeout) or reply_timeout <= 0:
             raise ValueError('Reply timeout must be finite and positive')
         self.port = port
         self.reply_timeout = reply_timeout
         self.clock, self.sleep = clock, sleep
         self.send_guard, self.on_send, self.on_reply = send_guard, on_send, on_reply
+        self.on_query_timing = on_query_timing
         self.parser = ReplyParser()
         self.lock = threading.Lock()
         self.latest = None
@@ -243,8 +244,11 @@ class RkMaster:
             now = self.clock()
         details = dict(opcode=kind, request=request, request_hex=packet.hex())
         reply_timeout = max(self.reply_timeout, APPEND_REPLY_TIMEOUT_S) if kind == APPEND else self.reply_timeout
+        trace = self.on_query_timing if kind == QUERY else None
         exchange = None
         try:
+            if trace is not None:
+                trace('cadence_ready', request, self.clock())
             # STOP acceptance and the actual write share a short gate. Waiting for
             # cadence or ACK happens outside it, so a queued START can be cancelled.
             with self.send_guard(kind) if self.send_guard is not None else nullcontext():
@@ -254,13 +258,19 @@ class RkMaster:
                 self.last_sent, self.sent = sent_at, self.sent + 1
                 details['sent_at'] = sent_at
                 deadline = sent_at + reply_timeout
+                if trace is not None:
+                    trace('write_started', request, sent_at)
                 try:
                     written = self.port.write(packet)
                 except TimeoutError:
+                    if trace is not None:
+                        trace('write_returned', request, self.clock())
                     if not drop_missing:
                         raise
                     # A timed-out write can still deliver a QUERY. Honor only an on-time matching ACK.
                 else:
+                    if trace is not None:
+                        trace('write_returned', request, self.clock())
                     details['bytes_written'] = written
                     if written != len(packet):
                         raise LinkError('Partial serial write, command outcome unknown', details=details)
@@ -291,6 +301,10 @@ class RkMaster:
                         if accepted == request:
                             self._dropped_request = None
                     self.latest = exchange
+                    if trace is not None:
+                        parsed_at = self.clock()
+                        trace('read_returned', request, arrived)
+                        trace('parsed', request, parsed_at)
                     if self.on_reply is not None:
                         self.on_reply(exchange)
                     if value.ack_result:
@@ -301,6 +315,8 @@ class RkMaster:
                 # The next request must not accept a late ACK for this sample.
                 self._dropped_request = request
                 self.dropped_queries += 1
+                if trace is not None:
+                    trace('timeout', request, self.clock())
                 return None
             raise ReplyTimeout('Timed out without a matching V12 reply', exchange, details=details)
         except RequestCancelled:
