@@ -33,9 +33,45 @@ class FeedbackHookTests(unittest.TestCase):
         self.assertIsNone(master.query())
         self.assertEqual((len(sent), len(replies), master.dropped_queries), (2, 1, 1))
 
+    def test_slow_send_hook_does_not_spend_the_reply_window_or_compress_writes(self):
+        clock = FakeClock()
+        port = FakePort(clock)
+        sent = []
+
+        def record_send(kind, request, sent_at):
+            sent.append(sent_at)
+            if request == 1:
+                clock.sleep(.150)
+
+        master = v12.RkMaster(port, clock=clock, sleep=clock.sleep, on_send=record_send)
+        master.discover()
+        replies = [master.query(), master.query()]
+        writes = [at for at, _ in port.writes]
+        self.assertEqual(sent, writes)
+        for earlier, later in zip(writes, writes[1:]):
+            self.assertGreaterEqual(later - earlier, v12.PERIOD_S)
+        self.assertEqual([reply.request for reply in replies], [1, 2])
+        for reply in replies:
+            self.assertAlmostEqual(reply.received_at - reply.sent_at, .014)
+        self.assertEqual(master.dropped_queries, 0)
+
+    def test_partial_write_is_still_recorded_as_an_attempt(self):
+        clock = FakeClock()
+        port = FakePort(clock)
+        sent = []
+        master = v12.RkMaster(port, clock=clock, sleep=clock.sleep,
+                              on_send=lambda *args: sent.append(args))
+        master.discover()
+        port.short_write = True
+        with self.assertRaisesRegex(v12.LinkError, 'Partial serial write'):
+            master.query()
+        self.assertEqual(sent[-1], (v12.QUERY, 1, port.writes[-1][0]))
+        self.assertEqual(len(sent), 2)
+
     def test_stop_during_cadence_prevents_actual_start_write(self):
         clock = FakeClock()
         cancelled = [False]
+        sent = []
 
         def response(index, kind, request, task):
             tick = 1000 + index * 20
@@ -55,11 +91,13 @@ class FeedbackHookTests(unittest.TestCase):
             clock.sleep(seconds)
 
         port = FakePort(clock, response)
-        master = v12.RkMaster(port, clock=clock, sleep=sleep, send_guard=guard)
+        master = v12.RkMaster(port, clock=clock, sleep=sleep, send_guard=guard,
+                              on_send=lambda *args: sent.append(args))
         master.discover()
         with self.assertRaises(v12.RequestCancelled):
             master.start(TASK)
         self.assertEqual(len(port.writes), 1)
+        self.assertEqual(len(sent), 1)
         self.assertFalse(master.failed)
         self.assertIsNotNone(master.query())
 

@@ -240,7 +240,7 @@ class RkMaster:
         while now < earliest:
             self.sleep(earliest - now)
             now = self.clock()
-        details = {}
+        details = dict(opcode=kind, request=request, request_hex=packet.hex())
         exchange = None
         try:
             # STOP acceptance and the actual write share a short gate. Waiting for
@@ -250,10 +250,8 @@ class RkMaster:
                 if start_before is not None and sent_at >= start_before:
                     return None
                 self.last_sent, self.sent = sent_at, self.sent + 1
-                details = dict(opcode=kind, request=request, request_hex=packet.hex(), sent_at=sent_at)
+                details['sent_at'] = sent_at
                 deadline = sent_at + self.reply_timeout
-                if self.on_send is not None:
-                    self.on_send(kind, request, sent_at)
                 try:
                     written = self.port.write(packet)
                 except TimeoutError:
@@ -317,6 +315,15 @@ class RkMaster:
         except BaseException:
             self.failed = True
             raise
+        finally:
+            # Shared diagnostics can wait for a reader. Keep that wait out of
+            # both the serial write gate and the reply window.
+            if self.on_send is not None and 'sent_at' in details:
+                try:
+                    self.on_send(kind, request, sent_at)
+                except BaseException:
+                    self.failed = True
+                    raise
 
     def discover(self):
         with self.lock:
