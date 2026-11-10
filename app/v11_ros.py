@@ -16,6 +16,7 @@ from simple_p2p_history import PoseHistory, PoseHistoryError
 NS = 1_000_000_000
 SOURCE_MAX_AGE_S = .25
 OBSTACLE_ODOM_MAX_AGE_S = .5
+OBSTACLE_SCAN_MAX_AGE_S = .5
 LASER_X_M = .13
 MIN_RANGE_M = 1.
 
@@ -159,8 +160,8 @@ class ObstacleScans:
         with self.lock:
             self.received = dict(stamp_ns=stamp, age_at_receive_ms=age*1000,
                                  rejection=('scan timestamp is in the future' if age < 0 else
-                                            'scan expired on receipt' if age >= SOURCE_MAX_AGE_S else None))
-        if not 0 <= now_mono - source < SOURCE_MAX_AGE_S:
+                                            'scan expired on receipt' if age >= OBSTACLE_SCAN_MAX_AGE_S else None))
+        if not 0 <= age < OBSTACLE_SCAN_MAX_AGE_S:
             return
         points, clear_rays = [], []
         minimum = max(self.min_range_m, scan.range_min)
@@ -175,7 +176,7 @@ class ObstacleScans:
                 points.append(end)
                 clear_rays.append((self.laser_x + minimum*c, self.laser_y + minimum*s, *end))
         observation = dict(points=tuple(points), clear_rays=tuple(clear_rays), stamp_ns=stamp,
-                           source_mono=source, expires_mono=source+SOURCE_MAX_AGE_S,
+                           source_mono=source, expires_mono=source+OBSTACLE_SCAN_MAX_AGE_S,
                            usable=bool(points), finite_count=diagnostic['finite_valid_rays'],
                            invalid_count=diagnostic['invalid_rays_skipped'],
                            no_return_count=diagnostic['positive_infinite_rays'])

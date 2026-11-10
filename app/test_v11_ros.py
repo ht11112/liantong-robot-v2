@@ -194,27 +194,27 @@ class ObstacleScanTests(unittest.TestCase):
         self.assertEqual((paired['lower_sample_sequence'], paired['upper_sample_sequence']), (1, 2))
         self.assertAlmostEqual(paired['scan_age_ms'], 70.)
 
-        expired = scans.diagnostics(10.31)
+        expired = scans.diagnostics(10.52)
         self.assertFalse(expired['paired'])
         self.assertEqual(expired['failure_reason'], 'scan expired before pairing')
         self.assertEqual(expired['last_usable_stamp_ns'], paired['scan_stamp_ns'])
         json.dumps(expired, allow_nan=False)
 
-    def test_obstacles_pair_fresh_scan_with_older_real_odom_bracket(self):
+    def test_obstacles_pair_delayed_scan_with_older_real_odom_bracket(self):
         odom = OdomHistory(OFFSET)
         scans = ObstacleScans(odom)
         odom.add(exchange(1, 100, 10.021))
         odom.add(exchange(4, 250, 10.171))
-        scans.add(obstacle_scan(10.09, [2.]*9), 10.18)
+        scans.add(obstacle_scan(10.09, [2.]*9), 10.38)
 
-        frame = scans.latest_observation(10.30)
+        frame = scans.latest_observation(10.39)
         self.assertTrue(frame['usable'])
+        self.assertAlmostEqual(frame['expires_mono'], 10.60)
         pose = frame['pose']
         self.assertEqual((pose['lower_sample_sequence'], pose['upper_sample_sequence']), (1, 4))
-        self.assertAlmostEqual(10.30 - pose['source_monotonic_s'], .30)
+        self.assertAlmostEqual(10.39 - pose['source_monotonic_s'], .39)
         with self.assertRaisesRegex(PoseHistoryError, 'no fresh odometry bracket'):
-            odom.at(frame['stamp_ns'], 10.30)
-        self.assertIsNone(scans.latest_observation(10.351))
+            odom.at(frame['stamp_ns'], 10.39)
 
     def test_gap_diagnostics_show_fresh_sample_but_lost_scan_bracket(self):
         odom = OdomHistory(OFFSET)
@@ -232,7 +232,7 @@ class ObstacleScanTests(unittest.TestCase):
         self.assertEqual(diagnostic['failure_reason'], 'query is outside the observed segment')
 
     def test_rejected_raw_scan_diagnostics_do_not_create_a_frame(self):
-        for now, reason in ((10.4, 'scan expired on receipt'), (10., 'scan timestamp is in the future')):
+        for now, reason in ((10.52, 'scan expired on receipt'), (10., 'scan timestamp is in the future')):
             with self.subTest(now=now):
                 scans = ObstacleScans(OdomHistory(OFFSET))
                 scans.add(obstacle_scan(10.01, [2.]*9), now)
@@ -298,8 +298,9 @@ class ObstacleScanTests(unittest.TestCase):
         odom.add(exchange(2, 150, 10.071))
         scans.add(obstacle_scan(10.01, [2.]*9), 10.08)
         scans.add(obstacle_scan(10.01, [math.inf]*9), 10.09)
-        self.assertEqual(len(scans.latest(10.1)[1]), 5)
-        self.assertIsNone(scans.latest(10.3))
+        frame = scans.latest_observation(10.1)
+        self.assertEqual(len(frame['points']), 5)
+        self.assertAlmostEqual(frame['expires_mono'], 10.52)
 
         odom.add(exchange(1, 100, 10.121, epoch=2))
         self.assertIsNone(scans.latest(10.14))
