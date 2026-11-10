@@ -214,6 +214,13 @@ def _capsule_hits_cell(a, b, radius_sq, i, j):
     return False
 
 
+def _obstacle_hits_sweep(a, b, radius, obstacle_cells):
+    left, right = min(a[0], b[0])-radius-_EPS, max(a[0], b[0])+radius+_EPS
+    bottom, top = min(a[1], b[1])-radius-_EPS, max(a[1], b[1])+radius+_EPS
+    return any(left-1. <= i <= right and bottom-1. <= j <= top
+               and _capsule_hits_cell(a, b, radius*radius, i, j) for i, j in obstacle_cells)
+
+
 # 将静态地图与雷达障碍合并；路径检查考虑车体包络而非仅检查中心点。
 class _Costmap:
     def __init__(self, grid, search_padding=0., *, obstacle_cells=()):
@@ -399,14 +406,57 @@ class GridMap:
             else:
                 length = max(0., segment['distance_m']-progress) / self.resolution
                 x, y = x + length*math.cos(yaw), y + length*math.sin(yaw)
-            b = x, y
-            left, right = min(a[0], x)-radius-_EPS, max(a[0], x)+radius+_EPS
-            bottom, top = min(a[1], y)-radius-_EPS, max(a[1], y)+radius+_EPS
-            if any(left-1. <= i <= right and bottom-1. <= j <= top
-                   and _capsule_hits_cell(a, b, radius*radius, i, j) for i, j in obstacle_cells):
+            if _obstacle_hits_sweep(a, (x, y), radius, obstacle_cells):
                 return True
             progress = 0.
         return False
+
+    def resume_route(self, pose, plan, index, progress, *, obstacle_cells=()):
+        """Build a queue along the original route, or return None if its remainder is blocked."""
+        if plan['map_id'] != self.map_id or plan['no_motion']:
+            raise PlanningError('Expected an executable preview for this exact map')
+        start, target = _point(pose, ('x', 'y', 'yaw')), _point(plan['goal'])
+        result = self._new_plan(start, target)
+        costmap = _Costmap(self, obstacle_cells=obstacle_cells)
+        if result['no_motion']:
+            self._endpoints(costmap, start, target)
+            return result
+
+        segments = plan['segments']
+        if not 0 <= index < len(segments):
+            raise PlanningError('No remaining route segment to reconnect')
+        completed_moves = sum(segment['kind'] == 'move' for segment in segments[:index])
+        remaining = [_point(point) for point in plan['path'][completed_moves:]]
+        moving = segments[index]['kind'] == 'move'
+        if moving:
+            a, b = remaining[:2]
+            dx, dy = b[0]-a[0], b[1]-a[1]
+            length = math.hypot(dx, dy)
+            along = ((start[0]-a[0])*dx + (start[1]-a[1])*dy) / length
+            tolerance = GOAL_TOLERANCE_M if index == len(segments)-1 else MOVE_TOLERANCE_M
+            if along > length + _EPS and math.dist(start[:2], b) > tolerance+_EPS:
+                raise PlanningError('Stopped beyond the remaining MOVE endpoint')
+            fraction = min(1., max(0., along/length, progress/length))
+            remaining[0] = a[0]+fraction*dx, a[1]+fraction*dy
+
+        # A blockage on the connector alone does not justify replacing the route.
+        route = [self._to_grid(*point) for point in remaining]
+        if any(_obstacle_hits_sweep(a, b, costmap.radius, obstacle_cells) for a, b in zip(route, route[1:])):
+            return None
+        # Merge a sub-tolerance remainder into the connector to its endpoint.
+        if moving and math.dist(remaining[0], remaining[1]) <= tolerance+_EPS:
+            del remaining[0]
+        if math.dist(start[:2], remaining[0]) <= MOVE_TOLERANCE_M+_EPS:
+            del remaining[0]
+        if not remaining:
+            raise PlanningError('Remaining route cannot reach the requested goal')
+        a, _ = self._endpoints(costmap, start, target)
+        chain = [a] + [self._to_grid(*point) for point in remaining]
+        if not costmap.sweep(a, chain[1]):
+            raise PlanningError('Reconnect sweep intersects a blocked cell or map boundary')
+        segments, crc = self._compile(start, chain)
+        return dict(result, segments=segments, queue_crc32=crc, search_padding_m=0.,
+                    **self._verify(costmap, start, target, segments))
 
     def _endpoints(self, costmap, pose, goal):
         a, b = self._to_grid(*pose[:2]), self._to_grid(*goal)
@@ -471,19 +521,25 @@ class GridMap:
             x, y = x+length*math.cos(yaw), y+length*math.sin(yaw)
         return _queue(segments)
 
+    def _new_plan(self, start, target):
+        error = math.hypot(target[0]-start[0], target[1]-start[1])
+        result = dict(map_id=self.map_id, start=dict(zip(('x', 'y', 'yaw'), start)),
+                      goal=dict(zip(('x', 'y'), target)),
+                      goal_tolerance_m=GOAL_TOLERANCE_M, no_motion=error <= GOAL_TOLERANCE_M+_EPS)
+        if result['no_motion']:
+            return dict(result, segments=[], queue_crc32=0,
+                        path=[dict(x=start[0], y=start[1])], distance_m=0., nominal_duration_s=0.,
+                        nominal_goal_error_m=error, actual_endpoint_verified=False)
+        return result
+
     # 地图路径编译成 MCU 段队列后，还需验证实际指令。
     def plan(self, pose, goal, *, obstacle_cells=()):
         start, target = _point(pose, ('x', 'y', 'yaw')), _point(goal)
         costmap = _Costmap(self, obstacle_cells=obstacle_cells)
         a, b = self._endpoints(costmap, start, target)
-        result = dict(map_id=self.map_id, start=dict(zip(('x', 'y', 'yaw'), start)),
-                      goal=dict(zip(('x', 'y'), target)),
-                      goal_tolerance_m=GOAL_TOLERANCE_M)
-        if math.hypot(target[0]-start[0], target[1]-start[1]) <= GOAL_TOLERANCE_M+_EPS:
-            return dict(result, no_motion=True, segments=[], queue_crc32=0,
-                        path=[dict(x=start[0], y=start[1])], distance_m=0., nominal_duration_s=0.,
-                        nominal_goal_error_m=math.hypot(target[0]-start[0], target[1]-start[1]),
-                        actual_endpoint_verified=False)
+        result = self._new_plan(start, target)
+        if result['no_motion']:
+            return result
         last_error = None
         # Try wider candidate routes only during preview. Check each encoded
         # route with the same sweep policy used before uploading it.
@@ -503,7 +559,7 @@ class GridMap:
             except PlanningError as exc:
                 last_error = exc
                 continue
-            return dict(result, no_motion=False, segments=segments, queue_crc32=crc,
+            return dict(result, segments=segments, queue_crc32=crc,
                         search_padding_m=padding, **checked)
         raise last_error or PlanningError('No collision-checked executable action queue')
 

@@ -688,6 +688,7 @@ class NavigationTest(unittest.TestCase):
         scanner = self.obstacle_test_start()
         master = Mock()
         scanner.latest_observation.return_value = None
+        self.observe(x=.8, progress=.8)
         self.fresh_tick(.3)
         self.nav._avoidance_cycle(master, self.nav.latest)
         self.assertFalse(self.nav.stop_requested)
@@ -695,13 +696,60 @@ class NavigationTest(unittest.TestCase):
         self.nav._avoidance_cycle(master, self.nav.latest)
         self.assertTrue(self.nav.stop_requested)
         self.assertIsNone(self.nav.lease_task)
+        self.observe(x=.83)
         self.stopped_detour(master)
         self.nav._avoidance_cycle(master, self.nav.latest)
         self.assertIsNone(self.nav.pending)
         self.scan_observation(scanner)
-        self.nav._avoidance_cycle(master, self.nav.latest)
-        self.assertIsNotNone(self.nav.pending)
+        with patch.object(self.grid, 'plan', wraps=self.grid.plan) as search:
+            self.nav._avoidance_cycle(master, self.nav.latest)
+            search.assert_not_called()
+        route = self.nav.pending
+        self.assertAlmostEqual(route['start']['x'], 1.43)
+        self.assertEqual(len(route['segments']), 1)
+        self.assertAlmostEqual(route['segments'][0]['distance_m'], 2.02, places=5)
         self.assertEqual(master.stop.call_count, 1)
+
+        def upload(plan, on_ack):
+            ready = replace(self.nav.latest, status=replace(self.sample, task=2, state=2, first_error=0))
+            on_ack(ready)
+            return [ready]
+
+        master.upload.side_effect = upload
+        master.start.return_value = replace(self.nav.latest, status=replace(
+            self.sample, task=2, state=3, first_error=0, lease_remaining_ms=30000,
+            flags=self.sample.flags & ~STOP_CONFIRMED | EXECUTING))
+        self.nav._upload(master, route)
+        master.start.assert_called_once_with(2)
+        self.assertEqual(self.nav.replans, 0)
+        self.assertEqual(self.nav.avoidance_message, '沿原路线继续前往目标')
+
+    def test_recovered_scan_searches_only_for_an_obstacle_on_original_remainder(self):
+        initial = self.sample
+        for obstruction in ('remaining', 'connector'):
+            with self.subTest(obstruction=obstruction):
+                self.sample = initial
+                scanner = self.obstacle_test_start()
+                master = Mock()
+                lateral = .65 if obstruction == 'connector' else 0.
+                self.observe(x=.8, y=lateral, progress=.8)
+                self.fresh_tick(.8)
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                self.assertTrue(self.nav.stop_requested)
+                self.stopped_detour(master)
+                obstacle = (1.35, 0.) if obstruction == 'remaining' else (.8, .35)
+                self.scan_observation(scanner, (obstacle,))
+                with patch.object(self.grid, 'plan', wraps=self.grid.plan) as search:
+                    self.nav._avoidance_cycle(master, self.nav.latest)
+                if obstruction == 'remaining':
+                    search.assert_called_once()
+                    self.assertIsNotNone(self.nav.pending)
+                    self.assertFalse(self.nav.detour['rejoining'])
+                else:
+                    search.assert_not_called()
+                    self.assertIsNone(self.nav.pending)
+                    self.assertEqual(self.nav.avoidance_message, '无法安全接回原路线，保持停车')
+                    master.start.assert_not_called()
 
     def test_duplicate_scan_does_not_refresh_scan_deadline(self):
         scanner = self.obstacle_test_start()

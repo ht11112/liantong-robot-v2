@@ -161,6 +161,61 @@ class MapPlanTests(unittest.TestCase):
         self.assertTrue(grid.route_blocked(after_turn, plan, 1, 0., ahead))
         self.assertFalse(grid.route_blocked(after_turn, plan, 2, 0., ahead))
 
+    def bent_route(self, grid):
+        start = pose(1., 2.)
+        plan = wire_preview(grid, dict(x=3., y=4.), [dict(kind='move', distance_m=2.),
+                                                dict(kind='turn', angle_rad=math.pi/2.),
+                                                dict(kind='move', distance_m=2.)])
+        return dict(plan, **grid.validate_plan(start, plan))
+
+    def test_resume_preserves_remaining_waypoints_and_respects_reported_progress(self):
+        grid = self.make_map()
+        original = self.bent_route(grid)
+        stopped = pose(2., 2.3)
+        cells = grid.obstacle_cells([(1.55, 2.), (4., 3.)])
+        resumed = grid.resume_route(stopped, original, 0, 1.3, obstacle_cells=cells)
+        self.assertEqual(resumed['goal'], original['goal'])
+        self.assertEqual(resumed['path'], grid.validate_plan(stopped, resumed, obstacle_cells=cells)['path'])
+        self.assertEqual(len(resumed['path']), 4)
+        for point, expected in zip(resumed['path'][1:], [(2.3, 2.), (3., 2.), (3., 4.)]):
+            self.assertAlmostEqual(point['x'], expected[0], places=5)
+            self.assertAlmostEqual(point['y'], expected[1], places=5)
+
+    def test_resume_reports_only_remaining_route_obstacle_as_blockage(self):
+        grid = self.make_map()
+        original = self.bent_route(grid)
+        stopped = pose(2., 3.)
+        ahead = grid.obstacle_cells([(3., 3.5)])
+        self.assertIsNone(grid.resume_route(stopped, original, 0, 1.3, obstacle_cells=ahead))
+        connector_only = grid.obstacle_cells([(2.15, 2.55)])
+        with self.assertRaisesRegex(PlanningError, 'Reconnect sweep'):
+            grid.resume_route(stopped, original, 0, 1.3, obstacle_cells=connector_only)
+        static_grid = self.make_map(((21, 25, 0),))
+        with self.assertRaisesRegex(PlanningError, 'Reconnect sweep'):
+            static_grid.resume_route(stopped, self.bent_route(static_grid), 0, 1.3)
+
+    def test_resume_turn_uses_original_pivot_and_handoff_can_skip_completed_segment(self):
+        grid = self.make_map()
+        original = self.bent_route(grid)
+        stopped = pose(3.04, 2., math.pi/4.)
+        resumed = grid.resume_route(stopped, original, 1, math.pi/4.)
+        self.assertEqual(len(resumed['path']), 3)
+        self.assertAlmostEqual(resumed['path'][1]['x'], 3., places=5)
+        self.assertAlmostEqual(resumed['path'][1]['y'], 2., places=5)
+        handoff = grid.resume_route(pose(3., 2., math.pi/2.), original, 2, 0.)
+        self.assertEqual(handoff['segments'], [dict(kind='move', distance_m=2.)])
+
+    def test_resume_overshoot_stays_stopped_and_goal_tolerance_needs_no_motion(self):
+        grid = self.make_map()
+        original = self.bent_route(grid)
+        with self.assertRaisesRegex(PlanningError, 'Stopped beyond'):
+            grid.resume_route(pose(3.08, 2.), original, 0, 1.9)
+        resumed = grid.resume_route(pose(3.01, 2.), original, 0, 1.9)
+        self.assertEqual(len(resumed['path']), 2)
+        arrived = grid.resume_route(pose(3., 3.95), original, 2, 1.9)
+        self.assertTrue(arrived['no_motion'])
+        self.assertEqual(arrived['segments'], [])
+
     def test_straight_sweep_detects_closed_cell_edge_not_only_centers(self):
         grid = self.make_map(((20,20,0),))
         y = 2.-BODY_RADIUS_M  # Exact swept disk tangency at cell y=2 m.

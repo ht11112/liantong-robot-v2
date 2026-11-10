@@ -442,7 +442,7 @@ class Navigation:
                         self.detour['attempt'] = None
                         self.detour['retry_at'] = now + REPLAN_INTERVAL_S
                         self.avoidance_phase = 'waiting'
-                        self.avoidance_message = '续行等待雷达与里程计配对超时，保持停车，恢复后重新规划'
+                        self.avoidance_message = '续行等待雷达与里程计配对超时，保持停车'
                         return False
                     raise ValueError(message)
             # Leave the existing wait budget intact; the serial worker continues independently.
@@ -517,10 +517,14 @@ class Navigation:
             if not self.stop_requested and status.state in LEASE_STATES and status.lease_remaining_ms:
                 self.lease_task = status.boot, status.epoch, status.task
                 if self.detour is not None:
+                    rejoining = self.detour.get('rejoining', False)
                     self.detour = None
-                    self.replans += 1
+                    if not rejoining:
+                        self.replans += 1
                     self.stop_ack = self.stop_verified = self.stop_evidence = None
-                    self.avoidance_phase, self.avoidance_message = 'watching', '已换路线，继续前往原目标'
+                    self.avoidance_phase = 'watching'
+                    self.avoidance_message = ('沿原路线继续前往目标' if rejoining
+                                              else '已换路线，继续前往原目标')
             elif self.detour is not None:
                 self._cancel_detour('底盘未进入续行状态，请人工处理')
 
@@ -581,7 +585,9 @@ class Navigation:
 
             if self.detour is not None:
                 if self.stop_verified:
-                    self.avoidance_phase, self.avoidance_message = 'waiting', '已停稳，等待重新规划'
+                    self.avoidance_phase = 'waiting'
+                    self.avoidance_message = ('已停稳，等待配对恢复后复验原路线' if 'remaining' in self.detour
+                                              else '已停稳，等待重新规划')
                 else:
                     self._cancel_detour(self.error)
 
@@ -589,6 +595,9 @@ class Navigation:
     def _check_route(self, reply):
         status = reply.status
         identity = status.boot, status.epoch, status.task
+        # In the handoff state the reported segment has already finished.
+        index = status.index + (status.state == 6)
+        progress = status.progress if status.state in (4, 5) else 0.
         with self.lock:
             if (self.stop_requested or self.lease_task != identity or status.state not in LEASE_STATES
                     or status.first_error or status.first_drive_error):
@@ -598,13 +607,12 @@ class Navigation:
             if points is None:
                 if (self.last_usable_scan is None or
                         self.clock() - self.last_usable_scan >= self.obstacle_scan_timeout_s):
-                    self.detour = dict(goal=route['goal'], attempt=None, retry_at=0.)
+                    if route is not None:
+                        self.detour = dict(goal=route['goal'], attempt=None, retry_at=0.,
+                                           remaining=(route, index, progress))
                     self.avoidance_phase, self.avoidance_message = 'stopping', '雷达持续无有效观测，停车等待恢复'
                     self._queue_stop()
                 return
-        # In the handoff state the reported segment has already finished.
-        index = status.index + (status.state == 6)
-        progress = status.progress if status.state in (4, 5) else 0.
         blocked = self.grid.route_blocked(pose, route, index, progress, cells)
         with self.lock:
             if blocked and not self.stop_requested and self.route is route and self.lease_task == identity:
@@ -613,7 +621,7 @@ class Navigation:
                 self.avoidance_phase, self.avoidance_message = 'stopping', '前方路线被挡，正在停车'
                 self._queue_stop()
 
-    # 确认停稳后重规划；A* 可能耗时，上传前需重新核对反馈和位姿。
+    # 缺测停车先复验原路线。仅剩余扫掠被障碍占用时搜索绕行。
     def _avoidance_cycle(self, master, reply):
         with self.lock:
             detour = self.detour
@@ -625,7 +633,7 @@ class Navigation:
                 return
             if not self.stop_verified or self.stop_requested or not self._stationary():
                 return
-            status = reply.status
+            status = self.latest.status
             if status.first_error not in (0, MCU_CANCELLED):
                 self._cancel_detour('底盘有故障，取消自动续行')
                 return
@@ -641,17 +649,27 @@ class Navigation:
                 return
             detour['attempt'], detour['retry_at'] = cells, self.clock() + REPLAN_INTERVAL_S
             pose = self._map_pose()
-            self.avoidance_phase, self.avoidance_message = 'replanning', '正在重新规划到原目标'
+            remaining = detour.get('remaining')
 
+        rejoining = remaining is not None
         try:
-            plan = self.grid.plan(pose, detour['goal'], obstacle_cells=cells)
+            plan = self.grid.resume_route(pose, *remaining, obstacle_cells=cells) if rejoining else None
+            if plan is None:
+                rejoining = False
+                with self.lock:
+                    if self.detour is not detour:
+                        return
+                    self.avoidance_phase, self.avoidance_message = 'replanning', '正在重新规划到原目标'
+                plan = self.grid.plan(pose, detour['goal'], obstacle_cells=cells)
         except PlanningError:
             with self.lock:
                 if self.detour is detour:
-                    self.avoidance_phase, self.avoidance_message = 'waiting', '暂无绕行路线，保持停车'
+                    self.avoidance_phase = 'waiting'
+                    self.avoidance_message = ('无法安全接回原路线，保持停车' if rejoining
+                                              else '暂无绕行路线，保持停车')
             return
 
-        # A* 不影响采集进程；这里等新的缓存反馈后复核起点。
+        # 等新的缓存反馈后复核起点。
         fresh = master.query()
         if fresh is not None:
             self.observe(fresh)
@@ -668,7 +686,10 @@ class Navigation:
                 return
             self.pending = self.route = plan
             self.work, self.error = 'uploading', None
-            self.avoidance_phase, self.avoidance_message = 'resuming', '已找到绕行路线，正在下发'
+            detour['rejoining'] = rejoining
+            self.avoidance_phase = 'resuming'
+            self.avoidance_message = ('已复验原路线剩余部分，正在下发' if rejoining
+                                      else '已找到绕行路线，正在下发')
 
     # 导航线程只读缓存并提交命令；串口进程的查询不依赖本循环进度。
     def run(self, device, closed, trace_feedback_timing=False):
