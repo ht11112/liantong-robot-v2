@@ -196,9 +196,25 @@ class ObstacleScanTests(unittest.TestCase):
 
         expired = scans.diagnostics(10.31)
         self.assertFalse(expired['paired'])
-        self.assertEqual(expired['failure_reason'], 'latest original source is future or expired')
+        self.assertEqual(expired['failure_reason'], 'scan expired before pairing')
         self.assertEqual(expired['last_usable_stamp_ns'], paired['scan_stamp_ns'])
         json.dumps(expired, allow_nan=False)
+
+    def test_obstacles_pair_fresh_scan_with_older_real_odom_bracket(self):
+        odom = OdomHistory(OFFSET)
+        scans = ObstacleScans(odom)
+        odom.add(exchange(1, 100, 10.021))
+        odom.add(exchange(4, 250, 10.171))
+        scans.add(obstacle_scan(10.09, [2.]*9), 10.18)
+
+        frame = scans.latest_observation(10.30)
+        self.assertTrue(frame['usable'])
+        pose = frame['pose']
+        self.assertEqual((pose['lower_sample_sequence'], pose['upper_sample_sequence']), (1, 4))
+        self.assertAlmostEqual(10.30 - pose['source_monotonic_s'], .30)
+        with self.assertRaisesRegex(PoseHistoryError, 'no fresh odometry bracket'):
+            odom.at(frame['stamp_ns'], 10.30)
+        self.assertIsNone(scans.latest_observation(10.351))
 
     def test_gap_diagnostics_show_fresh_sample_but_lost_scan_bracket(self):
         odom = OdomHistory(OFFSET)

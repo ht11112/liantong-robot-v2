@@ -15,6 +15,7 @@ from simple_p2p_history import PoseHistory, PoseHistoryError
 
 NS = 1_000_000_000
 SOURCE_MAX_AGE_S = .25
+OBSTACLE_ODOM_MAX_AGE_S = .5
 LASER_X_M = .13
 MIN_RANGE_M = 1.
 
@@ -88,11 +89,11 @@ class OdomHistory:
             self.last = status
             return pose
 
-    def at(self, stamp_ns, now_mono):
+    def at(self, stamp_ns, now_mono, *, max_age_s=SOURCE_MAX_AGE_S):
         with self.lock:
-            latest = self.history.latest(now_mono, SOURCE_MAX_AGE_S)
+            latest = self.history.latest(now_mono, max_age_s)
             pose = self.history.sample_at((stamp_ns - self.ros_offset_ns) / NS)
-            if not 0 <= now_mono - pose['source_monotonic_s'] < SOURCE_MAX_AGE_S:
+            if not 0 <= now_mono - pose['source_monotonic_s'] < max_age_s:
                 raise PoseHistoryError('Scan stamp has no fresh odometry bracket')
             for key in ('sample_sequence', 'lower_sample_sequence', 'upper_sample_sequence'):
                 if pose.get(key) is not None:
@@ -192,8 +193,12 @@ class ObstacleScans:
             received = self.received
         failure = None
         for stamp, observation in reversed(frames):
+            if now_mono >= observation['expires_mono']:
+                if failure is None:
+                    failure = dict(stamp_ns=stamp, reason='scan expired before pairing')
+                continue
             try:
-                pose = self.odom.at(stamp, now_mono)
+                pose = self.odom.at(stamp, now_mono, max_age_s=OBSTACLE_ODOM_MAX_AGE_S)
             except PoseHistoryError as exc:
                 if failure is None:
                     failure = dict(stamp_ns=stamp, reason=str(exc))
