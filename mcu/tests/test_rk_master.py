@@ -454,7 +454,7 @@ class MasterTests(unittest.TestCase):
                 if not poll_started.wait(1):
                     raise RuntimeError('Poll test did not reach the concurrent call')
             ready = kind == v11.COMMIT
-            delay = .450 if kind == v11.APPEND else .014
+            delay = .900 if kind == v11.APPEND else .014
             return [(delay, telemetry(publication_sequence=index + 1, publication_tick_ms=1000 + 20 * index,
                                      ack_request=request, accepted_request_watermark=request, task=task,
                                      state=v11.READY if ready else 0, count=2 if ready else 0,
@@ -480,7 +480,7 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(acks[-1].status.state, v11.READY)
         self.assertEqual([ack.opcode for ack in acks], [v11.BEGIN, v11.APPEND, v11.APPEND, v11.COMMIT])
         for ack in acks[1:3]:
-            self.assertAlmostEqual(ack.received_at - ack.sent_at, .450)
+            self.assertAlmostEqual(ack.received_at - ack.sent_at, .900)
         self.assertEqual([packet[3] for _, packet in port.writes],
                          [v11.QUERY, v11.BEGIN, v11.APPEND, v11.APPEND, v11.COMMIT, v11.QUERY])
         self.assertEqual(len(poll_result), 1)
@@ -488,7 +488,7 @@ class MasterTests(unittest.TestCase):
 
     def test_upload_does_not_retry_after_opcode_specific_reply_deadline(self):
         for delayed, delay, expected_wait, prefix in (
-                (v11.APPEND, .501, .500, [v11.BEGIN]),
+                (v11.APPEND, 1.001, 1.000, [v11.BEGIN]),
                 (v11.COMMIT, .150, .100, [v11.BEGIN, v11.APPEND])):
             with self.subTest(opcode=delayed):
                 master, port = self.make_master()
