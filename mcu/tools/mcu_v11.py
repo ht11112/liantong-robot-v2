@@ -2,7 +2,7 @@
 
 import argparse
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass
 import json
 import math
@@ -186,16 +186,22 @@ class ReplyTimeout(LinkError):
     pass
 
 
+class RequestCancelled(ValueError):
+    """A request cancelled before any bytes were sent."""
+
+
 # 单个串口 owner 一次只处理一个请求；普通查询可丢样，动作事务不可。
 class RkMaster:
     """One serial owner, one transaction at a time. Ordinary queries may drop."""
 
-    def __init__(self, port, *, reply_timeout=.100, clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, port, *, reply_timeout=.100, clock=time.monotonic, sleep=time.sleep,
+                 send_guard=None, on_send=None, on_reply=None):
         if not math.isfinite(reply_timeout) or reply_timeout <= 0:
             raise ValueError('Reply timeout must be finite and positive')
         self.port = port
         self.reply_timeout = reply_timeout
         self.clock, self.sleep = clock, sleep
+        self.send_guard, self.on_send, self.on_reply = send_guard, on_send, on_reply
         self.parser = ReplyParser()
         self.lock = threading.Lock()
         self.latest = None
@@ -234,24 +240,30 @@ class RkMaster:
         while now < earliest:
             self.sleep(earliest - now)
             now = self.clock()
-        sent_at = self.clock()
-        if start_before is not None and sent_at >= start_before:
-            return None
-        self.last_sent, self.sent = sent_at, self.sent + 1
-        details = dict(opcode=kind, request=request, request_hex=packet.hex(), sent_at=sent_at)
-        deadline = sent_at + self.reply_timeout
+        details = {}
         exchange = None
         try:
-            try:
-                written = self.port.write(packet)
-            except TimeoutError:
-                if not drop_missing:
-                    raise
-                # A timed-out write can still deliver a QUERY. Honor only an on-time matching ACK.
-            else:
-                details['bytes_written'] = written
-                if written != len(packet):
-                    raise LinkError('Partial serial write, command outcome unknown', details=details)
+            # STOP acceptance and the actual write share a short gate. Waiting for
+            # cadence or ACK happens outside it, so a queued START can be cancelled.
+            with self.send_guard(kind) if self.send_guard is not None else nullcontext():
+                sent_at = self.clock()
+                if start_before is not None and sent_at >= start_before:
+                    return None
+                self.last_sent, self.sent = sent_at, self.sent + 1
+                details = dict(opcode=kind, request=request, request_hex=packet.hex(), sent_at=sent_at)
+                deadline = sent_at + self.reply_timeout
+                if self.on_send is not None:
+                    self.on_send(kind, request, sent_at)
+                try:
+                    written = self.port.write(packet)
+                except TimeoutError:
+                    if not drop_missing:
+                        raise
+                    # A timed-out write can still deliver a QUERY. Honor only an on-time matching ACK.
+                else:
+                    details['bytes_written'] = written
+                    if written != len(packet):
+                        raise LinkError('Partial serial write, command outcome unknown', details=details)
             while self.clock() < deadline:
                 data = self.port.read(max(1, TELEMETRY_SIZE - len(self.parser.buffer)))
                 arrived = self.clock()
@@ -279,6 +291,8 @@ class RkMaster:
                         if accepted == request:
                             self._dropped_request = None
                     self.latest = exchange
+                    if self.on_reply is not None:
+                        self.on_reply(exchange)
                     if value.ack_result:
                         raise Rejected('MCU rejected opcode {} with result {}'.format(kind, value.ack_result),
                                        exchange, details=details)
@@ -289,6 +303,8 @@ class RkMaster:
                 self.dropped_queries += 1
                 return None
             raise ReplyTimeout('Timed out without a matching V12 reply', exchange, details=details)
+        except RequestCancelled:
+            raise
         except Rejected:
             if discover:
                 self.failed = True

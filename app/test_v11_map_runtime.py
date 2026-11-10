@@ -1,17 +1,20 @@
 import math
-from contextlib import nullcontext, redirect_stdout
+import struct
+from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import unittest
-from dataclasses import replace
+from dataclasses import astuple, replace
 from unittest.mock import Mock, patch
 
 from v11_map_runtime import Navigation, load_map, same_pose
 from mcu_v11 import (ACK_VALID, EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RENEW, STOP_CONFIRMED,
-                     Exchange, LinkError, QueuePlan, Telemetry)
+                     HEADER, STATUS, Exchange, LinkError, QueuePlan, RequestCancelled, Telemetry, command, crc16)
+from v12_feedback_worker import FeedbackWorker, SharedFeedbackCache
+from v11_ros import OdomHistory
 
 
 class Localization:
@@ -27,6 +30,26 @@ class Localization:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+
+class CachedOdom:
+    def __init__(self):
+        self.odom = OdomHistory(0)
+        self.seen = []
+
+    def publish(self, exchange):
+        self.seen.append(exchange)
+        self.odom.add(exchange)
+
+    def invalidate_history(self):
+        self.odom.invalidate()
+
+
+def cache_exchange(sample, request, sent):
+    raw = HEADER + STATUS.pack(*astuple(sample))
+    raw += struct.pack('<H', crc16(raw[2:]))
+    packet = command(7, sample.boot, sample.epoch, request)
+    return Exchange(7, request, sent, sent + .01, sample, packet.hex(), raw.hex())
 
 
 class NavigationTest(unittest.TestCase):
@@ -113,8 +136,13 @@ class NavigationTest(unittest.TestCase):
         initial = self.nav.latest
         initial_alignment = self.nav.alignment
         initial_source_time = self.nav.source_time
-        closed, port, master = Event(), object(), Mock(failed=False)
+        closed, master = Event(), Mock(failed=False)
         master.discover.return_value = initial
+        master.latest = initial
+        master.diagnostics.return_value = {}
+        history = [initial]
+        master.history_since.side_effect = lambda cursor: dict(
+            cursor=len(history), exchanges=history[cursor:], missed=0, connected=True, error=None)
         steps = iter(('drop', 'age', 'receive', 'verify'))
 
         def query():
@@ -145,7 +173,9 @@ class NavigationTest(unittest.TestCase):
                 self.now += .02
                 sample = replace(self.sample, publication_sequence=2, sample_sequence=2,
                                  publication_tick_ms=150, measurement_tick_ms=145, x=.25)
-                return Exchange(7, 2, self.now - .01, self.now, sample, '', '')
+                master.latest = Exchange(7, 2, self.now - .01, self.now, sample, '', '')
+                history.append(master.latest)
+                return master.latest
             state = self.nav.snapshot()
             self.assertTrue(state['connected'])
             self.assertTrue(state['source_fresh'])
@@ -161,13 +191,13 @@ class NavigationTest(unittest.TestCase):
             return None
 
         master.query.side_effect = query
-        with patch('v11_map_runtime.open_port', return_value=nullcontext(port)) as opening, \
-                patch('v11_map_runtime.RkMaster', return_value=master) as owner, \
+        with patch('v11_map_runtime.FeedbackWorker', return_value=master) as owner, \
                 patch('builtins.print') as output:
             self.nav.run('/dev/ttyUSB2', closed)
         self.assertTrue(closed.is_set())
-        opening.assert_called_once_with('/dev/ttyUSB2', .1)
-        owner.assert_called_once_with(port)
+        owner.assert_called_once_with('/dev/ttyUSB2')
+        master.launch.assert_called_once_with()
+        master.close.assert_called_once_with()
         master.start.assert_not_called()
         master.renew.assert_not_called()
         master.upload.assert_not_called()
@@ -178,9 +208,12 @@ class NavigationTest(unittest.TestCase):
     def test_actual_link_failure_still_closes_owner_and_reports_error(self):
         master = Mock(failed=True)
         master.discover.return_value = self.nav.latest
+        master.latest = self.nav.latest
+        master.diagnostics.return_value = {}
+        master.history_since.side_effect = lambda cursor: dict(cursor=1,
+            exchanges=[master.latest] if not cursor else [], missed=0, connected=True, error=None)
         master.query.side_effect = LinkError('Serial exchange failed')
-        with patch('v11_map_runtime.open_port', return_value=nullcontext(object())), \
-                patch('v11_map_runtime.RkMaster', return_value=master), patch('builtins.print'):
+        with patch('v11_map_runtime.FeedbackWorker', return_value=master), patch('builtins.print'):
             self.nav.run('/dev/ttyUSB2', Event())
         state = self.nav.snapshot()
         self.assertFalse(state['connected'])
@@ -188,6 +221,165 @@ class NavigationTest(unittest.TestCase):
         self.assertFalse(state['can_stop'])
         self.assertEqual(state['task']['phase'], 'unknown')
         self.assertEqual(state['error'], 'Serial exchange failed')
+
+    def test_cached_history_preserves_invalid_sample_before_newer_command_result(self):
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        odom = CachedOdom()
+        self.nav.localizer = odom
+        worker = FeedbackWorker('unused')
+        self.addCleanup(worker.close)
+        self.nav.feedback = worker
+        samples = [self.sample, replace(self.sample, flags=ACK_VALID | ODOM_INITIALIZED),
+                   replace(self.sample, sample_sequence=2, publication_sequence=3,
+                           measurement_tick_ms=145, publication_tick_ms=150)]
+        frames = [cache_exchange(sample, index+1, 4.88+index*.05)
+                  for index, sample in enumerate(samples)]
+        for frame in frames:
+            worker.cache.publish(frame)
+        self.nav.observe(frames[-1])
+        self.assertEqual(odom.seen, frames)
+        self.assertEqual(self.nav.localization['mode'], 'unlocalized')
+        self.assertEqual(odom.odom.history.summary()['count'], 1)
+        source_time = self.nav.source_time
+        self.nav.observe(frames[-1])
+        self.assertEqual(odom.seen, frames)
+        self.assertEqual(self.nav.source_time, source_time)
+        self.assertEqual(self.nav.snapshot()['communication']['consumer_lag_ms'], 0.)
+        self.assertEqual(worker.cache.tx_sequence.value, 0)
+
+    def test_cache_overrun_invalidates_alignment_and_history_without_restamping(self):
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        odom = CachedOdom()
+        self.nav.localizer = odom
+        worker = FeedbackWorker('unused')
+        worker.cache = SharedFeedbackCache(capacity=2)
+        self.addCleanup(worker.close)
+        self.nav.feedback = worker
+        first = cache_exchange(self.sample, 1, 4.80)
+        worker.cache.publish(first)
+        self.nav._consume_feedback()
+        for index in range(1, 4):
+            sample = replace(self.sample, sample_sequence=index+1, publication_sequence=index+1,
+                             measurement_tick_ms=95+index*50, publication_tick_ms=100+index*50)
+            worker.cache.publish(cache_exchange(sample, index+1, 4.80+index*.05))
+        self.nav.pending = {'old': 'route'}
+        with redirect_stdout(io.StringIO()) as logged:
+            self.nav._consume_feedback()
+        self.assertEqual(self.nav.feedback_missed, 1)
+        self.assertIn('v12_feedback_overrun', logged.getvalue())
+        self.assertEqual(self.nav.localization['mode'], 'unlocalized')
+        self.assertIsNone(self.nav.pending)
+        self.assertIsNone(self.nav.route)
+        self.assertIn('cache_overrun', self.nav.error)
+        self.assertEqual([e.status.sample_sequence for e in odom.seen], [1, 3, 4])
+        self.assertEqual(odom.odom.history.summary()['count'], 2)
+        self.assertAlmostEqual(self.nav.source_time, 4.944)
+        self.assertEqual(worker.stop_revision, 0)
+
+    def test_feedback_consumer_failure_invalidates_state_without_navigation_cycle(self):
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        worker = FeedbackWorker('unused')
+        self.addCleanup(worker.close)
+        worker.cache.publish(cache_exchange(self.sample, 1, 4.98))
+        self.nav.feedback = worker
+        self.nav._consume_feedback()
+        self.nav.pending = {'old': 'route'}
+        worker.cache.disconnect(dict(type='LinkError', message='serial owner ended'))
+        self.nav._run_feedback_consumer(Event())
+        self.assertFalse(self.nav.connected)
+        self.assertIsNone(self.nav.pending)
+        self.assertIsNone(self.nav.lease_task)
+        self.assertEqual(self.nav.localization['mode'], 'unlocalized')
+        self.assertEqual(self.nav.error, 'serial owner ended')
+
+    def test_cache_overrun_during_execution_requests_stop_once(self):
+        self.nav.mode = 'drive'
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        worker = FeedbackWorker('unused')
+        worker.cache = SharedFeedbackCache(capacity=2)
+        self.addCleanup(worker.close)
+        self.nav.feedback = worker
+        for index in range(3):
+            sample = replace(self.sample, flags=self.sample.flags | EXECUTING, task=7, state=4,
+                             lease_remaining_ms=20000, publication_sequence=index+1,
+                             sample_sequence=index+1, measurement_tick_ms=95+index*50,
+                             publication_tick_ms=100+index*50)
+            worker.cache.publish(cache_exchange(sample, index+1, 4.88+index*.05))
+        self.nav.lease_task = 42, 1, 7
+        with patch.object(worker, 'request_stop') as stop, redirect_stdout(io.StringIO()):
+            self.nav._consume_feedback()
+            self.nav._consume_feedback()
+        stop.assert_called_once_with()
+        self.assertTrue(self.nav.stop_requested)
+        self.assertIsNone(self.nav.lease_task)
+        self.assertEqual(self.nav.localization['mode'], 'unlocalized')
+
+    def test_stop_cancels_pending_renew_without_closing_feedback_worker(self):
+        self.nav.mode = 'drive'
+        self.observe(task=7, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=4000)
+        self.nav.lease_task = 42, 1, 7
+        master = Mock(failed=False)
+
+        def renew(task):
+            self.nav.request_stop()
+            raise RequestCancelled('Control request cancelled by STOP')
+
+        master.renew.side_effect = renew
+        self.nav._renew_if_due(master, self.nav.latest)
+        self.assertTrue(self.nav.connected)
+        self.assertTrue(self.nav.stop_requested)
+        self.assertIsNone(self.nav.lease_task)
+        self.assertIsNone(self.nav.error)
+        master.close.assert_not_called()
+
+    def test_renew_reads_completed_feedback_before_submitting_rpc(self):
+        self.nav.mode = 'drive'
+        self.observe(task=7, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=4000)
+        self.nav.lease_task = 42, 1, 7
+        stale = self.nav.latest
+        worker = FeedbackWorker('unused')
+        self.addCleanup(worker.close)
+        self.nav.feedback = worker
+        completed = replace(self.sample, state=8, flags=self.sample.flags & ~EXECUTING | STOP_CONFIRMED,
+                            lease_remaining_ms=0, sample_sequence=2, publication_sequence=2,
+                            measurement_tick_ms=145, publication_tick_ms=150)
+        worker.cache.publish(cache_exchange(completed, 2, 4.98))
+        with patch.object(worker, 'renew') as renew:
+            self.nav._renew_if_due(worker, stale)
+        renew.assert_not_called()
+        self.assertIsNone(self.nav.lease_task)
+        self.assertEqual(self.nav.latest.status.state, 8)
+        self.assertTrue(self.nav.connected)
+
+    def test_task_ending_during_renew_rpc_does_not_close_feedback_worker(self):
+        self.nav.mode = 'drive'
+        self.observe(task=7, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=4000)
+        self.nav.lease_task = 42, 1, 7
+        stale = self.nav.latest
+        worker = FeedbackWorker('unused')
+        self.addCleanup(worker.close)
+        self.nav.feedback = worker
+        worker.cache.publish(cache_exchange(self.sample, 1, 4.97))
+        completed = replace(self.sample, state=8, flags=self.sample.flags & ~EXECUTING | STOP_CONFIRMED,
+                            lease_remaining_ms=0, sample_sequence=2, publication_sequence=2,
+                            measurement_tick_ms=145, publication_tick_ms=150)
+
+        def completed_before_renew(task, *, revision):
+            worker.cache.publish(cache_exchange(completed, 2, 4.98))
+            raise ValueError('RENEW requires the exact active task with an unexpired lease')
+
+        with patch.object(worker, 'renew', side_effect=completed_before_renew) as renew, \
+                patch.object(worker, 'close') as close:
+            self.nav._renew_if_due(worker, stale)
+            renew.assert_called_once_with(7, revision=0)
+            close.assert_not_called()
+        self.assertIsNone(self.nav.lease_task)
+        self.assertTrue(self.nav.connected)
+        self.assertIsNone(self.nav.error)
+        self.assertEqual(self.nav.latest.status.state, 8)
+        worker.cache.publish(cache_exchange(replace(completed, publication_sequence=3), 3, 4.99))
+        self.nav._consume_feedback()
+        self.assertEqual(self.nav.latest.status.publication_sequence, 3)
 
     def test_same_pose_checks_distance_and_wrapped_heading_at_the_boundary(self):
         reference = dict(x=0., y=0., yaw=math.radians(179.))
@@ -664,12 +856,15 @@ class NavigationTest(unittest.TestCase):
                 master.upload.assert_not_called()
                 master.start.assert_not_called()
 
-    def test_cancel_cannot_be_accepted_before_inflight_start_finishes(self):
+    def test_cancel_reaches_worker_while_start_ack_is_pending(self):
         self.nav.mode = 'drive'
         self.nav.align(dict(x=.6, y=2., yaw=0.), 'manual')
         self.nav.preview(dict(x=2., y=2.))
         plan = self.nav.plan
         master = Mock()
+        self.nav.feedback = master
+        master.stop_revision = 0
+        master.history_since.return_value = dict(cursor=0, exchanges=[], missed=0, connected=True, error=None)
         master.upload.return_value = [self.nav.latest]
         entering, accepted = Event(), Event()
         order = []
@@ -681,11 +876,15 @@ class NavigationTest(unittest.TestCase):
             accepted.set()
 
         worker = Thread(target=cancel)
-        def start(task):
+        def signal_stop():
+            master.stop_revision += 1
+        master.request_stop.side_effect = signal_stop
+
+        def start(task, *, revision):
+            self.assertEqual(revision, 0)
             worker.start()
             self.assertTrue(entering.wait(1.))
-            # STOP is trying to enter the shared command-ordering section.
-            self.assertFalse(accepted.wait(.02))
+            self.assertTrue(accepted.wait(1.))
             order.append('start completed')
             return self.nav.latest
         master.start.side_effect = start
@@ -694,7 +893,9 @@ class NavigationTest(unittest.TestCase):
         finally:
             worker.join(1.)
         self.assertTrue(accepted.is_set())
-        self.assertEqual(order, ['start completed', 'cancel accepted'])
+        self.assertEqual(order, ['cancel accepted', 'start completed'])
+        master.request_stop.assert_called_once_with()
+        self.assertEqual(master.stop_revision, 1)
         self.assertTrue(self.nav.stop_requested)
 
     def test_detour_resume_waits_for_pairing_and_keeps_stopped_on_timeout(self):

@@ -1,4 +1,4 @@
-"""RK V12 map navigation. The serial loop owns every MCU request."""
+"""RK V12 map navigation consuming an independent serial feedback worker."""
 
 import argparse
 from collections import deque
@@ -14,7 +14,8 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
 from mcu_v11 import (EXECUTING, LEASE_STATES, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, Rejected,
-                     RkMaster, error_record, open_port)
+                     RequestCancelled, error_record)
+from v12_feedback_worker import FeedbackWorker
 from v11_map_plan import PlanningError, load_map
 from v11_obstacles import DynamicObstacles
 
@@ -63,7 +64,7 @@ def inverse(pose):
                 y=s * pose['x'] - c * pose['y'], yaw=-pose['yaw'])
 
 
-# 导航状态由串口主线程维护；网页提交请求，扫描投影和清除在后台执行。
+# 串口在独立进程持续查询；导航与 ROS 只消费内存中的反馈历史。
 class Navigation:
     def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
                  obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S):
@@ -97,6 +98,11 @@ class Navigation:
         self.stop_evidence = None
         self.error = None
         self.last_scan_failure = None
+        self.feedback = None
+        self.feedback_cursor = 0
+        self.feedback_missed = 0
+        self.feedback_lock = threading.Lock()
+        self.feedback_error = None
 
     def _invalidate(self, reason):
         if self.detour is not None:
@@ -132,6 +138,12 @@ class Navigation:
 
     # 只有新的有效 MCU 测量能续鲜；boot 或 epoch 改变时必须重新定位。
     def observe(self, exchange):
+        if self.feedback is not None:
+            self._consume_feedback()
+            return
+        self._observe_exchange(exchange)
+
+    def _observe_exchange(self, exchange):
         sample = exchange.status
         identity = sample.boot, sample.epoch
         key = (*identity, sample.sample_sequence, sample.measurement_tick_ms)
@@ -159,6 +171,43 @@ class Navigation:
             self.localizer.publish(exchange)
         if self.scanner is not None:
             self.scanner.publish(exchange)
+
+    def _consume_feedback(self):
+        # 命令结果与后台消费都走同一游标，避免较新的 ACK 越过尚未读到的失效样本。
+        with self.feedback_lock:
+            batch = self.feedback.history_since(self.feedback_cursor)
+            if batch['missed']:
+                self.feedback_missed += batch['missed']
+                for adapter in (self.scanner, self.localizer):
+                    if adapter is not None:
+                        adapter.invalidate_history()
+                with self.lock:
+                    self._invalidate('反馈缓存遗漏，请重新定位')
+                    self.pending = self.lease_task = None
+                    self.error = '反馈缓存遗漏（cache_overrun），已取消待执行路线'
+                    sample = batch['exchanges'][-1].status
+                    if self.mode == 'drive' and sample.flags & EXECUTING:
+                        self._queue_stop()
+                print(json.dumps(dict(event='v12_feedback_overrun', missed=batch['missed'],
+                                      cursor=batch['cursor'])), flush=True)
+            for exchange in batch['exchanges']:
+                self._observe_exchange(exchange)
+            self.feedback_cursor = batch['cursor']
+            if not batch['connected']:
+                error = batch['error']
+                raise LinkError(error['message'] if error else '串口采集进程已退出')
+
+    def _run_feedback_consumer(self, closed):
+        try:
+            while not closed.wait(.01):
+                self._consume_feedback()
+        except Exception as exc:
+            with self.lock:
+                self.feedback_error = exc
+                self.error = str(exc)
+                self.connected = False
+                self.pending = self.lease_task = None
+                self._invalidate('串口已关闭，请重新连接并定位')
 
     def _clear_obstacles(self):
         self.obstacles.clear()
@@ -367,6 +416,8 @@ class Navigation:
         self.stop_revision += 1
         self.stop_ack = self.stop_verified = None
         self.stop_evidence = None
+        if self.feedback is not None:
+            self.feedback.request_stop()
 
     def _observe_upload(self, exchange):
         self.observe(exchange)
@@ -374,7 +425,7 @@ class Navigation:
             if self.stop_requested:
                 raise ValueError('上传已取消')
 
-    # 停车请求优先；截止时已有有效配对仍可使用，等待期间只查询真实反馈。
+    # 截止时已有有效配对仍可使用；query 在此只等待缓存推进，不发送串口。
     def _wait_start_scan(self, master, deadline, stage):
         while True:
             with self.lock:
@@ -394,7 +445,7 @@ class Navigation:
                         self.avoidance_message = '续行等待雷达与里程计配对超时，保持停车，恢复后重新规划'
                         return False
                     raise ValueError(message)
-            # Continue observing real odometry without starting a query that cannot finish in time.
+            # Leave the existing wait budget intact; the serial worker continues independently.
             query_cutoff = deadline - master.reply_timeout
             if now < query_cutoff:
                 reply = master.query(start_before=query_cutoff)
@@ -428,7 +479,9 @@ class Navigation:
         with self.lock:
             if self.stop_requested:
                 return
-        reply = master.upload(plan, on_ack=self._observe_upload)[-1]
+            revision = self.feedback.stop_revision if self.feedback is not None else None
+        reply = (master.upload(plan, on_ack=self._observe_upload, revision=revision) if self.feedback is not None
+                 else master.upload(plan, on_ack=self._observe_upload))[-1]
         with self.lock:
             if self.mode == 'ready' or self.stop_requested:
                 return
@@ -443,13 +496,21 @@ class Navigation:
             if not same_pose(current_pose, pose):
                 raise ValueError('上传期间起点已变化，请重新预览')
             current_cells = self._upload_obstacles() if self.scanner is not None else cells
-            if current_pose != pose or current_cells != cells:
-                self.grid.validate_plan(current_pose, plan, obstacle_cells=current_cells)
+        if current_pose != pose or current_cells != cells:
+            self.grid.validate_plan(current_pose, plan, obstacle_cells=current_cells)
+        with self.lock:
+            if self.stop_requested:
+                return
+            self._require_stationary()
+            if not same_pose(self._map_pose(), current_pose):
+                raise ValueError('上传期间起点已变化，请重新预览')
+            if self.scanner is not None and self._upload_obstacles() != current_cells:
+                raise ValueError('上传期间障碍已变化，请重新预览')
             self.work = 'starting'
-            # Order the single bounded START exchange with accepted HTTP STOPs.
-            # A cancellation cannot return successfully and then be overtaken
-            # by a START that was waiting just outside this critical section.
-            started = master.start(reply.status.task)
+            revision = self.feedback.stop_revision if self.feedback is not None else None
+        # 子进程在实际发送前复核这一代次，STOP 无需等待导航锁或 ACK。
+        started = (master.start(reply.status.task, revision=revision) if self.feedback is not None
+                   else master.start(reply.status.task))
         self.observe(started)
         status = started.status
         with self.lock:
@@ -469,18 +530,33 @@ class Navigation:
 
     # 仅为当前会话、当前任务且反馈新鲜的有效租约续期。
     def _renew_if_due(self, master, reply):
-        status = reply.status
+        if self.feedback is not None:
+            self._consume_feedback()
         with self.lock:
             if self.lease_task is None:
                 return
+            reply = self.latest
+            status = reply.status
             if (self.lease_task != (status.boot, status.epoch, status.task)
                     or status.state not in LEASE_STATES or not status.lease_remaining_ms):
                 self.lease_task = None
                 return
             if self.stop_requested or not self._fresh() or not 0 < self._lease_seconds(reply) <= RENEW_BEFORE_S:
                 return
+            revision = self.feedback.stop_revision if self.feedback is not None else None
         try:
-            self.observe(master.renew(status.task))
+            renewed = (master.renew(status.task, revision=revision) if self.feedback is not None
+                       else master.renew(status.task))
+            self.observe(renewed)
+        except RequestCancelled:
+            with self.lock:
+                self.lease_task = None
+        except ValueError:
+            # 子进程可能在 RPC 排队期间已查询到任务结束；这不是串口失效。
+            if self.feedback is not None:
+                self._consume_feedback()
+            with self.lock:
+                self.lease_task = None
         except Rejected as exc:
             # The MCU may complete or stop the task while RENEW is in flight.
             self.observe(exc.exchange)
@@ -513,33 +589,39 @@ class Navigation:
     def _check_route(self, reply):
         status = reply.status
         identity = status.boot, status.epoch, status.task
-        if (self.stop_requested or self.lease_task != identity or status.state not in LEASE_STATES
-                or status.first_error or status.first_drive_error):
-            return
-        pose, points = self._map_pose(), self._scan_points()
-        if points is None:
-            if (self.last_usable_scan is None or
-                    self.clock() - self.last_usable_scan >= self.obstacle_scan_timeout_s):
-                self.detour = dict(goal=self.route['goal'], attempt=None, retry_at=0.)
-                self.avoidance_phase, self.avoidance_message = 'stopping', '雷达持续无有效观测，停车等待恢复'
-                self._queue_stop()
-            return
-        cells = self.obstacles.cells
+        with self.lock:
+            if (self.stop_requested or self.lease_task != identity or status.state not in LEASE_STATES
+                    or status.first_error or status.first_drive_error):
+                return
+            pose, points = self._map_pose(), self._scan_points()
+            route, cells = self.route, self.obstacles.cells
+            if points is None:
+                if (self.last_usable_scan is None or
+                        self.clock() - self.last_usable_scan >= self.obstacle_scan_timeout_s):
+                    self.detour = dict(goal=route['goal'], attempt=None, retry_at=0.)
+                    self.avoidance_phase, self.avoidance_message = 'stopping', '雷达持续无有效观测，停车等待恢复'
+                    self._queue_stop()
+                return
         # In the handoff state the reported segment has already finished.
         index = status.index + (status.state == 6)
         progress = status.progress if status.state in (4, 5) else 0.
-        if self.grid.route_blocked(pose, self.route, index, progress, cells):
-            # Memory survives leaving the fan, but measured free rays can clear it.
-            self.detour = dict(goal=self.route['goal'], attempt=None, retry_at=0.)
-            self.avoidance_phase, self.avoidance_message = 'stopping', '前方路线被挡，正在停车'
-            self._queue_stop()
+        blocked = self.grid.route_blocked(pose, route, index, progress, cells)
+        with self.lock:
+            if blocked and not self.stop_requested and self.route is route and self.lease_task == identity:
+                # Memory survives leaving the fan, but measured free rays can clear it.
+                self.detour = dict(goal=route['goal'], attempt=None, retry_at=0.)
+                self.avoidance_phase, self.avoidance_message = 'stopping', '前方路线被挡，正在停车'
+                self._queue_stop()
 
     # 确认停稳后重规划；A* 可能耗时，上传前需重新核对反馈和位姿。
     def _avoidance_cycle(self, master, reply):
         with self.lock:
             detour = self.detour
-            if detour is None:
-                self._check_route(reply)
+        if detour is None:
+            self._check_route(reply)
+            return
+        with self.lock:
+            if self.detour is not detour:
                 return
             if not self.stop_verified or self.stop_requested or not self._stationary():
                 return
@@ -569,7 +651,7 @@ class Navigation:
                     self.avoidance_phase, self.avoidance_message = 'waiting', '暂无绕行路线，保持停车'
             return
 
-        # A* can outlast the freshness window while this owner is stopped.
+        # A* 不影响采集进程；这里等新的缓存反馈后复核起点。
         fresh = master.query()
         if fresh is not None:
             self.observe(fresh)
@@ -588,52 +670,64 @@ class Navigation:
             self.work, self.error = 'uploading', None
             self.avoidance_phase, self.avoidance_message = 'resuming', '已找到绕行路线，正在下发'
 
-    # 独占串口并串行处理停车、上传、查询和续约；异常后定位失效。
+    # 导航线程只读缓存并提交命令；串口进程的查询不依赖本循环进度。
     def run(self, device, closed):
+        master = FeedbackWorker(device)
+        self.feedback = master
+        self.feedback_cursor = self.feedback_missed = 0
+        self.feedback_error = None
+        consumer_closed = threading.Event()
+        consumer = None
         try:
-            with open_port(device, .1) as port:
-                master = RkMaster(port)
-                self.observe(master.discover())
-                while not closed.is_set():
+            master.launch()
+            self.observe(master.discover())
+            consumer = threading.Thread(target=self._run_feedback_consumer,
+                                        args=(consumer_closed,), name='v12-cache-consumer')
+            consumer.start()
+            while not closed.is_set():
+                if self.feedback_error is not None:
+                    raise self.feedback_error
+                with self.lock:
+                    stop = self.stop_requested
+                    plan, self.pending = self.pending, None
+                    if stop and self.work in (None, 'uploading', 'starting'):
+                        self.work = 'stopping'
+                try:
+                    if stop:
+                        self._stop(master)
+                    elif plan is not None:
+                        self._upload(master, plan)
+                    else:
+                        reply = master.query()
+                        if reply is not None:
+                            self.observe(reply)
+                            with self.lock:
+                                reply = self.latest
+                            if self.scanner is not None and self.mode == 'drive':
+                                self._avoidance_cycle(master, reply)
+                            self._renew_if_due(master, reply)
+                    if master.failed:
+                        raise LinkError(self.error or 'V12 会话已失效')
+                except (ValueError, LinkError) as exc:
+                    if master.failed or not (stop or plan is not None):
+                        raise
+                    if isinstance(exc, LinkError) and exc.exchange is not None:
+                        self.observe(exc.exchange)
                     with self.lock:
-                        stop = self.stop_requested
-                        plan, self.pending = self.pending, None
-                        if stop and self.work in (None, 'uploading', 'starting'):
-                            self.work = 'stopping'
-                    try:
+                        self.error = str(exc)
+                        if self.scanner is not None:
+                            self._record_scan_failure('v12_navigation_rejected',
+                                                      self.work or 'query', self.error)
+                        if self.detour is not None:
+                            self._cancel_detour(self.error)
                         if stop:
-                            self._stop(master)
-                        elif plan is not None:
-                            self._upload(master, plan)
-                        else:
-                            reply = master.query()
-                            if reply is not None:
-                                self.observe(reply)
-                                if self.scanner is not None and self.mode == 'drive':
-                                    self._avoidance_cycle(master, reply)
-                                self._renew_if_due(master, reply)
-                        if master.failed:
-                            raise LinkError(self.error or 'V12 会话已失效')
-                    except (ValueError, LinkError) as exc:
-                        if master.failed or not (stop or plan is not None):
-                            raise
-                        if isinstance(exc, LinkError) and exc.exchange is not None:
-                            self.observe(exc.exchange)
-                        with self.lock:
-                            self.error = str(exc)
-                            if self.scanner is not None:
-                                self._record_scan_failure('v12_navigation_rejected',
-                                                          self.work or 'query', self.error)
-                            if self.detour is not None:
-                                self._cancel_detour(self.error)
-                            if stop:
-                                self.stop_ack, self.stop_verified = False, False
-                    finally:
-                        with self.lock:
-                            if stop:
-                                self.stop_requested = False
-                            if self.work in ('uploading', 'starting', 'stopping') and (stop or plan is not None):
-                                self.work = None
+                            self.stop_ack, self.stop_verified = False, False
+                finally:
+                    with self.lock:
+                        if stop:
+                            self.stop_requested = False
+                        if self.work in ('uploading', 'starting', 'stopping') and (stop or plan is not None):
+                            self.work = None
         except Exception as exc:
             with self.lock:
                 self.error = str(exc)
@@ -641,6 +735,10 @@ class Navigation:
             print(json.dumps(dict(event='v12_owner_closed', task=task, error=error_record(exc))),
                   flush=True)
         finally:
+            consumer_closed.set()
+            if consumer is not None:
+                consumer.join()
+            master.close()
             with self.lock:
                 self.connected = False
                 self.pending = None
@@ -650,6 +748,8 @@ class Navigation:
 
     # 网页读取缓存快照；过期反馈不能证明当前位置或停车状态。
     def snapshot(self):
+        communication = self.feedback.diagnostics() if self.feedback is not None else None
+        cached = self.feedback.latest if self.feedback is not None else None
         with self.lock:
             status = self.latest.status if self.latest else None
             pose = self._map_pose()
@@ -699,6 +799,11 @@ class Navigation:
                         task=task, avoidance=avoidance, can_prepare=preparing,
                         can_start=bool(preparing and pose and self.plan and self.plan['segments']),
                         can_stop=self.connected and self.mode == 'drive', error=self.error)
+            if communication is not None:
+                communication = dict(communication, consumer_missed=self.feedback_missed,
+                                     consumer_lag_ms=(None if cached is None or self.latest is None else
+                                         max(0., cached.received_at-self.latest.received_at)*1000))
+            result['communication'] = communication
         if avoidance is not None:
             avoidance['points'] = [dict(x=x, y=y) for x, y in points or ()]
         return result
@@ -808,7 +913,7 @@ def main(argv=None):
     nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner,
                      obstacle_scan_timeout_s=args.obstacle_scan_timeout)
     closed = threading.Event()
-    workers = [threading.Thread(target=nav.run, args=(args.port, closed), name='v12-owner')]
+    workers = [threading.Thread(target=nav.run, args=(args.port, closed), name='v12-navigation')]
     if scanner is not None:
         for work in (nav.update_scan, nav.clear_obstacle_rays):
             workers.append(threading.Thread(target=nav.run_obstacle_worker, args=(closed, work), name=work.__name__))

@@ -75,6 +75,18 @@
           <p class="message" id="avoidance-status" role="status" hidden></p>
           <p class="message error" id="task-error" hidden></p><div class="actions" style="margin-top:10px"><button id="stop" type="button" class="stop" disabled>停车</button></div></div>
         </section>
+        <section class="card" id="communication-card" hidden>
+          <div class="cardhead"><h2>4 · 通信状态</h2><span class="pill" id="feedback-worker">等待反馈</span></div>
+          <div class="body"><dl>
+            <div class="kv"><dt>目标通信频率</dt><dd class="mono" id="feedback-target">—</dd></div>
+            <div class="kv"><dt>通信 / 查询频率</dt><dd class="mono" id="feedback-rate">—</dd></div>
+            <div class="kv"><dt>真实轮速样本</dt><dd class="mono" id="feedback-samples">—</dd></div>
+            <div class="kv"><dt>应答时延 中位 / P99</dt><dd class="mono" id="feedback-latency">—</dd></div>
+            <div class="kv"><dt>最大发送间隔</dt><dd class="mono" id="feedback-gap">—</dd></div>
+            <div class="kv"><dt>缓存读取延迟</dt><dd class="mono" id="feedback-consumer">—</dd></div>
+            <div class="kv"><dt>查询丢失 / 缓存遗漏</dt><dd class="mono" id="feedback-loss">—</dd></div>
+          </dl><small>查询目标 50 Hz；MCU 真实轮速采样约 20 Hz。控制命令也会返回反馈。</small></div>
+        </section>
       </aside>
       <section class="card costmap" aria-labelledby="costmap-title">
         <div class="cardhead"><h2 id="costmap-title">导航代价地图</h2><a id="costmap-open" target="_blank" rel="noopener" hidden>查看原图</a></div>
@@ -291,6 +303,21 @@
         task.phase==='turn'?`${(task.progress*180/Math.PI).toFixed(1)}°`:'—';
       $('task-lease').textContent=finite(task.lease_remaining_s)?`${task.lease_remaining_s.toFixed(1)} s`:'—';
       $('task-error').textContent=taskError||'';$('task-error').hidden=!taskError;
+      const comm=state.communication;
+      $('communication-card').hidden=!comm;
+      if(comm){
+        const number=(value,unit)=>finite(value)?`${value.toFixed(1)} ${unit}`:'—';
+        const current=online && comm.connected===true && comm.worker_alive===true;
+        $('feedback-worker').textContent=current?'独立查询中':'查询已断开';
+        $('feedback-worker').className='pill'+(current?' on':'');
+        $('feedback-target').textContent=number(comm.target_hz,'Hz');
+        $('feedback-rate').textContent=current?`${number(comm.send_rate_hz,'Hz')} / ${number(comm.query_rate_hz,'Hz')}`:'—';
+        $('feedback-samples').textContent=current?number(comm.real_sample_rate_hz,'Hz'):'—';
+        $('feedback-latency').textContent=current?`${number(comm.reply_latency_ms?.median,'ms')} / ${number(comm.reply_latency_ms?.p99,'ms')}`:'—';
+        $('feedback-gap').textContent=number(comm.max_send_gap_ms,'ms');
+        $('feedback-consumer').textContent=number(comm.consumer_lag_ms,'ms');
+        $('feedback-loss').textContent=`${comm.dropped_queries ?? '—'} / ${comm.consumer_missed ?? '—'}`;
+      }
       draw();
     }
     // 状态轮询只读取 RK 状态；实际动作由用户提交。

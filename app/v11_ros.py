@@ -30,6 +30,11 @@ class OdomHistory:
         self.source_sequences = {}
         self.lock = threading.Lock()
 
+    def invalidate(self):
+        with self.lock:
+            self.history.invalidate()
+            self.source_sequences.clear()
+
     # 会话、序号和测量间隔决定连续区间；缺口不能靠插值跨越。
     def add(self, exchange):
         status = exchange.status
@@ -263,6 +268,9 @@ class RosObstacleScanner:
     def publish(self, exchange):
         self.scans.odom.add(exchange)
 
+    def invalidate_history(self):
+        self.scans.odom.invalidate()
+
     def latest(self):
         return self.scans.latest(time.monotonic())
 
@@ -365,6 +373,9 @@ class RosLocalizer:
         self.tf.sendTransform(tf)
         self.odom_pub.publish(msg)
         return True
+
+    def invalidate_history(self):
+        self.odom.invalidate()
 
     def localize(self, seed):
         x, y, yaw = (seed[key] for key in ('x', 'y', 'yaw'))

@@ -57,6 +57,21 @@ class V11RosTests(unittest.TestCase):
         with self.assertRaises(PoseHistoryError):
             odom.at(first['stamp_ns'], 10.25)
 
+    def test_consumer_overrun_invalidates_interpolation_until_new_real_bracket(self):
+        odom = OdomHistory(OFFSET)
+        first = odom.add(exchange(1, 100, 10.021))
+        odom.invalidate()
+        self.assertIsNone(odom.add(exchange(1, 100, 10.041)))
+        with self.assertRaises(PoseHistoryError):
+            odom.at(first['stamp_ns'], 10.05)
+        second = odom.add(exchange(2, 150, 10.071))
+        with self.assertRaises(PoseHistoryError):
+            odom.at(first['stamp_ns']+25_000_000, 10.1)
+        third = odom.add(exchange(3, 200, 10.121))
+        paired = odom.at(second['stamp_ns']+25_000_000, 10.15)
+        self.assertEqual((paired['lower_sample_sequence'], paired['upper_sample_sequence']), (2, 3))
+        self.assertEqual(odom.at(third['stamp_ns'], 10.15), third)
+
     def test_invalid_source_large_sequence_gap_or_new_epoch_cuts_bracket(self):
         for cause in ('invalid', 'sequence', 'hidden_recovery', 'tick', 'epoch'):
             with self.subTest(cause=cause):

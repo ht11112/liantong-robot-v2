@@ -45,6 +45,8 @@ class MapPackageTests(unittest.TestCase):
                                    yaml_sha256=sha(yaml.read_bytes()))
             files, manifest = builder.assemble(args)
             self.assertIn('app/v11_obstacles.py', files)
+            self.assertIn('app/v12_feedback_worker.py', files)
+            self.assertIn('scripts/benchmark_v12_feedback.py', files)
             self.assertEqual(set(manifest['files']), set(files)-{'manifest.json'})
             for name, digest in manifest['files'].items():
                 self.assertEqual(sha(files[name]), digest, name)
@@ -71,14 +73,40 @@ class MapPackageTests(unittest.TestCase):
             # Ignore inherited PYTHONPATH and user site packages. The runtime
             # must find its dependencies inside the extracted package itself.
             env = dict(os.environ, TMP=str(folder), TEMP=str(folder))
+            (destination / 'spawn_smoke.py').write_text('''import sys
+sys.path.insert(0, 'app')
+from v12_feedback_worker import FeedbackWorker
+from mcu_v11 import LinkError
+
+def offline_port(device, timeout):
+    raise OSError('offline package smoke; no device opened')
+
+if __name__ == '__main__':
+    worker = FeedbackWorker('unused', port_factory=offline_port)
+    try:
+        worker.launch()
+        try:
+            worker.discover()
+        except LinkError as exc:
+            assert 'offline package smoke' in str(exc), str(exc)
+        else:
+            raise AssertionError('Expected offline fixture failure')
+        assert not worker.snapshot()['connected']
+        print('packaged feedback spawn OK')
+    finally:
+        worker.close()
+''', encoding='utf-8')
             commands = (
                 [sys.executable, '-E', '-s', '-B', manifest['entry_point'], '--help'],
                 [sys.executable, '-E', '-s', '-B', '-c',
                  "import sys; from pathlib import Path; sys.path.insert(0, 'app'); "
-                 "import v11_ros, v11_obstacles, manual_mapping_runtime, simple_p2p_history; "
-                 "modules=(v11_ros,v11_obstacles,manual_mapping_runtime,simple_p2p_history); "
+                 "import v11_ros, v11_obstacles, manual_mapping_runtime, simple_p2p_history, v12_feedback_worker; "
+                 "modules=(v11_ros,v11_obstacles,manual_mapping_runtime,simple_p2p_history,v12_feedback_worker); "
                  "[Path(m.__file__).resolve().relative_to(Path.cwd()) for m in modules]; "
                  "assert 'rospy' not in sys.modules; print('offline imports OK')"],
+                [sys.executable, '-E', '-s', '-B', 'spawn_smoke.py'],
+                [sys.executable, '-E', '-s', '-B', 'scripts/benchmark_v12_feedback.py',
+                 '--port', 'unused', '--output', 'must-not-exist'],
             )
             outputs = []
             for command in commands:
@@ -89,6 +117,8 @@ class MapPackageTests(unittest.TestCase):
                 outputs.append(result.stdout)
             self.assertIn('--obstacle-scan-timeout', outputs[0])
             self.assertIn('offline imports OK', outputs[1])
+            self.assertIn('packaged feedback spawn OK', outputs[2])
+            self.assertFalse((destination / 'must-not-exist').exists())
 
 
 if __name__ == '__main__':

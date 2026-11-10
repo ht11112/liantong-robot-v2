@@ -197,6 +197,8 @@ class MasterTests(unittest.TestCase):
                          report['fresh_source_replies'] - report['distinct_live_samples'])
         self.assertEqual(report['uart_first_error_7_replies'], report['acknowledged_queries'])
         self.assertAlmostEqual(report['reply_rate_hz'], 50.)
+        self.assertAlmostEqual(report['send_rate_hz'], 50.)
+        self.assertAlmostEqual(report['max_send_gap_ms'], 20.)
         self.assertTrue(all(packet[3] == v11.QUERY for _, packet in port.writes))
 
     def test_no_catch_up_after_slow_reply(self):
