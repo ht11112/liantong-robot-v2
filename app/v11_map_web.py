@@ -65,29 +65,44 @@ class SSHHTTP:
 
     def request(self, method, path, body=None):
         timeout = 35 if method == 'POST' else 6
-        channel = self.transport().open_channel('direct-tcpip', (HOST, RK_PORT), (HOST, PC_PORT), timeout=6)
-        connection = http.client.HTTPConnection(HOST, RK_PORT, timeout=timeout)
-        connection.sock = channel
+        transport = self.transport()
         try:
-            channel.settimeout(timeout)
-            headers = {'Connection': 'close'}
-            if body is not None:
-                headers['Content-Type'] = 'application/json'
-            connection.request(method, path, body=body, headers=headers)
-            # getresponse() closes a connection-close socket after its headers;
-            # unlike a native socket file, ChannelFile cannot outlive its channel.
-            with http.client.HTTPResponse(channel, method=method) as response:
-                response.begin()
-                limit = 8*1024*1024
-                raw = response.read(limit+1)
-                if len(raw) > limit:
-                    raise ValueError('RK response exceeds the size limit')
-                payload = json.loads(raw)
-                if not isinstance(payload, dict):
-                    raise ValueError('Expected a JSON object from RK')
-                return response.status, payload
-        finally:
-            connection.close()
+            channel = transport.open_channel('direct-tcpip', (HOST, RK_PORT), (HOST, PC_PORT), timeout=6)
+            connection = http.client.HTTPConnection(HOST, RK_PORT, timeout=timeout)
+            connection.sock = channel
+            try:
+                channel.settimeout(timeout)
+                headers = {'Connection': 'close'}
+                if body is not None:
+                    headers['Content-Type'] = 'application/json'
+                connection.request(method, path, body=body, headers=headers)
+                # getresponse() closes a connection-close socket after its headers;
+                # unlike a native socket file, ChannelFile cannot outlive its channel.
+                with http.client.HTTPResponse(channel, method=method) as response:
+                    response.begin()
+                    limit = 8*1024*1024
+                    raw = response.read(limit+1)
+                    if len(raw) <= limit and response.length:
+                        raise http.client.IncompleteRead(raw, response.length)
+                    status = response.status
+            finally:
+                connection.close()
+        except Exception:
+            with self.lock:
+                # A concurrent request may already have replaced this session.
+                if self.client is not None and self.client.get_transport() is transport:
+                    client, self.client = self.client, None
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            raise
+        if len(raw) > limit:
+            raise ValueError('RK response exceeds the size limit')
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError('Expected a JSON object from RK')
+        return status, payload
 
 
 # 本地地图先核对哈希，并与 RK 返回的地图身份比较。
