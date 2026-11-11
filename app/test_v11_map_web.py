@@ -6,7 +6,9 @@ import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 from v11_map_plan import load_map
 from v11_map_web import MapGateway, SSHHTTP, handler_for
@@ -57,6 +59,32 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual(remote.request('GET', '/api/state'), (200, {'connected': True}))
         self.assertTrue(channel.closed)
         self.assertEqual(channel.chunks, [])
+
+
+class ActionRouteTests(unittest.TestCase):
+    def test_ekf_turn_uses_the_same_origin_and_token_guard(self):
+        gateway = SimpleNamespace(csrf='test-token', request=Mock(return_value=(200, dict(connected=True))))
+        body = b'{"direction":-1}'
+        with ThreadingHTTPServer(('127.0.0.1', 0), handler_for(gateway)) as server:
+            thread = Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+            thread.start()
+            try:
+                def post(origin, token):
+                    with closing(HTTPConnection('127.0.0.1', server.server_port, timeout=2)) as client:
+                        client.request('POST', '/api/ekf-turn', body, headers={
+                            'Host': '127.0.0.1:8766', 'Origin': origin, 'Content-Type': 'application/json',
+                            'X-CSRF-Token': token})
+                        with client.getresponse() as response:
+                            return response.status
+
+                self.assertEqual(post('http://127.0.0.1:8766', 'wrong'), 403)
+                self.assertEqual(post('http://127.0.0.1:8767', 'test-token'), 403)
+                gateway.request.assert_not_called()
+                self.assertEqual(post('http://127.0.0.1:8766', 'test-token'), 200)
+                gateway.request.assert_called_once_with('POST', '/api/ekf-turn', body)
+            finally:
+                server.shutdown()
+                thread.join()
 
 
 class CostmapRouteTests(unittest.TestCase):

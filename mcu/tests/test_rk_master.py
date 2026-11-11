@@ -389,6 +389,28 @@ class MasterTests(unittest.TestCase):
                 self.assertEqual(master.dropped_queries, 0)
                 self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, opcode])
 
+    def test_start_reply_deadline_is_one_second(self):
+        discovery = telemetry(task=TASK, state=v11.READY, flags=v11.ACK_VALID | 3 | v11.COMMITTED)
+        for delay in (.900, 1.001):
+            with self.subTest(delay=delay):
+                def response(index, kind, request, task):
+                    if index == 0:
+                        return [(.014, discovery)]
+                    return [(delay, telemetry(publication_sequence=2, publication_tick_ms=1020,
+                                              task=task, ack_request=request, accepted_request_watermark=request,
+                                              state=3, flags=v11.ACK_VALID | 3 | v11.COMMITTED | v11.STARTED))]
+
+                master, port = self.make_master(response)
+                master.discover()
+                if delay < 1.:
+                    reply = master.start(TASK)
+                    self.assertAlmostEqual(reply.received_at - reply.sent_at, delay)
+                else:
+                    with self.assertRaises(v11.ReplyTimeout) as failure:
+                        master.start(TASK)
+                    self.assertAlmostEqual(port.clock() - failure.exception.details['sent_at'], 1., delta=.0021)
+                self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.START])
+
     def test_stale_ack_is_ignored_but_boot_change_poisoned(self):
         def response(index, kind, request, task):
             if index == 0:

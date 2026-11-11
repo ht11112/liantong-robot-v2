@@ -22,6 +22,7 @@ LEASE_MS = 30000
 TELEMETRY_SIZE = 110
 PERIOD_S = .020
 APPEND_REPLY_TIMEOUT_S = 1.0
+START_REPLY_TIMEOUT_S = 1.0
 MASK32 = 0xFFFFFFFF
 ODOM_INITIALIZED, ODOM_VALID, EXECUTING = 1, 2, 4
 STOP_CONFIRMED, RX_FAULT, COMMITTED, STARTED, ACK_VALID = 16, 32, 64, 128, 256
@@ -243,7 +244,11 @@ class RkMaster:
             self.sleep(earliest - now)
             now = self.clock()
         details = dict(opcode=kind, request=request, request_hex=packet.hex())
-        reply_timeout = max(self.reply_timeout, APPEND_REPLY_TIMEOUT_S) if kind == APPEND else self.reply_timeout
+        reply_timeout = self.reply_timeout
+        if kind == APPEND:
+            reply_timeout = max(reply_timeout, APPEND_REPLY_TIMEOUT_S)
+        elif kind == START:
+            reply_timeout = max(reply_timeout, START_REPLY_TIMEOUT_S)
         trace = self.on_query_timing if kind == QUERY else None
         exchange = None
         try:

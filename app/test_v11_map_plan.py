@@ -6,7 +6,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from v11_map_plan import BODY_RADIUS_M, GridMap, PlanningError, _pgm, _queue, load_map
+from v11_map_plan import (BODY_CLEARANCE_M, BODY_LENGTH_M, BODY_WIDTH_M, GridMap,
+                          PlanningError, _Costmap, _pgm, _queue, load_map)
 
 
 def pose(x, y, yaw=0.):
@@ -29,7 +30,8 @@ class MapPlanTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def make_map(self, changed=(), *, resolution=.1, origin=(0., 0., 0.), width=60, height=60):
+    def make_map(self, changed=(), *, resolution=.1, origin=(0., 0., 0.), width=60, height=60,
+                 clearance_m=0.):
         pixels = {(i,j): value for i,j,value in changed}
         raw = ('P5\r\n# keep raw image bytes\r\n{} {}\r\n255\r\n'.format(width,height)).encode('ascii')
         raw += bytes(pixels.get((x,y),254) for y in range(height-1,-1,-1) for x in range(width))
@@ -37,7 +39,9 @@ class MapPlanTests(unittest.TestCase):
         self.yaml.write_text('image: "floor.pgm" # same external file\nresolution: {}\norigin: {}\n'
                              'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n'.format(
                                  resolution,list(origin)),encoding='utf-8')
-        return load_map(self.pgm,self.yaml)
+        # These fixtures isolate physical footprint geometry; production-clearance
+        # tests below load the same map with the actual default.
+        return load_map(self.pgm,self.yaml,clearance_m=clearance_m)
 
     def test_original_map_bytes_y_flip_trinary_and_hash_identity(self):
         # First image pixel is LF (a real dark pixel, not header whitespace).
@@ -102,9 +106,9 @@ class MapPlanTests(unittest.TestCase):
     def test_outside_boundary_body_overlap_rejected_even_for_free_center(self):
         grid = self.make_map()
         with self.assertRaisesRegex(PlanningError,'Start footprint'):
-            grid.plan(pose(.20,2.),pose(2.,2.))
+            grid.plan(pose(.17,2.),pose(2.,2.))
         with self.assertRaisesRegex(PlanningError,'Goal footprint'):
-            grid.plan(pose(2.,2.),pose(5.8,2.))
+            grid.plan(pose(2.,2.),pose(5.84,2.))
 
     def test_unknown_wall_cannot_be_crossed(self):
         grid = self.make_map((30,j,205) for j in range(60))
@@ -133,7 +137,7 @@ class MapPlanTests(unittest.TestCase):
         direct = grid.plan(start, goal)
         costmap = grid.costmap_pgm()
         cells = grid.obstacle_cells([(3.05, 3.05)])
-        with self.assertRaisesRegex(PlanningError, 'MOVE swept capsule'):
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
             grid.validate_plan(start, direct, obstacle_cells=cells)
         detour = grid.plan(start, goal, obstacle_cells=cells)
         self.assertGreater(detour['distance_m'], direct['distance_m'])
@@ -218,36 +222,113 @@ class MapPlanTests(unittest.TestCase):
 
     def test_straight_sweep_detects_closed_cell_edge_not_only_centers(self):
         grid = self.make_map(((20,20,0),))
-        y = 2.-BODY_RADIUS_M  # Exact swept disk tangency at cell y=2 m.
+        y = 2.-BODY_WIDTH_M/2.
         start = pose(1.,y)
         plan = wire_preview(grid,pose(3.5,y),[dict(kind='move',distance_m=2.5)])
-        # The cell center is beyond the path disk. Its occupied square touches
-        # the disk, so the encoded queue is unsafe.
-        with self.assertRaisesRegex(PlanningError,'MOVE swept capsule'):
+        # 栅格中心在矩形外，但整个占据方格与车身侧边相切。
+        with self.assertRaisesRegex(PlanningError,'MOVE swept rectangle'):
             grid.validate_plan(start,plan)
 
     def test_full_turn_disk_catches_corner_outside_both_endpoint_rectangles(self):
         grid = self.make_map(((124,100,0),),resolution=.01,width=200,height=200)
         # x offset .24 exceeds the .175/.20 extents of the two rectangles at
         # yaw 0/90, but lies inside the intermediate corner sweep (.266 m).
-        with self.assertRaisesRegex(PlanningError,'Start footprint'):
+        with self.assertRaisesRegex(PlanningError,'TURN swept disk'):
             grid.plan(pose(1.,1.),pose(1.,1.5))
 
     def test_revalidation_accounts_for_intermediate_turn_termination_error(self):
         grid = self.make_map(((23,27,0),))
         start = pose(2.,2.)
-        plan = wire_preview(grid,pose(2.,3.5),[dict(kind='turn',angle_rad=math.pi/2.),
-                                             dict(kind='move',distance_m=1.5)])
-        # Nominal straight centerline is 0.30m from this occupied square,
-        # beyond the body radius, but the 3° TURN shortfall envelope reaches it.
-        with self.assertRaisesRegex(PlanningError,'MOVE swept capsule'):
+        plan = wire_preview(grid,pose(2.,4.),[dict(kind='turn',angle_rad=math.pi/2.),
+                                            dict(kind='move',distance_m=2.)])
+        # 标称矩形能通过；两米直行的 3° 朝向误差会触及该方格。
+        with self.assertRaisesRegex(PlanningError,'MOVE swept rectangle'):
             grid.validate_plan(start,plan)
-        nominal_grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        nominal_grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False, clearance_m=0.)
         nominal_grid.validate_plan(start, plan)
-        crossing = pose(2.1, 2.)
-        with self.assertRaisesRegex(PlanningError, 'MOVE swept capsule'):
+        crossing = pose(2.11, 2.)
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
             nominal_grid.validate_plan(crossing, wire_preview(
-                nominal_grid, pose(2.1, 3.5), plan['segments']))
+                nominal_grid, pose(2.11, 4.), plan['segments']))
+
+    def test_rectangle_passes_a_45cm_straight_corridor(self):
+        walls = [(x, y, 0) for x in range(120) for y in (20, 30)]
+        grid = self.make_map(walls, resolution=.05, width=120, height=80)
+        start, goal = pose(1., 1.275), pose(4., 1.275)
+        plan = grid.plan(start, goal)
+        self.assertEqual(plan['segments'], [dict(kind='move', distance_m=3.)])
+        self.assertEqual(grid.validate_plan(start, plan)['path'], plan['path'])
+        with self.assertRaisesRegex(PlanningError, 'TURN swept disk'):
+            grid.plan(pose(1., 1.275, .1), goal)
+
+    def test_rectangle_checks_vehicle_width_for_static_and_dynamic_hits(self):
+        grid = self.make_map(((200, 125, 0),), resolution=.01, width=400, height=250)
+        start, goal = pose(1., 1.), pose(3., 1.)
+        plan = grid.plan(start, goal)
+        for height, blocked in ((1.25, False), (1.201, True), (1.19, True)):
+            with self.subTest(height=height):
+                cells = grid.obstacle_cells([(2.1, height)])
+                self.assertEqual(grid.route_blocked(start, plan, 0, 0., cells), blocked)
+                if blocked:
+                    with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
+                        grid.validate_plan(start, plan, obstacle_cells=cells)
+                else:
+                    grid.validate_plan(start, plan, obstacle_cells=cells)
+                    self.assertEqual(grid.plan(start, goal, obstacle_cells=cells)['segments'],
+                                     [dict(kind='move', distance_m=2.)])
+
+    def test_rectangle_keeps_the_front_and_rear_17_5cm(self):
+        grid = self.make_map(resolution=.01, width=400, height=250)
+        start, goal = pose(1., 1.), pose(3., 1.)
+        plan = grid.plan(start, goal)
+        self.assertEqual(BODY_LENGTH_M, .35)
+        clear = grid.obstacle_cells([(.81, 1.), (3.18, 1.)])
+        grid.validate_plan(start, plan, obstacle_cells=clear)
+        for point in ((.82, 1.), (3.17, 1.)):
+            with self.subTest(point=point):
+                cells = grid.obstacle_cells([point])
+                self.assertTrue(grid.route_blocked(start, plan, 0, 0., cells))
+                with self.assertRaises(PlanningError):
+                    grid.validate_plan(start, plan, obstacle_cells=cells)
+
+    def test_rectangle_follows_heading_and_rotated_map(self):
+        for map_yaw in (0., math.pi/2.):
+            with self.subTest(map_yaw=map_yaw):
+                grid = self.make_map(((133, 167, 0),), resolution=.01, width=350, height=350,
+                                     origin=(10., 20., map_yaw))
+                start = pose(*grid._to_map(100., 100.), math.pi/4.+map_yaw)
+                goal = pose(*grid._to_map(200., 200.))
+                plan = grid.plan(start, goal)
+                self.assertEqual(len(plan['segments']), 1)
+                grid.validate_plan(start, plan)
+                cells = grid.obstacle_cells([grid._to_map(136.5, 164.5)])
+                self.assertTrue(grid.route_blocked(start, plan, 0, 0., cells))
+                with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
+                    grid.validate_plan(start, plan, obstacle_cells=cells)
+
+    def test_rectangle_boundary_uses_heading_and_checks_goal_side(self):
+        grid = self.make_map()
+        grid.plan(pose(.18, 2.), pose(5.8, 2.))
+        with self.assertRaisesRegex(PlanningError, 'Start footprint'):
+            grid.plan(pose(.18, 2., math.pi/2.), pose(.18, 3.))
+        start = pose(2., .3, math.atan2(-.12, 2.))
+        plan = wire_preview(grid, pose(4., .18),
+                            [dict(kind='move', distance_m=math.hypot(2., .12))])
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
+            grid.validate_plan(start, plan)
+
+    def test_remaining_rectangles_and_future_turns_share_collision_policy(self):
+        grid = self.make_map(resolution=.01, width=600, height=600)
+        original = self.bent_route(grid)
+        stopped = pose(2., 2.)
+        side = grid.obstacle_cells([(2.5, 2.25)])
+        self.assertFalse(grid.route_blocked(stopped, original, 0, 1., side))
+        resumed = grid.resume_route(stopped, original, 0, 1., obstacle_cells=side)
+        self.assertIsNotNone(resumed)
+        grid.validate_plan(stopped, resumed, obstacle_cells=side)
+        turn_corner = grid.obstacle_cells([(3.24, 2.)])
+        self.assertTrue(grid.route_blocked(stopped, original, 0, 1., turn_corner))
+        self.assertIsNone(grid.resume_route(stopped, original, 0, 1., obstacle_cells=turn_corner))
 
     def test_small_turn_omission_does_not_invent_a_heading_change(self):
         grid = self.make_map()
@@ -297,6 +378,91 @@ class MapPlanTests(unittest.TestCase):
             _queue([dict(kind='move',distance_m=.10)])
         with self.assertRaisesRegex(PlanningError,'below its termination tolerance'):
             _queue([dict(kind='move',distance_m=.02),dict(kind='move',distance_m=.5)])
+
+    def test_default_15cm_clearance_applies_to_straight_and_dynamic_sweeps(self):
+        self.make_map([(x, 100, 0) for x in range(600)], resolution=.01,
+                      width=600, height=400)
+        grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        self.assertEqual(grid.clearance_m, BODY_CLEARANCE_M)
+        self.assertEqual(grid.clearance_m, .15)
+        start, goal = pose(1., 1.361), pose(4., 1.361)
+        plan = grid.plan(start, goal)
+        self.assertEqual(plan['segments'], [dict(kind='move', distance_m=3.)])
+        grid.validate_plan(start, plan)
+        with self.assertRaisesRegex(PlanningError, 'Start footprint'):
+            grid.plan(pose(1., 1.359), pose(4., 1.359))
+        cells = grid.obstacle_cells([(2.5, 1.021)])
+        self.assertTrue(grid.route_blocked(start, plan, 0, 0., cells))
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
+            grid.validate_plan(start, plan, obstacle_cells=cells)
+
+    def test_default_clearance_never_falls_back_to_a_narrow_corridor(self):
+        walls = [(x, y, 0) for x in range(600) for y in (100, 146)]
+        self.make_map(walls, resolution=.01, width=600, height=400)
+        grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        with self.assertRaisesRegex(PlanningError, 'Start footprint'):
+            grid.plan(pose(1., 1.235), pose(4., 1.235))
+        walls = [(x, y, 0) for x in range(600) for y in (100, 173)]
+        self.make_map(walls, resolution=.01, width=600, height=400)
+        grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        start, goal = pose(1., 1.37), pose(4., 1.37)
+        plan = grid.plan(start, goal)
+        self.assertEqual(plan['segments'], [dict(kind='move', distance_m=3.)])
+        grid.validate_plan(start, plan)
+
+    def test_default_clearance_covers_turn_corners_and_map_boundary(self):
+        self.make_map(((240, 200, 0),), resolution=.01, width=600, height=600)
+        grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        with self.assertRaisesRegex(PlanningError, 'TURN swept disk'):
+            grid.plan(pose(2., 2.), pose(2., 4.))
+        self.make_map(resolution=.01, width=600, height=400)
+        grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        grid.plan(pose(1., .351), pose(4., .351))
+        with self.assertRaisesRegex(PlanningError, 'Start footprint'):
+            grid.plan(pose(1., .349), pose(4., .349))
+
+    def test_static_wall_is_rechecked_from_measured_heading_with_empty_live_cells(self):
+        self.make_map([(x, 200, 0) for x in range(600)], resolution=.01,
+                      width=600, height=400)
+        grid = load_map(self.pgm, self.yaml, use_modeled_error_margin=False)
+        start = pose(1., 1.64)
+        plan = grid.plan(start, pose(4., 1.64))
+        self.assertFalse(grid.route_blocked(start, plan, 0, 0., ()))
+        drifted = pose(1., 1.64, math.radians(.5))
+        self.assertTrue(grid.route_blocked(drifted, plan, 0, 0., ()))
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
+            grid.validate_plan(drifted, plan)
+
+    def test_short_final_move_chooses_an_earlier_corner_without_dropping_goal(self):
+        grid = self.make_map([(x, y, 0) for x in range(26, 34) for y in range(26, 34)],
+                             resolution=.05)
+        grid.use_modeled_error_margin = False
+        start = pose(.7616652530681516, 2.6039800735935654, 2.7815774864988)
+        goal = pose(1.1411740255187706, 1.1168360749229325)
+        plan = grid.plan(start, goal)
+        self.assertGreater(plan['segments'][-1]['distance_m'], .10)
+        self.assertLess(plan['nominal_goal_error_m'], 1e-6)
+        self.assertEqual(plan['goal'], dict(x=goal['x'], y=goal['y']))
+        self.assertEqual(grid.validate_plan(start, plan)['path'], plan['path'])
+        costmap = _Costmap(grid)
+        short_corner = (21.5, 22.5)
+        impossible_chain = [grid._to_grid(start['x'], start['y']), short_corner,
+                            grid._to_grid(goal['x'], goal['y'])]
+        with self.assertRaisesRegex(PlanningError, 'executable MOVE lengths'):
+            costmap.simplify(impossible_chain)
+
+    def test_resume_merges_sub_tolerance_projection_and_checks_the_resulting_sweep(self):
+        grid = self.make_map(resolution=.01, width=600, height=600)
+        grid.use_modeled_error_margin = False
+        original = self.bent_route(grid)
+        stopped = pose(2., 2.02001, -math.pi/2.+math.radians(2.9))
+        resumed = grid.resume_route(stopped, original, 0, 1.)
+        self.assertEqual(len(resumed['path']), 3)
+        self.assertLess(resumed['nominal_goal_error_m'], 1e-6)
+        self.assertEqual(grid.validate_plan(stopped, resumed)['path'], resumed['path'])
+        cells = grid.obstacle_cells([(2.501, 2.211)])
+        with self.assertRaisesRegex(PlanningError, 'MOVE swept rectangle'):
+            grid.resume_route(stopped, original, 0, 1., obstacle_cells=cells)
 
 
 if __name__ == '__main__':

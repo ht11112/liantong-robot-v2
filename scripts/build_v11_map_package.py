@@ -18,6 +18,7 @@ from v11_map_plan import load_map
 SOURCES = (
     'app/v12_feedback_worker.py', 'scripts/benchmark_v12_feedback.py',
     'app/v11_map_runtime.py', 'app/v11_map_plan.py', 'app/v11_ros.py', 'app/v11_obstacles.py',
+    'app/v11_ekf.py', 'app/v11_ekf_worker.py',
     'app/manual_mapping_runtime.py', 'app/simple_p2p_history.py',
     'mcu/tools/mcu_v10.py', 'mcu/tools/mcu_v11.py',
 )

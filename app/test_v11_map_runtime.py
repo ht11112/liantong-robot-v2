@@ -15,6 +15,8 @@ from mcu_v11 import (ACK_VALID, EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RENEW, 
                      HEADER, STATUS, Exchange, LinkError, QueuePlan, RequestCancelled, Telemetry, command, crc16)
 from v12_feedback_worker import FeedbackWorker, SharedFeedbackCache
 from v11_ros import OdomHistory
+from v11_ros import ObstacleScans, RosObstacleScanner
+from test_v11_ros import OFFSET, obstacle_scan
 
 
 class Localization:
@@ -731,13 +733,13 @@ class NavigationTest(unittest.TestCase):
                 self.sample = initial
                 scanner = self.obstacle_test_start()
                 master = Mock()
-                lateral = .65 if obstruction == 'connector' else 0.
+                lateral = 1.0 if obstruction == 'connector' else 0.
                 self.observe(x=.8, y=lateral, progress=.8)
                 self.fresh_tick(.8)
                 self.nav._avoidance_cycle(master, self.nav.latest)
                 self.assertTrue(self.nav.stop_requested)
                 self.stopped_detour(master)
-                obstacle = (1.35, 0.) if obstruction == 'remaining' else (.8, .35)
+                obstacle = (1.35, 0.) if obstruction == 'remaining' else (.8, .5)
                 self.scan_observation(scanner, (obstacle,))
                 with patch.object(self.grid, 'plan', wraps=self.grid.plan) as search:
                     self.nav._avoidance_cycle(master, self.nav.latest)
@@ -1038,6 +1040,460 @@ class NavigationTest(unittest.TestCase):
                     self.assertEqual(self.nav.replans, 1)
                     self.assertEqual(master.query.call_count, 2 if outcome == 'expires_after_upload' else 1)
                 self.assertEqual(master.upload.call_count, int(outcome not in ('timeout', 'stop')))
+
+    def test_detour_collision_recheck_waits_replans_and_manual_stop_cancels(self):
+        initial = self.sample
+        for stage in ('before_upload', 'before_start'):
+            with self.subTest(stage=stage):
+                self.sample = initial
+                scanner = self.obstacle_test_start()
+                master = Mock(reply_timeout=.1)
+                self.nav.detour = dict(goal=self.nav.route['goal'], attempt=None, retry_at=0.)
+                self.stopped_detour(master)
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                route = self.nav.pending
+
+                def upload(plan, *, on_ack):
+                    self.observe(task=2, state=2, first_error=0)
+                    on_ack(self.nav.latest)
+                    self.scan_observation(scanner, ((1.5, 0.),))
+                    return [self.nav.latest]
+
+                master.upload.side_effect = upload
+                if stage == 'before_upload':
+                    self.scan_observation(scanner, ((1.5, 0.),))
+                captured = io.StringIO()
+                with redirect_stdout(captured):
+                    self.nav._upload(master, route)
+                self.assertEqual(master.upload.call_count, int(stage == 'before_start'))
+                master.start.assert_not_called()
+                self.assertEqual(self.nav.avoidance_phase, 'waiting')
+                self.assertEqual(self.nav.detour['goal'], route['goal'])
+                self.assertIsNone(self.nav.detour['attempt'])
+                self.assertIsNone(self.nav.pending)
+                self.assertIsNone(self.nav.work)
+                self.assertTrue(self.nav.stop_verified)
+                self.assertEqual(json.loads(captured.getvalue())['stage'], stage)
+
+                self.fresh_tick(1.01)
+                self.scan_observation(scanner)
+                master.query.return_value = self.nav.latest
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                replacement = self.nav.pending
+                self.assertIsNotNone(replacement)
+                self.assertEqual(replacement['goal'], route['goal'])
+                self.assertNotEqual(replacement['path'], route['path'])
+                self.grid.validate_plan(self.nav._map_pose(), replacement,
+                                        obstacle_cells=self.nav.obstacles.cells)
+                self.assertEqual(self.nav.replans, 0)
+                self.nav.request_stop()
+                self.assertIsNone(self.nav.detour)
+                self.assertIsNone(self.nav.pending)
+                self.assertTrue(self.nav.stop_requested)
+                master.start.assert_not_called()
+
+    def test_detour_queue_crc_failure_is_not_a_collision_retry(self):
+        self.obstacle_test_start()
+        master = Mock(reply_timeout=.1)
+        self.nav.detour = dict(goal=self.nav.route['goal'], attempt=None, retry_at=0.)
+        self.stopped_detour(master)
+        self.nav._avoidance_cycle(master, self.nav.latest)
+        route = dict(self.nav.pending, queue_crc32=self.nav.pending['queue_crc32'] ^ 1)
+        with self.assertRaisesRegex(ValueError, 'CRC'):
+            self.nav._upload(master, route)
+        master.upload.assert_not_called()
+        master.start.assert_not_called()
+
+    def test_resume_rechecks_committed_queue_when_scan_expires_during_validation(self):
+        initial = self.sample
+        for outcome in ('clear', 'blocked', 'timeout', 'stop'):
+            with self.subTest(outcome=outcome):
+                self.sample = initial
+                scanner = self.obstacle_test_start()
+                master = Mock(reply_timeout=.1)
+                self.nav.detour = dict(goal=self.nav.route['goal'], attempt=None, retry_at=0.)
+                self.stopped_detour(master)
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                route = self.nav.pending
+                began = self.now
+                validations = []
+                real_validate = self.grid.validate_plan
+
+                def upload(plan, *, on_ack):
+                    self.observe(task=2, state=2, first_error=0)
+                    on_ack(self.nav.latest)
+                    return [self.nav.latest]
+
+                def validate(pose, plan, *, obstacle_cells=()):
+                    validations.append((pose, obstacle_cells))
+                    result = real_validate(pose, plan, obstacle_cells=obstacle_cells)
+                    if len(validations) == 2:
+                        self.fresh_tick(.26)
+                        self.assertIsNone(self.nav._scan_points())
+                    return result
+
+                def query(*, start_before):
+                    self.assertLess(self.now, start_before)
+                    self.fresh_tick(.05)
+                    if outcome == 'stop':
+                        self.nav.request_stop()
+                    elif outcome != 'timeout':
+                        self.observe(x=.01)
+                        point = (1.5, 0. if outcome == 'blocked' else 1.2)
+                        self.scan_observation(scanner, (point,))
+                    return self.nav.latest
+
+                def start(task):
+                    self.assertIsNotNone(self.nav._scan_points())
+                    return replace(self.nav.latest, status=replace(self.sample, state=3,
+                                   flags=self.sample.flags & ~STOP_CONFIRMED | EXECUTING,
+                                   lease_remaining_ms=30000))
+
+                master.upload.side_effect = upload
+                master.query.side_effect = query
+                master.start.side_effect = start
+                master.sleep.side_effect = lambda seconds: setattr(self, 'now', self.now + seconds)
+                with patch.object(self.grid, 'validate_plan', side_effect=validate), redirect_stdout(io.StringIO()):
+                    self.nav._upload(master, route)
+                master.upload.assert_called_once()
+                if outcome in ('clear', 'blocked'):
+                    self.assertEqual(len(validations), 3)
+                    self.assertAlmostEqual(validations[-1][0]['x'], .61)
+                    self.assertEqual(validations[-1][1], self.nav.obstacles.cells)
+                    self.assertTrue(validations[-1][1])
+                if outcome == 'clear':
+                    master.start.assert_called_once_with(2)
+                    self.assertIsNone(self.nav.detour)
+                else:
+                    master.start.assert_not_called()
+                if outcome == 'blocked':
+                    self.assertEqual(self.nav.avoidance_phase, 'waiting')
+                    self.assertEqual(self.nav.detour['goal'], route['goal'])
+                    self.assertIsNone(self.nav.pending)
+                    self.assertTrue(self.nav.stop_verified)
+                    self.assertIn('swept rectangle', self.nav.error)
+                if outcome == 'timeout':
+                    self.assertAlmostEqual(self.now-began, 2.)
+                    self.assertEqual(self.nav.avoidance_phase, 'waiting')
+                    self.assertEqual(self.nav.detour['goal'], route['goal'])
+                    self.assertTrue(self.nav.stop_verified)
+                if outcome == 'stop':
+                    self.assertTrue(self.nav.stop_requested)
+                    self.assertIsNone(self.nav.detour)
+
+
+class EkfTurnTest(unittest.TestCase):
+    setUp = NavigationTest.setUp
+    observe = NavigationTest.observe
+    scan_observation = NavigationTest.scan_observation
+
+    def prepare_turn(self, direction=1, initial_yaw=0.):
+        self.grid.use_modeled_error_margin = False
+        self.scanner = Mock()
+        self.scanner.diagnostics.return_value = dict(failure_reason=None, paired=True)
+        self.estimate = dict(fresh=True, yaw_rad=initial_yaw, age_ms=0.)
+        self.ekf = Mock()
+        self.ekf.ekf_snapshot.side_effect = lambda: dict(self.estimate)
+        self.nav = Navigation(self.grid, clock=lambda: self.now, mode='drive',
+                              scanner=self.scanner, ekf=self.ekf, ekf_turn_test=True)
+        self.observe()
+        self.nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+        self.scan_id = 0
+        self.scan_observation(self.scanner)
+        self.assertTrue(self.nav.snapshot()['can_ekf_turn'])
+        self.nav.request_ekf_turn(direction)
+        return self.nav.pending
+
+    def start_turn(self, direction=1, initial_yaw=0.):
+        plan = self.prepare_turn(direction, initial_yaw)
+        master = Mock()
+
+        def upload(document, on_ack):
+            self.assertIs(document, plan)
+            ready = replace(self.nav.latest, status=replace(self.sample, task=1, state=2, count=1))
+            on_ack(ready)
+            return [ready]
+
+        master.upload.side_effect = upload
+        active = replace(self.sample, task=1, state=5, count=1, flags=self.sample.flags | EXECUTING,
+                         lease_remaining_ms=30000)
+        master.start.return_value = replace(self.nav.latest, status=active)
+        self.nav._upload(master, plan)
+        self.nav.pending = self.nav.work = None
+        return master, plan
+
+    def test_turn_only_queue_and_signed_ekf_stop_across_wrap(self):
+        for direction in (1, -1):
+            with self.subTest(direction=direction):
+                initial = direction * math.radians(170.)
+                master, plan = self.start_turn(direction, initial)
+                self.assertEqual([s['kind'] for s in plan['segments']], ['turn'])
+                self.assertAlmostEqual(plan['segments'][0]['angle_rad'], direction * math.radians(102.))
+                self.assertEqual(QueuePlan.from_document(plan).checksum, plan['queue_crc32'])
+                self.assertEqual(self.nav.snapshot()['ekf_turn']['phase'], 'turning')
+                self.estimate['yaw_rad'] = math.atan2(math.sin(initial + direction * math.radians(86.)),
+                                                     math.cos(initial + direction * math.radians(86.)))
+                self.nav._ekf_turn_cycle()
+                self.assertFalse(self.nav.stop_requested)
+                self.estimate['yaw_rad'] = math.atan2(math.sin(initial + direction * math.radians(88.)),
+                                                     math.cos(initial + direction * math.radians(88.)))
+                self.nav._ekf_turn_cycle()
+                self.assertTrue(self.nav.stop_requested)
+                self.assertIsNone(self.nav.detour)
+                self.assertIsNone(self.nav.pending)
+                self.estimate['yaw_rad'] = math.atan2(math.sin(initial + direction * math.radians(90.)),
+                                                     math.cos(initial + direction * math.radians(90.)))
+                master.stop.return_value = dict(stop_verified=True)
+                self.nav._stop(master)
+                self.assertEqual(self.nav.ekf_turn['phase'], 'complete')
+                self.assertAlmostEqual(self.nav.ekf_turn['turned_deg'], direction * 90.)
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                self.assertIsNone(self.nav.pending)
+                self.assertEqual(master.upload.call_count, 1)
+                self.assertEqual(master.start.call_count, 1)
+
+    def test_turn_stale_feedback_obstacle_and_mcu_bound_abort_without_resume(self):
+        for reason in ('ekf', 'scan', 'obstacle', 'mcu_bound', 'mcu_fault'):
+            with self.subTest(reason=reason):
+                master, _ = self.start_turn()
+                if reason == 'ekf':
+                    self.estimate['fresh'] = False
+                elif reason == 'scan':
+                    self.nav.scan_expires = self.now
+                elif reason == 'obstacle':
+                    self.nav.obstacles.cells = frozenset({(20, 20)})
+                else:
+                    self.nav.latest = replace(self.nav.latest, status=replace(self.nav.latest.status,
+                        state=8 if reason == 'mcu_bound' else 9, flags=self.sample.flags,
+                        first_error=0 if reason == 'mcu_bound' else 4))
+                self.nav._ekf_turn_cycle()
+                self.assertTrue(self.nav.stop_requested)
+                self.assertEqual(self.nav.ekf_turn_outcome, 'failed')
+                self.assertIsNone(self.nav.detour)
+                master.stop.return_value = dict(stop_verified=True)
+                self.nav._stop(master)
+                self.assertEqual(self.nav.ekf_turn['phase'], 'failed')
+                self.nav._avoidance_cycle(master, self.nav.latest)
+                self.assertIsNone(self.nav.pending)
+
+    def test_turn_refreshes_new_paired_scan_without_extending_its_deadline(self):
+        self.start_turn()
+        old_stamp = self.nav.scan_stamp
+        self.nav.scan_expires = self.now
+        fresh = dict(self.scanner.latest_observation.return_value, stamp_ns=old_stamp+1,
+                     expires_mono=self.now+.12)
+        self.scanner.latest_observation.return_value = fresh
+        self.nav._ekf_turn_cycle()
+        self.assertFalse(self.nav.stop_requested)
+        self.assertEqual(self.nav.ekf_turn['phase'], 'turning')
+        self.assertEqual(self.nav.scan_stamp, fresh['stamp_ns'])
+        self.assertEqual(self.nav.scan_expires, fresh['expires_mono'])
+        self.assertIsNone(self.nav.last_scan_failure)
+
+    def test_turn_fresh_fast_path_does_not_release_lock_before_its_check(self):
+        self.start_turn()
+        self.nav.scan_expires = self.now+.01
+        real_lock = self.nav.lock
+        case = self
+
+        class PauseAfterRelease:
+            first = True
+
+            def __enter__(self):
+                real_lock.acquire()
+
+            def __exit__(self, *unused):
+                real_lock.release()
+                if self.first:
+                    self.first = False
+                    case.now += .24
+
+        self.nav.lock = PauseAfterRelease()
+        with redirect_stdout(io.StringIO()):
+            self.nav._ekf_turn_cycle()
+        self.assertFalse(self.nav.stop_requested)
+        self.assertEqual(self.nav.ekf_turn['phase'], 'turning')
+
+    def test_turn_refresh_consumes_real_pending_cache_to_supply_scan_upper_bracket(self):
+        self.start_turn()
+        scanner = RosObstacleScanner.__new__(RosObstacleScanner)
+        scanner.scans = ObstacleScans(OdomHistory(OFFSET))
+        self.nav.scanner = scanner
+        old_status = replace(self.nav.latest.status, sample_sequence=1,
+                             measurement_tick_ms=100, publication_tick_ms=100)
+        self.nav._observe_exchange(cache_exchange(old_status, 1, 5.001))
+        self.now = 5.35
+        self.nav.scan_expires = self.now-.1
+        scanner.scans.add(obstacle_scan(5.21, [2.]*9), self.now)
+        feedback = FeedbackWorker('/dev/offline-not-opened')
+        self.addCleanup(feedback.close)
+        feedback.request_stop = Mock()
+        self.nav.feedback = feedback
+        for number in range(2, 8):
+            status = replace(old_status, sample_sequence=number,
+                             measurement_tick_ms=50+number*50, publication_tick_ms=50+number*50)
+            feedback.cache.publish(cache_exchange(status, number, 5.001+(number-1)*.05))
+        with patch('v11_ros.time.monotonic', side_effect=lambda: self.now), redirect_stdout(io.StringIO()):
+            self.assertIsNone(scanner.latest_observation())
+            self.nav._ekf_turn_cycle()
+            self.assertTrue(scanner.diagnostics()['paired'])
+        self.assertFalse(self.nav.stop_requested)
+        feedback.request_stop.assert_not_called()
+        self.assertEqual(self.nav.latest.status.sample_sequence, 7)
+        self.assertEqual(self.nav.feedback_cursor, 6)
+        self.assertAlmostEqual(self.nav.scan_expires, 5.72)
+        self.assertEqual(self.nav.ekf_turn['phase'], 'turning')
+
+    def test_turn_refresh_without_new_or_usable_scan_stops_with_frozen_diagnostic(self):
+        for observation in ('missing', 'same', 'expired', 'invalid'):
+            with self.subTest(observation=observation), redirect_stdout(io.StringIO()):
+                self.start_turn()
+                self.nav.scan_expires = self.now
+                current = self.scanner.latest_observation.return_value
+                if observation == 'missing':
+                    self.scanner.latest_observation.return_value = None
+                elif observation == 'expired':
+                    self.scanner.latest_observation.return_value = dict(current,
+                        stamp_ns=current['stamp_ns']+1, expires_mono=self.now)
+                elif observation == 'invalid':
+                    self.scanner.latest_observation.return_value = dict(current,
+                        stamp_ns=current['stamp_ns']+1, usable=False, points=(), clear_rays=())
+                self.nav._ekf_turn_cycle()
+                self.assertTrue(self.nav.stop_requested)
+                self.assertEqual(self.nav.ekf_turn_outcome, 'failed')
+                failure = self.nav.last_scan_failure
+                self.assertEqual(failure['event'], 'v12_ekf_turn_failed')
+                self.assertEqual(failure['stage'], 'turning')
+                self.assertEqual(failure['task'], 1)
+                self.assertEqual(failure['monotonic_s'], self.now)
+                self.scanner.diagnostics.return_value = dict(paired=True, failure_reason=None)
+                self.nav._ekf_turn_cycle()
+                self.assertIs(self.nav.last_scan_failure, failure)
+                self.assertIsNone(self.nav.detour)
+
+    def test_manual_stop_during_scan_refresh_cancels_trial_without_overwriting_reason(self):
+        self.start_turn()
+        self.nav.scan_expires = self.now
+        newer = dict(self.scanner.latest_observation.return_value,
+                     stamp_ns=self.nav.scan_stamp+1, expires_mono=self.now+.12)
+
+        def refresh():
+            completed = Event()
+
+            def cancel():
+                self.nav.request_stop()
+                completed.set()
+
+            thread = Thread(target=cancel)
+            thread.start()
+            self.assertTrue(completed.wait(1.), 'scan refresh held the navigation lock')
+            thread.join()
+            return newer
+
+        self.scanner.latest_observation.side_effect = refresh
+        self.nav._ekf_turn_cycle()
+        self.assertTrue(self.nav.stop_requested)
+        self.assertEqual(self.nav.ekf_turn_outcome, 'cancelled')
+        self.assertIsNone(self.nav.last_scan_failure)
+
+    def test_overlapping_scan_refresh_cannot_replace_newer_committed_frame(self):
+        self.start_turn()
+        original = self.scanner.latest_observation.return_value
+        older = dict(original, stamp_ns=self.nav.scan_stamp+1, expires_mono=self.now+.10)
+        newer = dict(original, stamp_ns=self.nav.scan_stamp+2, expires_mono=self.now+.20)
+        self.scanner.latest_observation.side_effect = [older, newer]
+        real_cells = self.grid.obstacle_cells
+        overlapped = False
+
+        def project(points):
+            nonlocal overlapped
+            if not overlapped:
+                overlapped = True
+                self.nav.update_scan()
+            return real_cells(points)
+
+        with patch.object(self.grid, 'obstacle_cells', side_effect=project):
+            self.nav.update_scan()
+        self.assertEqual(self.nav.scan_stamp, newer['stamp_ns'])
+        self.assertEqual(self.nav.scan_expires, newer['expires_mono'])
+
+    def test_turn_manual_stop_and_normal_commands_are_guarded(self):
+        master, _ = self.start_turn()
+        for action in (lambda: self.nav.align(dict(x=1., y=1., yaw=0.), 'manual'),
+                       lambda: self.nav.preview(dict(x=2., y=1.)),
+                       lambda: self.nav.request_start('old'), lambda: self.nav.request_ekf_turn(-1)):
+            with self.assertRaises(ValueError):
+                action()
+        self.nav.request_stop()
+        master.stop.return_value = dict(stop_verified=True)
+        self.nav._stop(master)
+        self.assertEqual(self.nav.ekf_turn['phase'], 'cancelled')
+        self.assertIsNone(self.nav.pending)
+
+    def test_turn_stopping_overshoot_or_stale_final_angle_is_not_success(self):
+        for final in (94., None):
+            with self.subTest(final=final):
+                master, _ = self.start_turn()
+                self.estimate['yaw_rad'] = math.radians(88.)
+                self.nav._ekf_turn_cycle()
+                if final is None:
+                    self.estimate['fresh'] = False
+                else:
+                    self.estimate['yaw_rad'] = math.radians(final)
+                master.stop.return_value = dict(stop_verified=True)
+                self.nav._stop(master)
+                self.assertEqual(self.nav.ekf_turn['phase'], 'failed')
+
+    def test_turn_disabled_invalid_direction_and_no_fresh_scan_reject(self):
+        with self.assertRaises(ValueError):
+            self.nav.request_ekf_turn(1)
+        self.prepare_turn()
+        for value in (True, 1., 0, 2, '1'):
+            with self.assertRaises(ValueError):
+                self.nav.request_ekf_turn(value)
+        self.nav.ekf_turn.update(phase='idle')
+        self.nav.work = self.nav.pending = None
+        self.nav.scan_expires = self.now
+        with self.assertRaisesRegex(ValueError, '雷达'):
+            self.nav.request_ekf_turn(1)
+
+    def test_turn_never_renews_its_single_mcu_lease(self):
+        master, _ = self.start_turn()
+        reply = replace(self.nav.latest, status=replace(self.nav.latest.status, lease_remaining_ms=1000))
+        self.nav._renew_if_due(master, reply)
+        master.renew.assert_not_called()
+
+    def test_turn_requires_fresh_ekf_again_before_start(self):
+        plan = self.prepare_turn()
+        master = Mock()
+
+        def upload(document, on_ack):
+            ready = replace(self.nav.latest, status=replace(self.sample, task=1, state=2, count=1))
+            on_ack(ready)
+            self.estimate['fresh'] = False
+            return [ready]
+
+        master.upload.side_effect = upload
+        with self.assertRaisesRegex(ValueError, 'EKF'):
+            self.nav._upload(master, plan)
+        master.start.assert_not_called()
+
+    def test_turn_stop_exception_does_not_leave_stopping_phase(self):
+        self.start_turn()
+        self.nav.request_stop()
+        closed, master = Event(), Mock(failed=False)
+        master.discover.return_value = self.nav.latest
+        master.history_since.return_value = dict(cursor=0, missed=0, exchanges=[], connected=True, error=None)
+
+        def failed_stop(**unused):
+            closed.set()
+            raise ValueError('stop result unavailable')
+
+        master.stop.side_effect = failed_stop
+        with patch('v11_map_runtime.FeedbackWorker', return_value=master):
+            self.nav.run('/dev/offline', closed)
+        self.assertEqual(self.nav.ekf_turn['phase'], 'failed')
+        self.assertFalse(self.nav.stop_requested)
 
 
 if __name__ == '__main__':

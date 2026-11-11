@@ -14,9 +14,10 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
 from mcu_v11 import (EXECUTING, LEASE_STATES, RX_FAULT, STOP, STOP_CONFIRMED, LinkError, Rejected,
-                     RequestCancelled, error_record)
+                     QueuePlan, RequestCancelled, error_record)
 from v12_feedback_worker import FeedbackWorker
-from v11_map_plan import PlanningError, load_map
+from v11_ekf_worker import EkfWorker
+from v11_map_plan import CollisionError, PlanningError, TURN_TOLERANCE_RAD, load_map
 from v11_obstacles import DynamicObstacles
 
 
@@ -67,11 +68,17 @@ def inverse(pose):
 # 串口在独立进程持续查询；导航与 ROS 只消费内存中的反馈历史。
 class Navigation:
     def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
-                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S):
+                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False):
         if not math.isfinite(obstacle_scan_timeout_s) or obstacle_scan_timeout_s <= 0:
             raise ValueError('Obstacle scan timeout must be positive and finite')
         self.grid, self.localizer, self.mode, self.clock = grid, localizer, mode, clock
         self.scanner = scanner
+        self.ekf = ekf
+        self.ekf_turn = (dict(phase='idle', message='仅试验单次原地转向 90°，不会直行',
+                              target_deg=90., turned_deg=0., direction=None) if ekf_turn_test else None)
+        self.ekf_turn_plan = None
+        self.ekf_turn_last_yaw = None
+        self.ekf_turn_outcome = None
         self.obstacles = DynamicObstacles(grid)
         self.obstacle_scan_timeout_s = obstacle_scan_timeout_s
         self.scan_stamp = self.last_usable_scan = None
@@ -105,6 +112,8 @@ class Navigation:
         self.feedback_error = None
 
     def _invalidate(self, reason):
+        if self._ekf_turn_active():
+            self._end_ekf_turn('failed', reason)
         if self.detour is not None:
             self._cancel_detour(reason)
         self.alignment = self.origin = self.plan = self.route = None
@@ -171,6 +180,8 @@ class Navigation:
             self.localizer.publish(exchange)
         if self.scanner is not None:
             self.scanner.publish(exchange)
+        if self.ekf is not None:
+            self.ekf.publish(exchange)
 
     def _consume_feedback(self):
         # 命令结果与后台消费都走同一游标，避免较新的 ACK 越过尚未读到的失效样本。
@@ -178,7 +189,7 @@ class Navigation:
             batch = self.feedback.history_since(self.feedback_cursor)
             if batch['missed']:
                 self.feedback_missed += batch['missed']
-                for adapter in (self.scanner, self.localizer):
+                for adapter in (self.scanner, self.localizer, self.ekf):
                     if adapter is not None:
                         adapter.invalidate_history()
                 with self.lock:
@@ -201,6 +212,7 @@ class Navigation:
         try:
             while not closed.wait(.01):
                 self._consume_feedback()
+                self._ekf_turn_cycle()
         except Exception as exc:
             with self.lock:
                 self.feedback_error = exc
@@ -275,6 +287,8 @@ class Navigation:
         with self.lock:
             if self.alignment is not anchor or not self._fresh() or self.clock() >= frame['expires_mono']:
                 return
+            if self.scan_stamp is not None and stamp <= self.scan_stamp:
+                return
             self.scan_stamp, self.scan_expires = stamp, frame['expires_mono']
             self.scan_status, self.scan_points = scan_status, points
             self.clear_work = None
@@ -308,12 +322,6 @@ class Navigation:
         while not closed.wait(OBSTACLE_WORK_INTERVAL_S):
             work()
 
-    def _upload_obstacles(self):
-        points = self._scan_points()
-        if points is None:
-            raise ValueError('避障测试需要定位后有效的雷达数据')
-        return self.obstacles.cells
-
     def _cancel_detour(self, reason):
         self.detour = None
         self.avoidance_phase, self.avoidance_message = 'cancelled', reason
@@ -321,7 +329,7 @@ class Navigation:
     @contextmanager
     def _stationary_work(self, name):
         with self.lock:
-            if self.work or self.stop_requested or self.detour is not None:
+            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active():
                 raise ValueError('当前操作正在处理')
             self._require_stationary()
             self.work, self.error = name, None
@@ -330,7 +338,8 @@ class Navigation:
             yield stop_revision
         finally:
             with self.lock:
-                self.work = None
+                if self.work == name:
+                    self.work = None
 
     # 手动对齐建立地图到里程计的变换；对齐期间车体移动则放弃。
     def align(self, seed, mode):
@@ -385,11 +394,123 @@ class Navigation:
                     raise ValueError('规划期间起点已变化，请重新预览')
                 self.plan = dict(plan, id=uuid.uuid4().hex)
 
+    def _ekf_turn_active(self):
+        return self.ekf_turn is not None and self.ekf_turn['phase'] in (
+            'uploading', 'starting', 'turning', 'stopping')
+
+    def _turn_feedback(self):
+        if self.mode != 'drive' or self.ekf_turn is None:
+            raise ValueError('未启用 EKF 原地转向试验')
+        if not self._fresh() or self._map_pose() is None:
+            raise ValueError('EKF 转向需要有效轮式反馈和地图起点')
+        status = self.latest.status
+        if status.flags & RX_FAULT or status.first_drive_error or status.first_error not in (0, MCU_CANCELLED):
+            raise ValueError('底盘故障，取消 EKF 转向')
+        if self.scanner is None or self._scan_points() is None:
+            raise ValueError('雷达配对已失效，取消 EKF 转向')
+        estimate = self.ekf.ekf_snapshot() if self.ekf is not None else None
+        if estimate is None or not estimate['fresh']:
+            raise ValueError('EKF 航向已过期，取消转向')
+        return estimate
+
+    def request_ekf_turn(self, direction):
+        if type(direction) is not int or direction not in (-1, 1):
+            raise ValueError('转向方向只能为 1 或 -1')
+        with self._stationary_work('turn_preparing') as revision:
+            with self.lock:
+                self._turn_feedback()
+                pose, anchor, cells = self._map_pose(), self.alignment, self.obstacles.cells
+            # 同一点的规划仍检查完整车体圆盘，和 TURN 的扫掠圆盘一致。
+            point = dict(x=pose['x'], y=pose['y'])
+            self.grid.plan(pose, point, obstacle_cells=cells)
+            segments = [dict(kind='turn', angle_rad=direction * math.radians(102.))]
+            plan = dict(id=uuid.uuid4().hex, map_id=self.grid.map_id, start=pose, goal=point,
+                        segments=segments, queue_crc32=QueuePlan.from_document(dict(segments=segments)).checksum,
+                        path=[point], no_motion=False, distance_m=0., nominal_duration_s=30.)
+            with self.lock:
+                self._turn_feedback()
+                if (revision != self.stop_revision or anchor is not self.alignment
+                        or not same_pose(self._map_pose(), pose)):
+                    raise ValueError('转向准备期间起点已变化或已取消')
+                self.ekf_turn.update(phase='uploading', message='准备单次转向；MCU 上限 102°，EKF 接近 90° 时停车',
+                                     direction=direction, turned_deg=0.)
+                self.ekf_turn_plan = plan
+                self.ekf_turn_last_yaw = self.ekf_turn_outcome = None
+                self.plan = None
+                self.pending = self.route = plan
+                self.work, self.error = 'uploading', None
+                self.stop_ack = self.stop_verified = self.stop_evidence = None
+
+    def _end_ekf_turn(self, outcome, message):
+        self.ekf_turn_outcome = outcome
+        self.ekf_turn.update(phase='stopping' if self.connected else 'failed', message=message)
+        self.detour = None
+        if self.connected and not self.stop_requested:
+            self._queue_stop()
+
+    def _ekf_turn_cycle(self):
+        with self.lock:
+            if not self._ekf_turn_active() or self.ekf_turn['phase'] == 'stopping':
+                return
+            if self._scan_points() is not None:
+                self._check_ekf_turn_locked()
+                return
+        if self.feedback is not None:
+            self._consume_feedback()
+        self.update_scan()
+        with self.lock:
+            if not self._ekf_turn_active() or self.ekf_turn['phase'] == 'stopping':
+                return
+            self._check_ekf_turn_locked()
+
+    def _check_ekf_turn_locked(self):
+        try:
+            estimate = self._turn_feedback()
+            status = self.latest.status
+            if self.ekf_turn['phase'] == 'turning' and (status.state not in LEASE_STATES
+                    or not status.flags & EXECUTING):
+                raise ValueError('MCU 转向上限已结束或底盘已停止，本次未由 EKF 完成')
+            if self.grid.route_blocked(self._map_pose(), self.ekf_turn_plan, 0, 0., self.obstacles.cells):
+                raise ValueError('转向扫掠内出现障碍，取消试验')
+            if self.ekf_turn_last_yaw is None:
+                return
+            yaw = estimate['yaw_rad']
+            self.ekf_turn['turned_deg'] += math.degrees(angle(yaw - self.ekf_turn_last_yaw))
+            self.ekf_turn_last_yaw = yaw
+            if self.ekf_turn['direction'] * self.ekf_turn['turned_deg'] >= 90. - math.degrees(TURN_TOLERANCE_RAD):
+                self._end_ekf_turn('complete', 'EKF 已进入 90° 转向容差，正在停车')
+        except ValueError as exc:
+            self._record_scan_failure('v12_ekf_turn_failed', self.ekf_turn['phase'], str(exc))
+            self._end_ekf_turn('failed', str(exc))
+
+    def _validate_upload(self, pose, plan, cells, stage):
+        try:
+            if plan is self.ekf_turn_plan:
+                self._turn_feedback()
+                self.grid.plan(pose, dict(x=pose['x'], y=pose['y']), obstacle_cells=cells)
+            elif cells:
+                self.grid.validate_plan(pose, plan, obstacle_cells=cells)
+            else:
+                self.grid.validate_plan(pose, plan)
+            return True
+        except CollisionError as exc:
+            with self.lock:
+                if self.detour is None:
+                    raise
+                self.error = str(exc)
+                self._record_scan_failure('v12_navigation_rejected', stage, self.error)
+                self.pending = self.work = None
+                self.detour['attempt'] = None
+                self.detour['retry_at'] = self.clock() + REPLAN_INTERVAL_S
+                self.avoidance_phase = 'waiting'
+                self.avoidance_message = '续行路线复验未通过，保持停车等待重试'
+            return False
+
     # 开始请求消费预览并排队，真正的串口上传由唯一 owner 完成。
     def request_start(self, plan_id):
         with self.lock:
             self._require_stationary()
-            if self.work or self.stop_requested or self.detour is not None:
+            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active():
                 raise ValueError('当前操作正在处理')
             if self.plan is None or self.plan['id'] != plan_id or not self.plan['segments']:
                 raise ValueError('请预览一条可执行的新路径')
@@ -406,6 +527,9 @@ class Navigation:
                 raise ValueError('静止验收模式使用查询和上传')
             if not self.connected:
                 raise ValueError('串口状态未知，请在现场停车')
+            if self._ekf_turn_active():
+                self._end_ekf_turn('cancelled', '已人工取消 EKF 转向')
+                return
             self._cancel_detour('已人工取消')
             self._queue_stop()
 
@@ -456,26 +580,32 @@ class Navigation:
             if remaining > 0:
                 master.sleep(min(remaining, OBSTACLE_WORK_INTERVAL_S))
 
+    def _upload_snapshot(self, master, deadline, stage, reference):
+        while self.scanner is None or self._wait_start_scan(master, deadline, stage):
+            with self.lock:
+                if self.stop_requested:
+                    return None
+                if self.scanner is not None and self._scan_points() is None:
+                    continue
+                self._require_stationary()
+                pose = self._map_pose()
+                if pose is None and stage == 'before_upload':
+                    raise ValueError('地图定位已失效，请重新定位')
+                if not same_pose(pose, reference):
+                    raise ValueError('起点已变化，请重新预览' if stage == 'before_upload'
+                                     else '上传期间起点已变化，请重新预览')
+                return pose, self.obstacles.cells if self.scanner is not None else frozenset()
+        return None
+
     # 上传前和 START 前共用扫描等待期限，并重新核对停稳、起点和障碍。
     def _upload(self, master, plan):
-        wait_for_scan = self.scanner is not None
         scan_deadline = self.clock() + START_SCAN_WAIT_S
-        if wait_for_scan and not self._wait_start_scan(master, scan_deadline, 'before_upload'):
+        snapshot = self._upload_snapshot(master, scan_deadline, 'before_upload', plan['start'])
+        if snapshot is None:
             return
-        with self.lock:
-            if self.stop_requested:
-                return
-            self._require_stationary()
-            pose = self._map_pose()
-            if pose is None:
-                raise ValueError('地图定位已失效，请重新定位')
-            if not same_pose(pose, plan['start']):
-                raise ValueError('起点已变化，请重新预览')
-            cells = self._upload_obstacles() if self.scanner is not None else frozenset()
-        if cells:
-            self.grid.validate_plan(pose, plan, obstacle_cells=cells)
-        else:
-            self.grid.validate_plan(pose, plan)
+        pose, cells = snapshot
+        if not self._validate_upload(pose, plan, cells, 'before_upload'):
+            return
         with self.lock:
             if self.stop_requested:
                 return
@@ -485,35 +615,41 @@ class Navigation:
         with self.lock:
             if self.mode == 'ready' or self.stop_requested:
                 return
-            wait_again = wait_for_scan and self._scan_points() is None
-        if wait_again and not self._wait_start_scan(master, scan_deadline, 'before_start'):
-            return
-        with self.lock:
-            if self.stop_requested:
+            revalidate = self.detour is not None
+        while True:
+            snapshot = self._upload_snapshot(master, scan_deadline, 'before_start', pose)
+            if snapshot is None:
                 return
-            self._require_stationary()
-            current_pose = self._map_pose()
-            if not same_pose(current_pose, pose):
-                raise ValueError('上传期间起点已变化，请重新预览')
-            current_cells = self._upload_obstacles() if self.scanner is not None else cells
-        if current_pose != pose or current_cells != cells:
-            self.grid.validate_plan(current_pose, plan, obstacle_cells=current_cells)
-        with self.lock:
-            if self.stop_requested:
-                return
-            self._require_stationary()
-            if not same_pose(self._map_pose(), current_pose):
-                raise ValueError('上传期间起点已变化，请重新预览')
-            if self.scanner is not None and self._upload_obstacles() != current_cells:
-                raise ValueError('上传期间障碍已变化，请重新预览')
-            self.work = 'starting'
-            revision = self.feedback.stop_revision if self.feedback is not None else None
+            current_pose, current_cells = snapshot
+            if revalidate or current_pose != pose or current_cells != cells:
+                if not self._validate_upload(current_pose, plan, current_cells, 'before_start'):
+                    return
+            with self.lock:
+                if self.stop_requested:
+                    return
+                if self.scanner is not None and self._scan_points() is None:
+                    # COMMIT 已完成，只复验同一队列，无需再上传。
+                    revalidate = True
+                    continue
+                self._require_stationary()
+                if not same_pose(self._map_pose(), current_pose):
+                    raise ValueError('上传期间起点已变化，请重新预览')
+                if self.scanner is not None and self.obstacles.cells != current_cells:
+                    raise ValueError('上传期间障碍已变化，请重新预览')
+                if plan is self.ekf_turn_plan:
+                    self.ekf_turn_last_yaw = self._turn_feedback()['yaw_rad']
+                    self.ekf_turn.update(phase='starting', message='正在启动 EKF 监督的单段转向')
+                self.work = 'starting'
+                revision = self.feedback.stop_revision if self.feedback is not None else None
+                break
         # 子进程在实际发送前复核这一代次，STOP 无需等待导航锁或 ACK。
         started = (master.start(reply.status.task, revision=revision) if self.feedback is not None
                    else master.start(reply.status.task))
         self.observe(started)
         status = started.status
         with self.lock:
+            if plan is self.ekf_turn_plan and not self.stop_requested:
+                self.ekf_turn.update(phase='turning', message='EKF 正在监督转角；试验结束后不直行')
             if not self.stop_requested and status.state in LEASE_STATES and status.lease_remaining_ms:
                 self.lease_task = status.boot, status.epoch, status.task
                 if self.detour is not None:
@@ -534,6 +670,8 @@ class Navigation:
 
     # 仅为当前会话、当前任务且反馈新鲜的有效租约续期。
     def _renew_if_due(self, master, reply):
+        if self._ekf_turn_active():
+            return
         if self.feedback is not None:
             self._consume_feedback()
         with self.lock:
@@ -583,6 +721,20 @@ class Navigation:
             else:
                 self.error = error.get('message', '停车未确认')
 
+            if self.ekf_turn is not None and self.ekf_turn['phase'] == 'stopping':
+                estimate = self.ekf.ekf_snapshot() if self.ekf is not None else None
+                if estimate is not None and estimate['fresh'] and self.ekf_turn_last_yaw is not None:
+                    self.ekf_turn['turned_deg'] += math.degrees(angle(estimate['yaw_rad'] - self.ekf_turn_last_yaw))
+                    self.ekf_turn_last_yaw = estimate['yaw_rad']
+                outcome = self.ekf_turn_outcome if self.stop_verified else 'failed'
+                message = self.ekf_turn['message'] + ('；实测停稳已确认' if self.stop_verified else '；停稳尚未确认')
+                if outcome == 'complete':
+                    if estimate is None or not estimate['fresh']:
+                        outcome, message = 'failed', message + '；最终 EKF 角度过期，不能确认到角'
+                    elif abs(self.ekf_turn['turned_deg'] - self.ekf_turn['direction'] * 90.) > math.degrees(TURN_TOLERANCE_RAD):
+                        outcome, message = 'failed', message + '；停稳角度超出 90°±3°'
+                self.ekf_turn.update(phase=outcome, message=message)
+
             if self.detour is not None:
                 if self.stop_verified:
                     self.avoidance_phase = 'waiting'
@@ -624,6 +776,8 @@ class Navigation:
     # 缺测停车先复验原路线。仅剩余扫掠被障碍占用时搜索绕行。
     def _avoidance_cycle(self, master, reply):
         with self.lock:
+            if self._ekf_turn_active() or (self.route is self.ekf_turn_plan and self.ekf_turn_plan is not None):
+                return
             detour = self.detour
         if detour is None:
             self._check_route(reply)
@@ -702,12 +856,15 @@ class Navigation:
         try:
             master.launch()
             self.observe(master.discover())
+            if isinstance(self.ekf, EkfWorker):
+                self.ekf.launch(master.cache)
             consumer = threading.Thread(target=self._run_feedback_consumer,
                                         args=(consumer_closed,), name='v12-cache-consumer')
             consumer.start()
             while not closed.is_set():
                 if self.feedback_error is not None:
                     raise self.feedback_error
+                self._ekf_turn_cycle()
                 with self.lock:
                     stop = self.stop_requested
                     plan, self.pending = self.pending, None
@@ -736,6 +893,8 @@ class Navigation:
                         self.observe(exc.exchange)
                     with self.lock:
                         self.error = str(exc)
+                        if self._ekf_turn_active():
+                            self._end_ekf_turn('failed', self.error)
                         if self.scanner is not None:
                             self._record_scan_failure('v12_navigation_rejected',
                                                       self.work or 'query', self.error)
@@ -743,6 +902,8 @@ class Navigation:
                             self._cancel_detour(self.error)
                         if stop:
                             self.stop_ack, self.stop_verified = False, False
+                            if self.ekf_turn is not None and self.ekf_turn['phase'] == 'stopping':
+                                self.ekf_turn.update(phase='failed', message='停车未确认：' + self.error)
                 finally:
                     with self.lock:
                         if stop:
@@ -759,6 +920,8 @@ class Navigation:
             consumer_closed.set()
             if consumer is not None:
                 consumer.join()
+            if isinstance(self.ekf, EkfWorker):
+                self.ekf.close()
             master.close()
             with self.lock:
                 self.connected = False
@@ -778,7 +941,15 @@ class Navigation:
             fresh = self._fresh()
             status_fresh = (self.connected and self.latest is not None
                             and 0 <= self.clock() - self.latest.sent_at < SOURCE_MAX_AGE_S)
-            preparing = not self.work and not self.stop_requested and self.detour is None and self._stationary()
+            preparing = (not self.work and not self.stop_requested and self.detour is None
+                         and not self._ekf_turn_active() and self._stationary())
+            can_ekf_turn = False
+            if preparing and self.ekf_turn is not None:
+                try:
+                    self._turn_feedback()
+                    can_ekf_turn = True
+                except ValueError:
+                    pass
             avoidance = None
             points = None
             if self.scanner is not None:
@@ -817,8 +988,10 @@ class Navigation:
                                     if pose is not None and self.origin else None),
                         trail=list(self.trail), preview=self.plan, route=self.route,
                         connected=self.connected,
-                        source_fresh=fresh, busy=bool(self.work or self.stop_requested), mode=self.mode,
+                        source_fresh=fresh, busy=bool(self.work or self.stop_requested or self._ekf_turn_active()), mode=self.mode,
                         task=task, avoidance=avoidance, can_prepare=preparing,
+                        ekf_turn=dict(self.ekf_turn) if self.ekf_turn is not None else None,
+                        can_ekf_turn=can_ekf_turn,
                         can_start=bool(preparing and pose and self.plan and self.plan['segments']),
                         can_stop=self.connected and self.mode == 'drive', error=self.error)
             if communication is not None:
@@ -828,6 +1001,9 @@ class Navigation:
             result['communication'] = communication
         if avoidance is not None:
             avoidance['points'] = [dict(x=x, y=y) for x, y in points or ()]
+        if self.ekf is not None:
+            result['imu'] = self.ekf.imu_snapshot()
+            result['ekf'] = self.ekf.ekf_snapshot()
         return result
 
 
@@ -886,6 +1062,8 @@ def handler_for(nav):
                     nav.preview(checked_body(body, ('x', 'y')))
                 elif self.path == '/api/start':
                     nav.request_start(checked_body(body, ('plan_id',))['plan_id'])
+                elif self.path == '/api/ekf-turn':
+                    nav.request_ekf_turn(checked_body(body, ('direction',))['direction'])
                 elif self.path == '/api/stop':
                     checked_body(body, ())
                     nav.request_stop()
@@ -921,7 +1099,14 @@ def main(argv=None):
     parser.add_argument('--obstacle-test', action='store_true', help='启用前方雷达挡路停车与自动重规划')
     parser.add_argument('--trace-feedback-timing', action='store_true',
                         help='在 RK 本机接口记录最近 4096 条 QUERY 的分段计时')
+    parser.add_argument('--ekf-imu-topic', help='启用二维融合，使用此 IMU 陀螺仪话题')
+    parser.add_argument('--ekf-executable', type=Path, help='使用指定的 robot_localization EKF 程序')
+    parser.add_argument('--ekf-turn-test', action='store_true', help='允许显式触发单次 EKF 监督的原地 90° 转向试验')
     args = parser.parse_args(argv)
+    if args.ekf_executable is not None and not args.ekf_imu_topic:
+        parser.error('--ekf-executable 需要 --ekf-imu-topic')
+    if args.ekf_turn_test and (not args.ekf_imu_topic or not args.obstacle_test):
+        parser.error('--ekf-turn-test 需要 --ekf-imu-topic 和 --obstacle-test')
     if (not all(math.isfinite(v) for v in (args.laser_x, args.laser_y, args.laser_yaw,
                                           args.obstacle_min_range, args.obstacle_scan_timeout))
             or args.obstacle_min_range < 0 or args.obstacle_scan_timeout <= 0):
@@ -937,7 +1122,10 @@ def main(argv=None):
     if args.obstacle_test:
         from v11_ros import RosObstacleScanner
         scanner = RosObstacleScanner(args.scan_topic, min_range_m=args.obstacle_min_range, **mounting)
-    nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner,
+    ekf = None
+    if args.ekf_imu_topic:
+        ekf = EkfWorker(args.ekf_imu_topic, args.ekf_executable)
+    nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner, ekf=ekf, ekf_turn_test=args.ekf_turn_test,
                      obstacle_scan_timeout_s=args.obstacle_scan_timeout)
     closed = threading.Event()
     workers = [threading.Thread(target=nav.run, args=(args.port, closed, args.trace_feedback_timing),
@@ -962,6 +1150,8 @@ def main(argv=None):
             localizer.close()
         if scanner is not None:
             scanner.close()
+        if ekf is not None:
+            ekf.close()
 
 
 if __name__ == '__main__':

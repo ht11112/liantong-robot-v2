@@ -1,8 +1,8 @@
 """Deterministic A* and MOVE/TURN swept-volume checks.
 
 All poses are in the saved map frame, in metres and radians. This module has
-no ROS, serial or runtime side effects. The swept disk bounds the body and
-the modeled firmware early-stop tolerances, not unmeasured drift or braking.
+no ROS, serial or runtime side effects. MOVE uses an oriented rectangle;
+TURN uses the disk swept by the body's corners.
 """
 import hashlib
 import heapq
@@ -13,7 +13,10 @@ import shlex
 import struct
 
 
-BODY_RADIUS_M = math.hypot(.175, .20)
+BODY_LENGTH_M = .35
+BODY_WIDTH_M = .40
+BODY_RADIUS_M = math.hypot(BODY_LENGTH_M / 2., BODY_WIDTH_M / 2.)
+BODY_CLEARANCE_M = .15
 MOVE_TOLERANCE_M = .02
 GOAL_TOLERANCE_M = .10
 TURN_TOLERANCE_RAD = math.pi / 60.
@@ -26,6 +29,10 @@ _STEPS = ((1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (-1, -1), (1, -1))
 
 class PlanningError(ValueError):
     """A map, pose, route or exact wire queue cannot be accepted."""
+
+
+class CollisionError(PlanningError):
+    """The current map or pose no longer leaves the required body clearance."""
 
 
 def _number(value):
@@ -161,7 +168,10 @@ def _sha(raw, expected):
 
 # 地图和配置按给定哈希核对，坐标以 YAML 的分辨率与原点为准。
 def load_map(pgm_path, yaml_path, expected_pgm_sha256=None, expected_yaml_sha256=None,
-             *, use_modeled_error_margin=True):
+             *, use_modeled_error_margin=True, clearance_m=BODY_CLEARANCE_M):
+    clearance_m = _number(clearance_m)
+    if clearance_m < 0.:
+        raise PlanningError('Body clearance cannot be negative')
     pgm_path, yaml_path = Path(pgm_path), Path(yaml_path)
     if pgm_path.stat().st_size > 1_010_000 or yaml_path.stat().st_size > 8192:
         raise PlanningError('Saved map files exceed the supported size')
@@ -180,7 +190,8 @@ def load_map(pgm_path, yaml_path, expected_pgm_sha256=None, expected_yaml_sha256
                 bits |= 1 << x
         rows.append(bits)
     return GridMap(pgm, width, height, resolution, origin, tuple(rows), pgm_sha, yaml_sha,
-                   occupied, free, negate, use_modeled_error_margin=use_modeled_error_margin)
+                   occupied, free, negate, use_modeled_error_margin=use_modeled_error_margin,
+                   clearance_m=clearance_m)
 
 
 def _point_box_sq(x, y, i, j):
@@ -188,37 +199,43 @@ def _point_box_sq(x, y, i, j):
     return dx*dx + dy*dy
 
 
-def _capsule_hits_cell(a, b, radius_sq, i, j):
-    """Exact closed segment-to-closed-cell distance, with conservative epsilon."""
-    ax, ay = a
-    bx, by = b
-    if min(_point_box_sq(ax, ay, i, j), _point_box_sq(bx, by, i, j)) <= radius_sq + _EPS:
-        return True
-    dx, dy = bx - ax, by - ay
-    length_sq = dx*dx + dy*dy
-    if not length_sq:
-        return False
-    low, high = 0., 1.
-    for position, delta, edge in ((ax, dx, i), (ay, dy, j)):
-        if delta:
-            t0, t1 = (edge - position) / delta, (edge + 1. - position) / delta
-            low, high = max(low, min(t0, t1)), min(high, max(t0, t1))
-        elif not edge <= position <= edge + 1.:
-            low, high = 1., 0.
-    if low <= high + _EPS:
-        return True
-    for x, y in ((i, j), (i+1, j), (i, j+1), (i+1, j+1)):
-        fraction = min(1., max(0., ((x-ax)*dx + (y-ay)*dy) / length_sq))
-        if (x-ax-fraction*dx)**2 + (y-ay-fraction*dy)**2 <= radius_sq + _EPS:
-            return True
-    return False
+class _RectangleSweep:
+    """Exact rectangle translated forward along its heading, in grid units."""
+    def __init__(self, a, b, half_length, half_width, yaw=None):
+        dx, dy = b[0]-a[0], b[1]-a[1]
+        yaw = math.atan2(dy, dx) if yaw is None else yaw
+        self.c, self.s = math.cos(yaw), math.sin(yaw)
+        self.x, self.y = (a[0]+b[0])/2., (a[1]+b[1])/2.
+        self.half_length = half_length + math.hypot(dx, dy)/2.
+        self.half_width = half_width
+        self.extent_x = abs(self.c)*self.half_length + abs(self.s)*half_width
+        self.extent_y = abs(self.s)*self.half_length + abs(self.c)*half_width
+        self.bounds = (self.x-self.extent_x, self.y-self.extent_y,
+                       self.x+self.extent_x, self.y+self.extent_y)
+
+    def hits_cell(self, i, j):
+        dx, dy = i+.5-self.x, j+.5-self.y
+        # 分离轴检查同时覆盖车身边、栅格边和角点相切。
+        cell_projection = .5*(abs(self.c)+abs(self.s))
+        return (abs(dx) <= self.extent_x+.5+_EPS
+                and abs(dy) <= self.extent_y+.5+_EPS
+                and abs(dx*self.c+dy*self.s) <= self.half_length+cell_projection+_EPS
+                and abs(-dx*self.s+dy*self.c) <= self.half_width+cell_projection+_EPS)
 
 
-def _obstacle_hits_sweep(a, b, radius, obstacle_cells):
-    left, right = min(a[0], b[0])-radius-_EPS, max(a[0], b[0])+radius+_EPS
-    bottom, top = min(a[1], b[1])-radius-_EPS, max(a[1], b[1])+radius+_EPS
-    return any(left-1. <= i <= right and bottom-1. <= j <= top
-               and _capsule_hits_cell(a, b, radius*radius, i, j) for i, j in obstacle_cells)
+class _DiskFootprint:
+    """A closed disk in grid units."""
+    def __init__(self, point, radius):
+        self.x, self.y = point
+        self.radius_sq = radius*radius
+        self.bounds = self.x-radius, self.y-radius, self.x+radius, self.y+radius
+
+    def hits_cell(self, i, j):
+        return _point_box_sq(self.x, self.y, i, j) <= self.radius_sq+_EPS
+
+
+def _obstacle_hits_sweep(sweep, obstacle_cells):
+    return any(sweep.hits_cell(i, j) for i, j in obstacle_cells)
 
 
 # 将静态地图与雷达障碍合并；路径检查考虑车体包络而非仅检查中心点。
@@ -230,7 +247,11 @@ class _Costmap:
             self.rows = list(self.rows)
             for x, y in obstacle_cells:
                 self.rows[y] |= 1 << x
-        self.radius = (BODY_RADIUS_M + search_padding) / grid.resolution
+        padding = grid.clearance_m + search_padding
+        self.radius = (BODY_RADIUS_M + padding) / grid.resolution
+        self.half_length = (BODY_LENGTH_M/2. + padding) / grid.resolution
+        self.half_width = (BODY_WIDTH_M/2. + padding) / grid.resolution
+        self.resolution = grid.resolution
         self._walkable = bytearray(self.width * self.height)
         self._disk_spans = []
         limit = int(math.floor(self.radius + .5 + _EPS))
@@ -240,10 +261,18 @@ class _Costmap:
             span = int(math.floor(horizontal+.5+_EPS))
             self._disk_spans.append((dy, span, (1 << (2*span+1)) - 1))
 
-    def sweep(self, a, b, radius=None):
-        radius = self.radius if radius is None else radius
-        low_x, high_x = min(a[0], b[0])-radius, max(a[0], b[0])+radius
-        low_y, high_y = min(a[1], b[1])-radius, max(a[1], b[1])+radius
+    def rectangle(self, a, b, *, yaw=None, margin=0.):
+        padding = margin/self.resolution
+        return _RectangleSweep(a, b, self.half_length+padding, self.half_width+padding, yaw)
+
+    def sweep(self, a, b, *, yaw=None, margin=0.):
+        return self._clear(self.rectangle(a, b, yaw=yaw, margin=margin))
+
+    def turn(self, point, margin=0.):
+        return self._clear(_DiskFootprint(point, self.radius+margin/self.resolution))
+
+    def _clear(self, sweep):
+        low_x, low_y, high_x, high_y = sweep.bounds
         if low_x <= _EPS or low_y <= _EPS or high_x >= self.width-_EPS or high_y >= self.height-_EPS:
             return False
         # Include cells just touching the bounding box (including integer boundaries).
@@ -254,7 +283,7 @@ class _Costmap:
             while hits:
                 bit = hits & -hits
                 i = left + bit.bit_length() - 1
-                if _capsule_hits_cell(a, b, radius*radius, i, j):
+                if sweep.hits_cell(i, j):
                     return False
                 hits ^= bit
         return True
@@ -322,23 +351,33 @@ class _Costmap:
 
     # 简化路径时仍检查整段扫掠区域，避免直线跨过障碍。
     def simplify(self, chain):
-        result, index = [chain[0]], 0
-        while index + 1 < len(chain):
-            for later in range(len(chain)-1, index, -1):
-                if self.sweep(chain[index], chain[later]):
-                    result.append(chain[later])
-                    index = later
+        indices, candidates, dead = [0], [len(chain)-1], set()
+        while indices:
+            index = indices[-1]
+            if index == len(chain)-1:
+                return [chain[node] for node in indices]
+            for later in range(candidates[-1], index, -1):
+                candidates[-1] = later-1
+                minimum = GOAL_TOLERANCE_M if later == len(chain)-1 else MOVE_TOLERANCE_M
+                if (later not in dead
+                        and math.dist(chain[index], chain[later])*self.resolution > _float32(minimum)+_EPS
+                        and self.sweep(chain[index], chain[later])):
+                    indices.append(later)
+                    candidates.append(len(chain)-1)
                     break
             else:
-                raise PlanningError('Grid route has no collision-free straight continuation')
-            if len(result) > MAX_SEGMENTS + 1:
+                # 最远可见拐点可能只留下不足10cm的末段；回退换拐点，不能删掉目标。
+                dead.add(indices.pop())
+                candidates.pop()
+            if len(indices) > MAX_SEGMENTS + 1:
                 raise PlanningError('Path exceeds the MCU action capacity')
-        return result
+        raise PlanningError('Grid route has no collision-free continuation with executable MOVE lengths')
 
 
 class GridMap:
     def __init__(self, pgm, width, height, resolution, origin, rows, pgm_sha, yaml_sha,
-                 occupied, free, negate, *, use_modeled_error_margin=True):
+                 occupied, free, negate, *, use_modeled_error_margin=True,
+                 clearance_m=BODY_CLEARANCE_M):
         self.pgm_bytes = pgm
         self.width, self.height, self.resolution, self.origin = width, height, resolution, origin
         self.blocked_rows = rows
@@ -346,6 +385,7 @@ class GridMap:
         self.map_id = hashlib.sha256((pgm_sha + yaml_sha).encode('ascii')).hexdigest()
         self.occupied_thresh, self.free_thresh, self.negate = occupied, free, negate
         self.use_modeled_error_margin = use_modeled_error_margin
+        self.clearance_m = clearance_m
         self._cos, self._sin = math.cos(origin[2]), math.sin(origin[2])
 
     def metadata(self):
@@ -355,7 +395,7 @@ class GridMap:
                     free_thresh=self.free_thresh, negate=self.negate)
 
     def costmap_pgm(self):
-        """Draw the baseline footprint's cell-center clearances in PGM row order."""
+        """Draw orientation-independent turning clearance in PGM row order."""
         width, height, pixels = _pgm(self.pgm_bytes)
         costmap = _Costmap(self)
         raster = bytearray(width * height)
@@ -392,21 +432,21 @@ class GridMap:
 
     # 检查当前段剩余部分和后续路线，不把已完成路段当作前方障碍。
     def route_blocked(self, pose, plan, index, progress, obstacle_cells):
-        """Test only new obstacles against the remaining queue from measured pose."""
-        if not obstacle_cells:
-            return False
+        """Check the remaining queue against static and live obstacles at measured pose."""
+        costmap = _Costmap(self, obstacle_cells=obstacle_cells)
         x, y = self._to_grid(pose['x'], pose['y'])
         yaw = pose['yaw'] - self.origin[2]
-        radius = BODY_RADIUS_M / self.resolution
         for segment in plan['segments'][index:]:
             a = x, y
             if segment['kind'] == 'turn':
                 turn = segment['angle_rad']
                 yaw += math.copysign(max(0., abs(turn)-progress), turn)
+                clear = costmap.turn(a)
             else:
                 length = max(0., segment['distance_m']-progress) / self.resolution
                 x, y = x + length*math.cos(yaw), y + length*math.sin(yaw)
-            if _obstacle_hits_sweep(a, (x, y), radius, obstacle_cells):
+                clear = costmap.sweep(a, (x, y), yaw=yaw)
+            if not clear:
                 return True
             progress = 0.
         return False
@@ -441,8 +481,15 @@ class GridMap:
 
         # A blockage on the connector alone does not justify replacing the route.
         route = [self._to_grid(*point) for point in remaining]
-        if any(_obstacle_hits_sweep(a, b, costmap.radius, obstacle_cells) for a, b in zip(route, route[1:])):
-            return None
+        waypoint = 0
+        for segment in segments[index:]:
+            if segment['kind'] == 'turn':
+                sweep = _DiskFootprint(route[waypoint], costmap.radius)
+            else:
+                sweep = costmap.rectangle(route[waypoint], route[waypoint+1])
+                waypoint += 1
+            if _obstacle_hits_sweep(sweep, obstacle_cells):
+                return None
         # Merge a sub-tolerance remainder into the connector to its endpoint.
         if moving and math.dist(remaining[0], remaining[1]) <= tolerance+_EPS:
             del remaining[0]
@@ -460,10 +507,11 @@ class GridMap:
 
     def _endpoints(self, costmap, pose, goal):
         a, b = self._to_grid(*pose[:2]), self._to_grid(*goal)
-        if not costmap.sweep(a, a):
-            raise PlanningError('Start footprint intersects occupied, unknown or outside space')
-        if not costmap.sweep(b, b):
-            raise PlanningError('Goal footprint intersects occupied, unknown or outside space')
+        if not costmap.sweep(a, a, yaw=pose[2]-self.origin[2]):
+            raise CollisionError('Start footprint intersects occupied, unknown or outside space')
+        # 终点朝向未指定，先用内切圆作必要筛选；编译后按实际到达朝向复验矩形。
+        if not costmap._clear(_DiskFootprint(b, min(costmap.half_length, costmap.half_width))):
+            raise CollisionError('Goal footprint intersects occupied, unknown or outside space')
         return a, b
 
     # 重新检查最终 MOVE/TURN 队列的车体扫掠及终点误差。
@@ -476,8 +524,8 @@ class GridMap:
             margin = position_error if self.use_modeled_error_margin else 0.
             if segment['kind'] == 'turn':
                 angle = segment['angle_rad']
-                if not costmap.sweep(start, start, (BODY_RADIUS_M+margin)/self.resolution):
-                    raise PlanningError('TURN swept disk intersects a blocked cell or map boundary')
+                if not costmap.turn(start, margin):
+                    raise CollisionError('TURN swept disk intersects a blocked cell or map boundary')
                 yaw = _wrap(yaw+angle)
                 heading_error += _float32(TURN_TOLERANCE_RAD)
                 estimated_time += abs(angle)/_TURN_RAD_S
@@ -487,10 +535,10 @@ class GridMap:
                 end = self._to_grid(x, y)
                 yaw_distance = 2.*length*math.sin(min(math.pi, heading_error)/2.)
                 if self.use_modeled_error_margin:
-                    margin += yaw_distance
-                radius = (BODY_RADIUS_M+margin)/self.resolution
-                if not costmap.sweep(start, end, radius):
-                    raise PlanningError('MOVE swept capsule intersects a blocked cell or map boundary')
+                    # 矩形还须覆盖累计朝向误差带来的车角位移。
+                    margin += yaw_distance + 2.*BODY_RADIUS_M*math.sin(min(math.pi, heading_error)/2.)
+                if not costmap.sweep(start, end, yaw=yaw-self.origin[2], margin=margin):
+                    raise CollisionError('MOVE swept rectangle intersects a blocked cell or map boundary')
                 path.append(dict(x=x, y=y))
                 distance += length
                 estimated_time += length/_WHEEL_M_PER_RPM_S
@@ -508,15 +556,19 @@ class GridMap:
     def _compile(self, start, chain):
         x, y, yaw = start
         segments = []
-        for waypoint in chain[1:]:
+        for index, waypoint in enumerate(chain[1:], 1):
             wx, wy = self._to_map(*waypoint)
             dx, dy = wx-x, wy-y
             turn = _float32(_wrap(math.atan2(dy, dx)-yaw))
+            next_yaw = _wrap(yaw+turn) if abs(turn) > _float32(TURN_TOLERANCE_RAD) else yaw
+            # 只合并中间短连接；保留原目标，合并后的真实指令仍须通过整段扫掠复验。
+            length = _float32(dx*math.cos(next_yaw) + dy*math.sin(next_yaw))
+            if index+1 < len(chain) and length <= _float32(MOVE_TOLERANCE_M):
+                continue
             if abs(turn) > _float32(TURN_TOLERANCE_RAD):
                 segments.append(dict(kind='turn', angle_rad=turn))
-                yaw = _wrap(yaw+turn)
+                yaw = next_yaw
             # An omitted sub-tolerance TURN really does not turn the robot.
-            length = _float32(dx*math.cos(yaw) + dy*math.sin(yaw))
             segments.append(dict(kind='move', distance_m=length))
             x, y = x+length*math.cos(yaw), y+length*math.sin(yaw)
         return _queue(segments)
@@ -545,8 +597,10 @@ class GridMap:
         # route with the same sweep policy used before uploading it.
         for padding in (0., .10, .25, .50):
             search = costmap if not padding else _Costmap(self, padding, obstacle_cells=obstacle_cells)
-            if not search.sweep(a, a) or not search.sweep(b, b):
-                break  # Larger search disks cannot reconnect these endpoints.
+            try:
+                self._endpoints(search, start, target)
+            except PlanningError:
+                break
             try:
                 chain = search.simplify(search.astar(a, b))
             except PlanningError as exc:

@@ -87,6 +87,21 @@
             <div class="kv"><dt>查询丢失 / 缓存遗漏</dt><dd class="mono" id="feedback-loss">—</dd></div>
           </dl><small>查询目标 50 Hz；MCU 真实轮速采样约 20 Hz。控制命令也会返回反馈。</small></div>
         </section>
+        <section class="card" id="imu-card" hidden>
+          <div class="cardhead"><h2>5 · IMU 角速度</h2><span class="pill" id="imu-status">等待数据</span></div>
+          <div class="body"><dl>
+            <div class="kv"><dt>样本年龄</dt><dd class="mono" id="imu-age">—</dd></div>
+            <div class="kv"><dt>车体 X 轴（横滚）</dt><dd class="mono" id="imu-x">—</dd></div>
+            <div class="kv"><dt>车体 Y 轴（俯仰）</dt><dd class="mono" id="imu-y">—</dd></div>
+            <div class="kv"><dt>车体 Z 轴（偏航）</dt><dd class="mono" id="imu-z">—</dd></div>
+            <div class="kv" id="ekf-heading-row" hidden><dt>EKF 融合航向角（局部）</dt><dd class="mono" id="ekf-heading">等待数据</dd></div>
+          </dl>
+          <div class="actions" id="ekf-turn-controls" style="margin-top:10px" hidden>
+            <button id="ekf-turn-left" type="button" disabled>EKF 左转 90°</button>
+            <button id="ekf-turn-right" type="button" disabled>EKF 右转 90°</button>
+          </div>
+          <p class="message" id="ekf-turn-status" role="status" hidden></p></div>
+        </section>
       </aside>
       <section class="card costmap" aria-labelledby="costmap-title">
         <div class="cardhead"><h2 id="costmap-title">导航代价地图</h2><a id="costmap-open" target="_blank" rel="noopener" hidden>查看原图</a></div>
@@ -94,11 +109,11 @@
           <div class="costmap-box"><canvas id="costmap-view" role="img" aria-label="基础代价地图与实时雷达障碍" hidden></canvas><p id="costmap-note">等待代价地图</p></div>
           <div class="map-foot">
             <div class="legend costmap-legend" aria-label="代价地图图例">
-              <span><i class="occupied"></i>障碍</span><span><i class="inflated"></i>车体净空</span>
+              <span><i class="occupied"></i>障碍</span><span><i class="inflated"></i>转向空间不足</span>
               <span><i class="unknown"></i>未知区</span><span><i class="free"></i>可通行</span>
               <span id="costmap-radar-legend" hidden><i class="radar"></i>雷达障碍</span>
             </div>
-            <span>显示基础净空，规划时可能使用额外边距</span>
+            <span>直行按 40 × 35 cm 矩形检查，灰色标示转向所需空间</span>
           </div>
         </div>
       </section>
@@ -119,6 +134,7 @@
     let state = {connected:false}, image = null, imageKey = '', view = null;
     let costmapImage = null, costmapKey = '', costmapError = false;
     let selectionMode = 'goal', drag = null, prepared = null, action = null, stopping = false;
+    let ekfTurnError = '';
     const finite = Number.isFinite;
     const angle = n => Math.atan2(Math.sin(n),Math.cos(n));
     const poseText = pose => `(${pose.x.toFixed(3)}, ${pose.y.toFixed(3)}) m · ${(pose.yaw*180/Math.PI).toFixed(1)}°`;
@@ -318,6 +334,35 @@
         $('feedback-consumer').textContent=number(comm.consumer_lag_ms,'ms');
         $('feedback-loss').textContent=`${comm.dropped_queries ?? '—'} / ${comm.consumer_missed ?? '—'}`;
       }
+      const imu=state.imu, ekf=state.ekf, ekfTurn=state.ekf_turn;
+      const hasEkfTurn=ekfTurn!=null && state.can_ekf_turn!==undefined;
+      $('imu-card').hidden=imu===undefined && ekf===undefined && !hasEkfTurn;
+      const imuFresh=online && imu?.fresh===true;
+      const rates=imuFresh ? imu.angular_velocity_rad_s : null;
+      $('imu-status').textContent=!online?'连接断开':imuFresh?'数据新鲜':finite(imu?.age_ms)?'数据过期':'等待数据';
+      $('imu-status').className='pill'+(imuFresh?' on':'');
+      $('imu-age').textContent=online && finite(imu?.age_ms)?`${imu.age_ms.toFixed(0)} ms`:'—';
+      for(const axis of ['x','y','z']){
+        const rate=rates?.[axis];
+        $('imu-'+axis).textContent=finite(rate)?`${(rate*180/Math.PI).toFixed(2)} °/s`:'—';
+      }
+      $('ekf-heading-row').hidden=ekf===undefined;
+      const ekfAge=online && finite(ekf?.age_ms)?` · ${ekf.age_ms.toFixed(0)} ms`:'';
+      const heading=ekf?.fresh===true && finite(ekf.yaw_rad)?`${(ekf.yaw_rad*180/Math.PI).toFixed(2)}°`:
+        ekfAge?'数据过期':'等待数据';
+      $('ekf-heading').textContent=online?heading+ekfAge:'连接断开';
+      $('ekf-turn-controls').hidden=!hasEkfTurn;
+      const canEkfTurn=hasEkfTurn && online && Boolean(state.csrf_token) && !action && !stopping
+        && state.can_ekf_turn===true;
+      $('ekf-turn-left').disabled=$('ekf-turn-right').disabled=!canEkfTurn;
+      const turnStatus=$('ekf-turn-status');
+      const turnProgress=online && ekfTurn?.direction && finite(ekfTurn.turned_deg)
+        ? `本次融合转角 ${ekfTurn.turned_deg.toFixed(1)}°` : '';
+      const turnMessage=action==='ekf-turn'?'正在提交转向请求。':
+        [online?ekfTurn?.message:'',turnProgress,ekfTurnError].filter(Boolean).join(' ');
+      if(turnStatus.textContent!==turnMessage) turnStatus.textContent=turnMessage;
+      turnStatus.hidden=!hasEkfTurn||!turnMessage;
+      turnStatus.className='message'+(ekfTurnError||ekfTurn?.phase==='failed'?' error':'');
       draw();
     }
     // 状态轮询只读取 RK 状态；实际动作由用户提交。
@@ -336,19 +381,26 @@
       }
     }
     // 操作请求携带会话令牌；停车和其他操作各有独立界面状态。
-    async function submit(op,body) {
-      if($(op).disabled) return;
+    async function submit(op,body,buttonId=op) {
+      if($(buttonId).disabled) return;
+      const ekfTurn=op==='ekf-turn';
       if(op==='stop') stopping=true;
       else action=op;
       prepared=null;
-      note(op==='localize'?'正在进行单次定位，请等待 RK 应答。':'正在提交请求。');render();
+      if(ekfTurn) ekfTurnError='';
+      else note(op==='localize'?'正在进行单次定位，请等待 RK 应答。':'正在提交请求。');
+      render();
       try {
         const response=await fetch('/api/'+op,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':state.csrf_token},body:JSON.stringify(body)});
         const next=await response.json();
         if(!response.ok||!('connected' in next)) throw new Error(next.error||'RK 未确认本次请求');
         if(op==='preview') prepared=next.preview?.id??null;
-        note(op==='stop'?'已提交停车请求，请看实测停稳状态。':'RK 已应答，请查看最新状态。');
-      } catch(error) {note(error.message,true);}
+        if(ekfTurn) state={...state,ekf_turn:next.ekf_turn,can_ekf_turn:next.can_ekf_turn};
+        else note(op==='stop'?'已提交停车请求，请看实测停稳状态。':'RK 已应答，请查看最新状态。');
+      } catch(error) {
+        if(ekfTurn) ekfTurnError=error.message;
+        else note(error.message,true);
+      }
       finally {if(op==='stop')stopping=false;else action=null;render();}
     }
     function setPoint(fields,p,yaw) {
@@ -373,6 +425,8 @@
     $('localize').onclick=()=>submit('localize',seed());$('zero').onclick=()=>submit('zero',seed());
     $('preview').onclick=()=>submit('preview',goal());$('start').onclick=()=>submit('start',{plan_id:prepared});
     $('stop').onclick=()=>submit('stop',{});
+    $('ekf-turn-left').onclick=()=>submit('ekf-turn',{direction:1},'ekf-turn-left');
+    $('ekf-turn-right').onclick=()=>submit('ekf-turn',{direction:-1},'ekf-turn-right');
     window.addEventListener('resize',draw);
     render();poll();
   })();
