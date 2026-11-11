@@ -117,7 +117,7 @@ static uint32_t arm_value(Drive *d,const ArmStep *s){
 static bool arm_check(Drive *d,const ArmStep *s,uint32_t v){
   switch(s->check){
   case EQ:return v==s->value;
-  case BUS_RANGE:return v>=2000u&&v<=3250u;
+  case BUS_RANGE:return v>=2000u&&v<=3300u;
   case SPEED_ZERO:return magnitude((int16_t)v)<=2u&&magnitude((int16_t)(v>>16))<=2u;
   case STATUS_ZERO:return statuses(v,0);
   case HALL_RANGE:return v>=1u&&v<=6u;

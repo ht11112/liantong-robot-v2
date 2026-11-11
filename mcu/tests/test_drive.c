@@ -6,7 +6,7 @@
 
 typedef struct {
   Drive d;uint32_t now,status,guard,target,bus_error,delay,decel_until;
-  uint32_t speed,current,positions[2],pole_override,max_speed,max_speed_reads,max_speed_writes;
+  uint32_t speed,current,positions[2],pole_override,max_speed,max_speed_reads,max_speed_writes,bus_voltage;
   uint32_t sends,target_writes,zero_writes,fallback_writes,speed_reads,max_speed_gap,last_speed_sample;
   uint8_t request[8];bool waiting,drop_all,drop_next,force_speed,send_fail,fifo_blocked;
   uint32_t sent_at;MQSample samples[2000];unsigned sample_count;
@@ -23,7 +23,7 @@ static bool send(void *u,const uint8_t b[8]){
 static uint32_t read_value(Peer *p,uint16_t index,uint8_t sub,unsigned *bytes){
   *bytes=4;
   switch(index){
-  case 0x2035:*bytes=2;return 2400;
+  case 0x2035:*bytes=2;return p->bus_voltage;
   case 0x603f:return 0;
   case 0x606c:
     p->speed_reads++;
@@ -76,7 +76,7 @@ static void tick(Peer *p){
 }
 static void run(Peer *p,unsigned ms){for(unsigned i=0;i<ms;i++)tick(p);}
 static void init(Peer *p){
-  memset(p,0,sizeof(*p));p->delay=1;p->guard=500;p->max_speed=87;p->now=1;
+  memset(p,0,sizeof(*p));p->delay=1;p->guard=500;p->max_speed=87;p->bus_voltage=2400;p->now=1;
   static const DriveBusOps ops={send,ready,errors};drive_init(&p->d,&ops,p,p->now);
 }
 static void boot(Peer *p){init(p);run(p,350);assert(p->d.view.state==MQ_DRIVE_STOPPED);assert(p->d.view.stop_verified&&p->d.view.guard_valid);}
@@ -86,6 +86,17 @@ static void test_boot_arm_refresh(void){
   run(&p,12);assert(p.d.view.applied_generation==generation);assert(p.d.view.applied_left==2&&p.d.view.applied_right==-2);
   uint32_t count=p.target_writes;run(&p,320);assert(p.target_writes>=count+3);assert(!p.d.view.error);assert(p.max_speed_gap<=55);
   puts("PASS drive boot, ARM object/readback, target generation, local refresh");
+}
+static void test_arm_bus_voltage_boundary(void){
+  const uint32_t voltages[]={1999,2000,3252,3300,3301};
+  const bool accepted[]={false,true,true,true,false};
+  for(unsigned i=0;i<sizeof(voltages)/sizeof(voltages[0]);i++){
+    Peer p;boot(&p);p.bus_voltage=voltages[i];
+    drive_ops()->arm(&p.d,p.now);run(&p,220);
+    if(accepted[i])assert(p.d.view.state==MQ_DRIVE_ENABLED&&!p.d.view.error);
+    else assert(p.d.view.state!=MQ_DRIVE_ENABLED&&p.d.view.error==DRIVE_ERR_CAN&&!p.target);
+  }
+  puts("PASS actual ARM accepts 20.00/32.52/33.00 V and rejects 19.99/33.01 V");
 }
 static void test_stop_sampling_and_inflight(void){
   Peer p;armed(&p);drive_ops()->target(&p.d,2,-2,p.now);run(&p,70);
@@ -251,7 +262,7 @@ static void test_counters_and_required_sources(void){
   puts("PASS ECR counters, immediate bus-off, optional position and required current freshness");
 }
 int main(void){
-  test_boot_arm_refresh();test_stop_sampling_and_inflight();test_stop_requires_two_consecutive_zero_samples();test_stop_stationary_window();
+  test_boot_arm_refresh();test_arm_bus_voltage_boundary();test_stop_sampling_and_inflight();test_stop_requires_two_consecutive_zero_samples();test_stop_stationary_window();
   test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
   test_counters_and_required_sources();
