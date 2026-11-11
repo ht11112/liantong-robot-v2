@@ -171,6 +171,16 @@ class CandidateTests(unittest.TestCase):
                     result = gate.add(pose, odom, now-.1, now)
                 self.assertIsNone(result)
 
+    def test_fresh_delayed_candidates_accumulate_by_source_time(self):
+        gate = _AmclCandidates()
+        odom = dict(x=0., y=0., yaw=0.)
+        for index in range(3):
+            source = 10. + index*.2
+            pose = mapped_pose(odom, dict(x=1., y=2., yaw=.3), round(source*NS))
+            result = gate.add(pose, odom, source, source+.301)
+            self.assertEqual(len(gate.rows), index+1)
+            self.assertEqual(result is not None, index == 2)
+
     def test_amcl_history_age_configuration_does_not_change_obstacle_default(self):
         source = exchange(1, 100, 10.021)
         source.received_at = 10.32

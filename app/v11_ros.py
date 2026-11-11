@@ -356,7 +356,8 @@ class _AmclCandidates:
             self.rows.clear()
             self.reason = 'AMCL uncertainty exceeds 0.10 m / 5 degrees'
             return None
-        if self.rows and now-self.rows[-1][0] >= AMCL_MAX_AGE_S:
+        # History continuity uses source times; transport latency is checked separately.
+        if self.rows and source-self.rows[-1][0] >= AMCL_MAX_AGE_S:
             self.rows.clear()
         alignment = _map_odom_alignment(map_pose, odom_pose)
         self.rows.append((source, alignment))
