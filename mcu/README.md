@@ -1,4 +1,10 @@
-# 第六分支：MCU 里程计恢复（V12）
+# MCU V13 引导直行
+
+第十分支增加类型 3 的引导 MOVE 和运行中的 `STEER` 差速修正。修正绑定任务、段索引及真实 MCU 测量时刻，单位为 milliRPM。整数 RPM 驱动通过 100 毫秒目标槽累计小数余量，仅降低内侧轮。修正基础样本达到 500 毫秒时按错误 9 停车。配套使用 V13 RK 主站与 `--ekf-move-correction`。见[V13 协议](docs/PROTOCOL_V13.md)及[RK 闭环说明](../docs/EKF_MOVE_CONTROL.md)。
+
+5/3/3 RPM 的候选构建遵守 32 KiB 应用区，交付为离线验证。输出文件为 `mcu-v13.bin`、`mcu-v13.elf` 和 `mcu-v13.map`。
+
+## 第六分支里程计恢复的沿革（V12）
 
 本轮修复 CAN 收包跨毫秒时的新鲜度误判、启动原点建立过早，以及静止短窗口内连续无效采样后无法恢复的问题。配套使用第七分支 `feature/rk-obstacle-fixes` 的 RK；第四分支 `feature/rk-task-renewal` 不变。具体原因、离线验证、限制及新版 MCU + 第七分支 RK 的验收步骤见 [里程计恢复说明](docs/ODOM_RECOVERY.md)。
 

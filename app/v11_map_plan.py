@@ -12,6 +12,8 @@ from pathlib import Path
 import shlex
 import struct
 
+from v13_move_control import LineReference, MoveController
+
 
 BODY_LENGTH_M = .35
 BODY_WIDTH_M = .40
@@ -67,11 +69,11 @@ def _queue(segments):
     # The RK service loads mcu/tools directly; repository unit tests also
     # support its namespace-package path. Use the actual shared wire codec.
     try:
-        from mcu_v10 import canonical_segments
+        from mcu_v11 import canonical_segments
     except ModuleNotFoundError as exc:
-        if exc.name != 'mcu_v10':
+        if exc.name != 'mcu_v11':
             raise
-        from mcu.tools.mcu_v10 import canonical_segments
+        from mcu.tools.mcu_v11 import canonical_segments
     try:
         packed, crc, _ = canonical_segments({'segments': segments})
     except (ValueError, TypeError, OverflowError) as exc:
@@ -79,11 +81,13 @@ def _queue(segments):
     canonical = []
     for index, raw in enumerate(packed):
         kind, value = struct.unpack('<If', raw)
-        if kind == 1:
+        if kind in (1, 3):
             minimum = GOAL_TOLERANCE_M if index + 1 == len(segments) else MOVE_TOLERANCE_M
             if value <= _float32(minimum):
                 raise PlanningError('MOVE distance is below its termination tolerance')
             canonical.append(dict(kind='move', distance_m=value))
+            if kind == 3:
+                canonical[-1]['guided'] = True
         else:
             if abs(value) <= _float32(TURN_TOLERANCE_RAD):
                 raise PlanningError('TURN angle is below its termination tolerance')
@@ -436,12 +440,19 @@ class GridMap:
         costmap = _Costmap(self, obstacle_cells=obstacle_cells)
         x, y = self._to_grid(pose['x'], pose['y'])
         yaw = pose['yaw'] - self.origin[2]
-        for segment in plan['segments'][index:]:
+        for segment_index, segment in enumerate(plan['segments'][index:], index):
             a = x, y
             if segment['kind'] == 'turn':
                 turn = segment['angle_rad']
                 yaw += math.copysign(max(0., abs(turn)-progress), turn)
                 clear = costmap.turn(a)
+            elif segment.get('guided'):
+                remainder = self._guided_remaining_sweep(costmap, a, yaw,
+                    LineReference.from_plan(plan, segment_index), progress)
+                if remainder is None:
+                    return True
+                (x, y), yaw = remainder
+                clear = True
             else:
                 length = max(0., segment['distance_m']-progress) / self.resolution
                 x, y = x + length*math.cos(yaw), y + length*math.sin(yaw)
@@ -450,6 +461,31 @@ class GridMap:
                 return True
             progress = 0.
         return False
+
+    def _guided_remaining_sweep(self, costmap, point, yaw, line, progress):
+        start = self._to_grid(line.x, line.y)
+        line_yaw = line.yaw - self.origin[2]
+        c, s = math.cos(line_yaw), math.sin(line_yaw)
+        dx, dy = point[0]-start[0], point[1]-start[1]
+        along, cross = c*dx+s*dy, -s*dx+c*dy
+        length = line.length_m / self.resolution
+        end = start[0]+length*c, start[1]+length*s
+        if not costmap.sweep(point, point, yaw=yaw):
+            return None
+        if (abs(cross)*self.resolution > MoveController.cross_deadband_m
+                or abs(_wrap(yaw-line_yaw)) > MoveController.heading_deadband_rad):
+            joined = min(length, max(0., along, progress/self.resolution)
+                         + MoveController.lookahead_m/self.resolution)
+            connector = start[0]+joined*c, start[1]+joined*s
+            # 纠偏只预测有限接回段，不能把 TURN 残差外推到整条长直线。
+            # 接回两端保守使用完整 TURN 圆盘；仍沿用同一车体及15cm净距。
+            if (not costmap.turn(point) or not costmap.sweep(point, connector)
+                    or not costmap.turn(connector)):
+                return None
+            point = connector
+        if not costmap.sweep(point, end, yaw=line_yaw):
+            return None
+        return end, line_yaw
 
     def resume_route(self, pose, plan, index, progress, *, obstacle_cells=()):
         """Build a queue along the original route, or return None if its remainder is blocked."""

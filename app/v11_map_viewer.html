@@ -96,6 +96,12 @@
             <div class="kv"><dt>车体 Z 轴（偏航）</dt><dd class="mono" id="imu-z">—</dd></div>
             <div class="kv" id="ekf-heading-row" hidden><dt>EKF 融合航向角（局部）</dt><dd class="mono" id="ekf-heading">等待数据</dd></div>
           </dl>
+          <dl id="move-control-data" hidden>
+            <div class="kv"><dt>直行纠偏</dt><dd id="move-control-phase">等待直行段</dd></div>
+            <div class="kv"><dt>航向误差</dt><dd class="mono" id="move-heading-error">—</dd></div>
+            <div class="kv"><dt>横向偏差</dt><dd class="mono" id="move-cross-error">—</dd></div>
+            <div class="kv"><dt>轮间差速给定</dt><dd class="mono" id="move-differential">—</dd></div>
+          </dl>
           <div class="actions" id="ekf-turn-controls" style="margin-top:10px" hidden>
             <button id="ekf-turn-left" type="button" disabled>EKF 左转 90°</button>
             <button id="ekf-turn-right" type="button" disabled>EKF 右转 90°</button>
@@ -351,6 +357,16 @@
       const heading=ekf?.fresh===true && finite(ekf.yaw_rad)?`${(ekf.yaw_rad*180/Math.PI).toFixed(2)}°`:
         ekfAge?'数据过期':'等待数据';
       $('ekf-heading').textContent=online?heading+ekfAge:'连接断开';
+      const moveControl=state.move_control;
+      $('move-control-data').hidden=moveControl?.enabled!==true;
+      $('move-control-phase').textContent=online?(moveControl?.message||'等待直行段'):'连接断开';
+      const moveFresh=online && ekf?.fresh===true && moveControl?.phase==='active';
+      $('move-heading-error').textContent=moveFresh && finite(moveControl.heading_error_rad)
+        ? `${(moveControl.heading_error_rad*180/Math.PI).toFixed(2)}°`:'—';
+      $('move-cross-error').textContent=moveFresh && finite(moveControl.cross_track_m)
+        ? `${(moveControl.cross_track_m*100).toFixed(2)} cm`:'—';
+      $('move-differential').textContent=moveFresh && finite(moveControl.differential_millirpm)
+        ? `${(moveControl.differential_millirpm/1000).toFixed(3)} RPM`:'—';
       $('ekf-turn-controls').hidden=!hasEkfTurn;
       const canEkfTurn=hasEkfTurn && online && Boolean(state.csrf_token) && !action && !stopping
         && state.can_ekf_turn===true;

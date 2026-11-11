@@ -39,6 +39,7 @@ size_t wire_telemetry(const MQ *q,uint8_t *o,uint32_t seq,uint32_t pub,
   if(q->committed)flags|=WIRE_COMMITTED;
   if(q->has_started)flags|=WIRE_STARTED;
   if(ack_valid)flags|=WIRE_ACK_VALID;
+  if(mq_steer_active(q,pub))flags|=WIRE_STEER_VALID;
   p64(o+6,q->boot_id);p32(o+14,q->odom.epoch);p32(o+18,seq);p32(o+22,pub);
   p32(o+26,q->odom.sample_sequence);p32(o+30,q->odom.measurement_tick_ms);
   p64(o+34,q->task_id);p32(o+42,ack);o[46]=result;o[47]=(uint8_t)q->state;
@@ -88,10 +89,10 @@ static void reject(Wire *w,uint32_t req,MQResult result,uint32_t now){
   /* A malformed or stale STOP must not displace a pending valid reply. */
   if(!w->reply_pending)stage_reply(w,req,result,0,now);
 }
-/* V12 帧经身份、顺序和内容校验后分发给任务队列状态机。 */
+/* V13 帧经身份、顺序和内容校验后分发给任务队列状态机。 */
 static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
   MQ *q=w->queue;uint8_t op=f[3];bool stop=op==WIRE_STOP;MQResult r;
-  if(n<36u||op<WIRE_BEGIN||op>WIRE_RENEW)return;
+  if(n<36u||op<WIRE_BEGIN||op>WIRE_STEER)return;
   /* The master waits for a reply before sending another ordinary request.
      STOP still runs while a reply waits or its transmit is in flight. */
   if(!stop&&(w->reply_pending||!w->io.tx_ready(w->user)))return;
@@ -122,7 +123,7 @@ static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
   }
   if(w->has_request && (int32_t)(req-w->last_request)<=0){reject(w,req,MQ_ORDER,now);return;}
   if(!stop && epoch!=q->odom.epoch){reject(w,req,MQ_IDENTITY,now);return;}
-  if(n!=((op==WIRE_BEGIN||op==WIRE_APPEND)?46u:36u)){
+  if(n!=((op==WIRE_BEGIN||op==WIRE_APPEND)?46u:op==WIRE_STEER?44u:36u)){
     reject(w,req,MQ_INVALID,now);return;
   }
   switch(op){
@@ -141,6 +142,7 @@ static void dispatch(Wire *w,const uint8_t *f,uint16_t n,uint32_t now){
     case WIRE_STOP:mq_stop(q,now);r=MQ_OK;break;
     case WIRE_RESET:r=mq_reset_odom(q,now);break;
     case WIRE_RENEW:r=mq_renew(q,task,now);break;
+    case WIRE_STEER:r=mq_steer(q,task,r16(f+34),(int16_t)r16(f+36),r32(f+38),now);break;
     default:r=MQ_OK;break;
   }
   /* Long operations (queue CRC/reset) remain outside the IRQ mask. If an IRQ
@@ -158,7 +160,7 @@ static void consume(Wire *w,uint8_t byte,uint32_t now){
   if(w->used==6u){
     uint16_t len=r16(w->frame+4);
     bool telemetry=w->frame[3]==WIRE_TELEMETRY&&len==WIRE_TELEMETRY_SIZE-8u;
-    bool known_version=w->frame[2]==WIRE_VERSION||w->frame[2]==11u||w->frame[2]==10u;
+    bool known_version=w->frame[2]==WIRE_VERSION||w->frame[2]==12u||w->frame[2]==11u||w->frame[2]==10u;
     if(!known_version||(!telemetry&&(len<28u||len>WIRE_COMMAND_MAX-8u))){w->used=0;return;}
     w->wanted=(uint16_t)(len+8u);
   }

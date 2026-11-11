@@ -1,4 +1,4 @@
-"""Single V12 serial process and bounded shared feedback; importing performs no IO."""
+"""Single V13 serial process and bounded shared feedback; importing performs no IO."""
 
 from contextlib import closing, contextmanager
 import math
@@ -293,6 +293,8 @@ def _worker_main(device, reply_timeout, cache, commands, results, stop_results,
                                 result = master.start(payload)
                             elif operation == 'renew':
                                 result = master.renew(payload)
+                            elif operation == 'steer':
+                                result = master.steer(*payload)
                             else:
                                 raise ValueError('Unknown feedback operation')
                             results.put(identifier, True, result)
@@ -495,6 +497,10 @@ class FeedbackWorker:
 
     def renew(self, task, *, revision=None):
         return self._submit('renew', task, revision, self.reply_timeout + STOP_PROOF_TIMEOUT_S + 2.)
+
+    def steer(self, task, index, bias_millirpm, basis_tick, *, revision=None):
+        return self._submit('steer', (task, index, bias_millirpm, basis_tick), revision,
+                            self.reply_timeout + STOP_PROOF_TIMEOUT_S + 2.)
 
     def request_stop(self):
         self._check_owner()

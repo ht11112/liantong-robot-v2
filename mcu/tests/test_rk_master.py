@@ -1,6 +1,6 @@
-"""Offline tests for V12 codec, sequencing, polling and operator boundaries."""
+"""Offline tests for V13 codec, sequencing, polling and operator boundaries."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import os
@@ -9,6 +9,7 @@ import struct
 import sys
 import threading
 import unittest
+import zlib
 from unittest.mock import patch
 
 
@@ -97,7 +98,7 @@ class FakePort:
 class CodecTests(unittest.TestCase):
     def test_discovery_and_regular_wire_layout(self):
         discovery = v11.command(v11.QUERY)
-        self.assertEqual(discovery[:6], b'\xa5\x5a\x0c\x07\x1c\x00')
+        self.assertEqual(discovery[:6], b'\xa5\x5a\x0d\x07\x1c\x00')
         self.assertEqual(discovery[6:34], bytes(28))
         self.assertEqual(len(discovery), 36)
         self.assertEqual(v11.crc16(discovery[2:-2]), int.from_bytes(discovery[-2:], 'little'))
@@ -112,7 +113,7 @@ class CodecTests(unittest.TestCase):
     def test_real_c_golden(self):
         log = os.environ.get('MQ_V11_CODEC_GOLDEN_LOG')
         if not log:
-            self.skipTest('Run the host C build to compare the actual V12 golden vector')
+            self.skipTest('Run the host C build to compare the actual V13 golden vector')
         lines = Path(log).read_text(encoding='utf-8').splitlines()
         line = next(line for line in lines if line.startswith('GOLDEN'))
         golden = json.loads(line.partition(' ')[2] if line.startswith('GOLDEN ') else line[line.index('{'):])
@@ -129,7 +130,7 @@ class CodecTests(unittest.TestCase):
         valid = telemetry()
         bad_crc = bytearray(valid)
         bad_crc[50] ^= 1
-        old_body = b'\x0b' + valid[3:-2]
+        old_body = b'\x0c' + valid[3:-2]
         old = valid[:2] + old_body + struct.pack('<H', v11.crc16(old_body))
         parser = v11.ReplyParser()
         self.assertEqual(list(parser.feed(b'noise' + old + bad_crc + telemetry(lease_remaining_ms=1) + valid[:50])), [])
@@ -155,6 +156,44 @@ class CodecTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Remove duration_s'):
             v11.QueuePlan.from_document({'segments': [{'kind': 'move', 'distance_m': .5}], 'duration_s': 1200})
 
+    def test_guided_move_uses_distinct_canonical_kind_and_crc(self):
+        document = dict(segments=[dict(kind='move', distance_m=.5, guided=True),
+                                  dict(kind='turn', angle_rad=-1.5),
+                                  dict(kind='move', distance_m=.75, guided=False)])
+        segments, checksum, duration = v11.canonical_segments(document)
+        expected = [struct.pack('<If', 3, .5), struct.pack('<If', 2, -1.5), struct.pack('<If', 1, .75)]
+        self.assertEqual(segments, expected)
+        self.assertEqual(checksum, zlib.crc32(b''.join(expected)))
+        self.assertEqual(duration, 1200000)
+        self.assertEqual(v11.QueuePlan.from_document(document).segments, tuple(expected))
+        for segment in (dict(kind='move', distance_m=.5, guided=1),
+                        dict(kind='move', distance_m=.5, guided='true'),
+                        dict(kind='turn', angle_rad=1., guided=True)):
+            with self.subTest(segment=segment), self.assertRaisesRegex(ValueError, 'guided'):
+                v11.canonical_segments(dict(segments=[segment]))
+
+    def test_steer_wire_layout_uses_signed_millirpm_and_wraparound_basis(self):
+        packet = v11.command(v11.STEER, BOOT, 7, 33, TASK, struct.pack('<HhI', 127, -1250, 0xffffffff))
+        self.assertEqual(len(packet), 44)
+        self.assertEqual(packet[:6], b'\xa5\x5a\x0d\x09\x24\x00')
+        self.assertEqual(struct.unpack_from('<HhI', packet, 34), (127, -1250, 0xffffffff))
+        self.assertEqual(v11.crc16(packet[2:-2]), int.from_bytes(packet[-2:], 'little'))
+        self.assertEqual(v11.decode_telemetry(telemetry(flags=259 | v11.STEER_VALID)).flags, 771)
+        with self.assertRaises(ValueError):
+            v11.decode_telemetry(telemetry(flags=259 | 1024))
+        for extra in (b'', bytes(10)):
+            with self.assertRaises(ValueError):
+                v11.command(v11.STEER, BOOT, 7, 33, TASK, extra)
+
+
+def active_move_response(index, kind, request, task):
+    tick = 1000 + index * 20
+    return [(.014, telemetry(publication_sequence=index + 1, publication_tick_ms=tick,
+                             measurement_tick_ms=tick - 5, sample_sequence=index + 1,
+                             ack_request=request, accepted_request_watermark=request, task=TASK,
+                             state=4, count=1, flags=3 | v11.ACK_VALID | v11.EXECUTING,
+                             lease_remaining_ms=30000))]
+
 
 class MasterTests(unittest.TestCase):
     def make_master(self, response=None):
@@ -162,6 +201,77 @@ class MasterTests(unittest.TestCase):
         port = FakePort(clock, response)
         master = v11.RkMaster(port, clock=clock, sleep=clock.sleep)
         return master, port
+
+    def test_steer_fractional_bias_and_validation_use_one_real_transaction(self):
+        master, port = self.make_master(active_move_response)
+        master.discover()
+        reply = master.steer(TASK, 0, 1250, 995)
+        self.assertEqual(reply.opcode, v11.STEER)
+        self.assertEqual(struct.unpack_from('<HhI', port.writes[-1][1], 34), (0, 1250, 995))
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STEER])
+        for bias in (-2001, 2001, True, 1.25):
+            with self.subTest(bias=bias), self.assertRaises(ValueError):
+                master.steer(TASK, 0, bias, 995)
+        for index, tick in ((128, 995), (True, 995), (0, -1), (0, 0x100000000), (0, True)):
+            with self.subTest(index=index, tick=tick), self.assertRaises(ValueError):
+                master.steer(TASK, index, 1000, tick)
+        with self.assertRaisesRegex(ValueError, 'exact active MOVE'):
+            master.steer(TASK + 1, 0, 1000, 995)
+        self.assertEqual(len(port.writes), 2)
+
+    def test_late_steer_reply_times_out_from_actual_send_without_retry(self):
+        def response(index, kind, request, task):
+            rows = active_move_response(index, kind, request, task)
+            return [(delay if kind != v11.STEER else .101, frame) for delay, frame in rows]
+
+        master, port = self.make_master(response)
+        master.discover()
+        with self.assertRaises(v11.ReplyTimeout) as fault:
+            master.steer(TASK, 0, 500, 995)
+        self.assertEqual(fault.exception.details['sent_at'], port.writes[-1][0])
+        self.assertGreaterEqual(master.clock() - port.writes[-1][0], .100)
+        self.assertTrue(master.failed)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STEER])
+
+    def test_rejected_steer_reply_is_retained_without_resending(self):
+        def response(index, kind, request, task):
+            if kind != v11.STEER:
+                return active_move_response(index, kind, request, task)
+            return [(.014, telemetry(publication_sequence=index + 1, publication_tick_ms=1020,
+                                     measurement_tick_ms=1015, sample_sequence=2,
+                                     ack_request=request, accepted_request_watermark=request,
+                                     ack_result=4, task=TASK, state=4, count=1,
+                                     flags=3 | v11.ACK_VALID | v11.EXECUTING, lease_remaining_ms=30000))]
+
+        master, port = self.make_master(response)
+        master.discover()
+        with self.assertRaises(v11.Rejected) as rejected:
+            master.steer(TASK, 0, -750, 995)
+        self.assertIs(master.latest, rejected.exception.exchange)
+        self.assertFalse(master.failed)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STEER])
+
+    def test_stop_during_cadence_cancels_steer_before_actual_write(self):
+        clock = FakeClock()
+        port = FakePort(clock, active_move_response)
+        cancelled = [False]
+
+        @contextmanager
+        def guard(kind):
+            if kind == v11.STEER and cancelled[0]:
+                raise v11.RequestCancelled('STOP precedes STEER')
+            yield
+
+        def sleep(seconds):
+            cancelled[0] = True
+            clock.sleep(seconds)
+
+        master = v11.RkMaster(port, clock=clock, sleep=sleep, send_guard=guard)
+        master.discover()
+        with self.assertRaises(v11.RequestCancelled):
+            master.steer(TASK, 0, 1000, 995)
+        self.assertFalse(master.failed)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY])
 
     def test_discovery_resumes_watermark_and_wraps(self):
         def response(index, kind, request, task):
@@ -573,7 +683,7 @@ class MasterTests(unittest.TestCase):
         reply = master.renew(TASK)
         self.assertEqual(reply.status.lease_remaining_ms, 30000)
         packet = port.writes[-1][1]
-        self.assertEqual(packet[:6], b'\xa5\x5a\x0c\x08\x1c\x00')
+        self.assertEqual(packet[:6], b'\xa5\x5a\x0d\x08\x1c\x00')
         self.assertEqual(len(packet), 36)
         self.assertEqual(struct.unpack_from('<QIIIQ', packet, 6), (BOOT, 7, 1, 0, TASK))
         self.assertEqual([frame[3] for _, frame in port.writes], [v11.QUERY, v11.RENEW])

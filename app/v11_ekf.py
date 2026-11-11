@@ -1,6 +1,8 @@
 """Optional ROS1 wheel/gyro EKF output, independent of the navigation pose."""
 
 import math
+from bisect import bisect_left
+from collections import deque
 from pathlib import Path
 import subprocess
 import threading
@@ -52,6 +54,24 @@ def _valid_estimate(message):
         and abs(math.hypot(*quaternion) - 1.) < .005)
 
 
+def pose_at_stamp(history, stamp_ns):
+    index = bisect_left([row[0] for row in history], stamp_ns)
+    if index < len(history) and history[index][0] == stamp_ns:
+        return dict(zip(('x', 'y', 'yaw'), history[index][1:]))
+    if index == 0 or index == len(history):
+        return None
+    before, after = history[index-1], history[index]
+    interval = after[0] - before[0]
+    if interval > SOURCE_MAX_AGE_S * NS:
+        return None
+    fraction = (stamp_ns - before[0]) / interval
+    yaw_step = math.atan2(math.sin(after[3]-before[3]), math.cos(after[3]-before[3]))
+    yaw = before[3] + fraction * yaw_step
+    return dict(x=before[1] + fraction*(after[1]-before[1]),
+                y=before[2] + fraction*(after[2]-before[2]),
+                yaw=math.atan2(math.sin(yaw), math.cos(yaw)))
+
+
 class RosEkfOdometry:
     """Publish fresh wheel and gyro measurements, and gate the private EKF estimate."""
 
@@ -72,6 +92,10 @@ class RosEkfOdometry:
         self.wheel = None
         self.imu = None
         self.last_output = None
+        self.last_pose = None
+        self.last_yaw_rate = None
+        self.last_linear_speed = None
+        self.pose_history = deque(maxlen=64)
         self.output_floor_ns = 0
         self.handles = []
         self.child = None
@@ -97,6 +121,7 @@ class RosEkfOdometry:
 
     def _clear_wheel(self):
         self.wheel = None
+        self.pose_history.clear()
         self.output_floor_ns = self.rospy.Time.now().to_nsec()
 
     def invalidate_history(self):
@@ -197,7 +222,16 @@ class RosEkfOdometry:
             fresh = (stamp_ns >= self.output_floor_ns and _fresh(now, stamp_ns)
                      and _fresh(mono, receipt_ns) and self._inputs_fresh(now, mono))
             return dict(fresh=fresh, age_ms=age / 1_000_000 if age >= 0 else None,
-                        yaw_rad=yaw_rad if fresh else None)
+                        yaw_rad=yaw_rad if fresh else None,
+                        pose=dict(self.last_pose) if fresh else None,
+                        angular_z_rad_s=self.last_yaw_rate if fresh else None,
+                        linear_x_m_s=self.last_linear_speed if fresh else None)
+
+    def pose_at(self, stamp_ns):
+        with self.lock:
+            if not (self.ekf_snapshot() or {}).get('fresh'):
+                return None
+            return pose_at_stamp(tuple(self.pose_history), stamp_ns)
 
     def worker_snapshot(self):
         # Copy the data and every input deadline together. Parent reads must not
@@ -212,6 +246,7 @@ class RosEkfOdometry:
 
             imu_deadline = deadline(self.imu, SOURCE_MAX_AGE_S)
             return dict(written_mono=mono / NS, imu=self.imu_snapshot(), ekf=self.ekf_snapshot(),
+                        pose_history=tuple(self.pose_history),
                         imu_valid_until_mono=imu_deadline,
                         ekf_valid_until_mono=min(imu_deadline, deadline(self.wheel, WHEEL_MAX_AGE_S),
                                                  deadline(self.last_output, SOURCE_MAX_AGE_S)))
@@ -233,6 +268,11 @@ class RosEkfOdometry:
             yaw_rad = math.atan2(2. * (q.w*q.z + q.x*q.y), 1. - 2. * (q.y*q.y + q.z*q.z))
             self.filtered_pub.publish(message)
             self.last_output = stamp_ns, mono, yaw_rad
+            position = message.pose.pose.position
+            self.last_pose = dict(x=position.x, y=position.y, yaw=yaw_rad)
+            self.last_yaw_rate = message.twist.twist.angular.z
+            self.last_linear_speed = message.twist.twist.linear.x
+            self.pose_history.append((stamp_ns, position.x, position.y, yaw_rad))
 
     def close(self):
         with self.lock:

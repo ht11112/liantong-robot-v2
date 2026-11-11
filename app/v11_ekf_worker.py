@@ -4,7 +4,7 @@ import multiprocessing as mp
 import pickle
 import time
 
-from v11_ekf import RosEkfOdometry
+from v11_ekf import RosEkfOdometry, pose_at_stamp
 
 
 class _StopFlag:
@@ -138,7 +138,7 @@ class EkfWorker:
             self.closed.set()
             raise
 
-    def _snapshot(self, kind):
+    def _snapshot(self, kind, include_history=False):
         _, record = self.snapshots.read()
         if record is None or record[kind] is None:
             return None
@@ -152,6 +152,10 @@ class EkfWorker:
                               and now <= record[kind + '_valid_until_mono'])
         if kind == 'ekf' and not value['fresh']:
             value['yaw_rad'] = None
+            value['pose'] = value['angular_z_rad_s'] = None
+            value['linear_x_m_s'] = None
+        if include_history:
+            value['pose_history'] = record.get('pose_history', ())
         return value
 
     def imu_snapshot(self):
@@ -159,6 +163,12 @@ class EkfWorker:
 
     def ekf_snapshot(self):
         return self._snapshot('ekf')
+
+    def pose_at(self, stamp_ns):
+        snapshot = self._snapshot('ekf', include_history=True)
+        if snapshot is None or not snapshot['fresh']:
+            return None
+        return pose_at_stamp(snapshot['pose_history'], stamp_ns)
 
     def close(self):
         self.closed.set()

@@ -1,4 +1,4 @@
-"""RK master for the V12 request/reply link. Import does not access serial."""
+"""RK master for the V13 request/reply link. Import does not access serial."""
 
 import argparse
 from collections import Counter
@@ -11,13 +11,20 @@ import statistics
 import struct
 import threading
 import time
+import zlib
 
-from mcu_v10 import BAUD, canonical_segments, crc16
+try:
+    from mcu_v10 import BAUD, canonical_segments as _standard_canonical_segments, crc16
+except ModuleNotFoundError as exc:
+    if exc.name != 'mcu_v10':
+        raise
+    from .mcu_v10 import BAUD, canonical_segments as _standard_canonical_segments, crc16
 
 
-# 文件名沿用 v11，实际请求与回复的线上协议版本为 V12。
-VERSION = 12
-BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, RENEW, TELEMETRY = 1, 2, 3, 4, 5, 6, 7, 8, 128
+# 文件名沿用 v11，实际请求与回复的线上协议版本为 V13。
+VERSION = 13
+BEGIN, APPEND, COMMIT, START, STOP, RESET, QUERY, RENEW, STEER, TELEMETRY = 1, 2, 3, 4, 5, 6, 7, 8, 9, 128
+MOVE_GUIDED = 3
 LEASE_MS = 30000
 TELEMETRY_SIZE = 110
 PERIOD_S = .020
@@ -26,6 +33,7 @@ START_REPLY_TIMEOUT_S = 1.0
 MASK32 = 0xFFFFFFFF
 ODOM_INITIALIZED, ODOM_VALID, EXECUTING = 1, 2, 4
 STOP_CONFIRMED, RX_FAULT, COMMITTED, STARTED, ACK_VALID = 16, 32, 64, 128, 256
+STEER_VALID = 512
 READY = 2
 LEASE_STATES = range(3, 7)  # ARMING, MOVE, TURN, BARRIER
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -34,7 +42,8 @@ STATUS = struct.Struct('<QIIIIIQIBBHHHffffffIIhhHIIII')
 
 
 def command(kind, boot=0, epoch=0, request=0, task=0, extra=b''):
-    if not BEGIN <= kind <= RENEW or len(extra) != (10 if kind in (BEGIN, APPEND) else 0):
+    expected = 10 if kind in (BEGIN, APPEND) else 8 if kind == STEER else 0
+    if not BEGIN <= kind <= STEER or len(extra) != expected:
         raise ValueError('Invalid command opcode or payload length')
     if request == 0:
         if kind != QUERY or boot or epoch or task:
@@ -43,6 +52,17 @@ def command(kind, boot=0, epoch=0, request=0, task=0, extra=b''):
         raise ValueError('Regular requests require current boot, epoch and a nonzero request')
     body = struct.pack('<BBHQIIIQ', VERSION, kind, 28 + len(extra), boot, epoch, request, 0, task) + extra
     return b'\xa5\x5a' + body + struct.pack('<H', crc16(body))
+
+
+def canonical_segments(document):
+    segments, _, duration_ms = _standard_canonical_segments(document)
+    for index, segment in enumerate(document['segments']):
+        guided = segment.get('guided', False)
+        if type(guided) is not bool or guided and segment['kind'] != 'move':
+            raise ValueError('guided must be boolean and only enables MOVE guidance')
+        if guided:
+            segments[index] = struct.pack('<I', MOVE_GUIDED) + segments[index][4:]
+    return segments, zlib.crc32(b''.join(segments)), duration_ms
 
 
 @dataclass(frozen=True)
@@ -88,25 +108,25 @@ class Telemetry:
 
 def decode_telemetry(raw):
     if len(raw) != TELEMETRY_SIZE or raw[:6] != HEADER:
-        raise ValueError('Invalid V12 reply header')
+        raise ValueError('Invalid V13 reply header')
     if crc16(raw[2:108]) != struct.unpack_from('<H', raw, 108)[0]:
-        raise ValueError('Invalid V12 reply CRC')
+        raise ValueError('Invalid V13 reply CRC')
     return decode_status(raw)
 
 
 def decode_status(raw):
     value = Telemetry(*STATUS.unpack_from(raw, 6))
-    if (not value.boot or not value.epoch or value.state > 9 or value.flags & ~511
+    if (not value.boot or not value.epoch or value.state > 9 or value.flags & ~1023
             or value.ack_result > 8 or value.lease_remaining_ms > LEASE_MS
             or value.lease_remaining_ms and (not value.flags & EXECUTING or value.state not in LEASE_STATES)
             or value.flags & ODOM_VALID and not value.source_valid
             or not all(math.isfinite(v) for v in (value.progress, value.x, value.y, value.yaw, value.v, value.w))
             or abs(value.yaw) > math.pi + .000001):
-        raise ValueError('Inconsistent V12 reply metadata')
+        raise ValueError('Inconsistent V13 reply metadata')
     return value
 
 
-# 按帧头、长度和 CRC 从串口字节流提取完整 V12 回复。
+# 按帧头、长度和 CRC 从串口字节流提取完整 V13 回复。
 class ReplyParser:
     def __init__(self):
         self.buffer = bytearray()
@@ -168,7 +188,7 @@ class QueuePlan:
     @classmethod
     def from_document(cls, document):
         if 'duration_s' in document:
-            raise ValueError('Remove duration_s from V12 queues. Task time is governed by the renewable lease.')
+            raise ValueError('Remove duration_s from V13 queues. Task time is governed by the renewable lease.')
         segments, checksum, _ = canonical_segments(document)
         return cls(tuple(segments), checksum)
 
@@ -323,7 +343,7 @@ class RkMaster:
                 if trace is not None:
                     trace('timeout', request, self.clock())
                 return None
-            raise ReplyTimeout('Timed out without a matching V12 reply', exchange, details=details)
+            raise ReplyTimeout('Timed out without a matching V13 reply', exchange, details=details)
         except RequestCancelled:
             raise
         except Rejected:
@@ -411,6 +431,23 @@ class RkMaster:
             if reply.status.task != task:
                 self.failed = True
                 raise LinkError('RENEW ACK did not identify the current task', reply)
+            return reply
+
+    def steer(self, task, index, bias_millirpm, basis_tick):
+        if (type(task) is not int or not 0 < task <= UINT64_MAX
+                or type(index) is not int or not 0 <= index < 128
+                or type(bias_millirpm) is not int or not -2000 <= bias_millirpm <= 2000
+                or type(basis_tick) is not int or not 0 <= basis_tick <= MASK32):
+            raise ValueError('STEER requires a task, segment index, signed millirpm bias and uint32 basis tick')
+        with self.lock:
+            value = self.latest.status if self.latest else None
+            if (value is None or value.task != task or value.index != index or value.state != 4
+                    or not value.flags & EXECUTING or not value.lease_remaining_ms):
+                raise ValueError('STEER requires the exact active MOVE task and segment')
+            reply = self._exchange(STEER, task=task, extra=struct.pack('<HhI', index, bias_millirpm, basis_tick))
+            if reply.status.task != task:
+                self.failed = True
+                raise LinkError('STEER ACK did not identify the current task', reply)
             return reply
 
     # 先取得 STOP 应答，再等待应答之后的新鲜实测零速与停车确认。

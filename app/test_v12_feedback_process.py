@@ -15,10 +15,36 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from v12_feedback_worker import FeedbackWorker
-from feedback_test_support import simulated_port
-from mcu_v11 import APPEND, BEGIN, COMMIT, PERIOD_S, QUERY, STOP, LinkError, decode_telemetry
+from feedback_test_support import SimulatedPort, simulated_port
+from mcu_v11 import (APPEND, BEGIN, COMMIT, HEADER, PERIOD_S, QUERY, STEER, STEER_VALID, STATUS,
+                     STOP, LinkError, Rejected, command, crc16, decode_telemetry)
+import struct
 from v11_map_plan import load_map
 from v11_ros import NS, OdomHistory
+
+
+class GuidedSimulatedPort(SimulatedPort):
+    def write(self, packet):
+        if packet[3] != STEER:
+            return super().write(packet)
+        index, bias, basis = struct.unpack_from('<HhI', packet, 34)
+        if len(packet) != 44 or index != 0 or not -2000 <= bias <= 2000:
+            raise AssertionError('Invalid STEER payload from production master')
+        boot, epoch, request = struct.unpack_from('<QII', packet, 6)
+        self.extra_flags |= STEER_VALID
+        super().write(command(QUERY, boot, epoch, request))
+        if self.profile == 'steer_rejected':
+            values = asdict(decode_telemetry(bytes(self.pending)))
+            values['ack_result'] = 4
+            body = HEADER[2:] + STATUS.pack(*values.values())
+            self.pending[:] = b'\xa5\x5a' + body + struct.pack('<H', crc16(body))
+        elif self.profile == 'steer_late':
+            self.ready_at = time.monotonic() + .15
+        return len(packet)
+
+
+def guided_simulated_port(device, reply_timeout):
+    return GuidedSimulatedPort(device, reply_timeout)
 
 
 class FeedbackProcessTests(unittest.TestCase):
@@ -57,6 +83,61 @@ class FeedbackProcessTests(unittest.TestCase):
             self.assertEqual(timestamps, sorted(timestamps))
             self.assertLessEqual(timestamps[-1], following['write_started'])
             self.assertEqual(following['request'], previous['request'] + 1)
+
+    def launch_guided(self, profile='normal'):
+        worker = FeedbackWorker(profile, port_factory=guided_simulated_port).launch()
+        self.addCleanup(worker.close)
+        worker.discover()
+        ack = worker.upload(dict(segments=[dict(kind='move', distance_m=.5, guided=True)]))[-1]
+        worker.start(ack.status.task)
+        return worker
+
+    def test_steer_ack_is_cached_with_fractional_bias_bytes(self):
+        worker = self.launch_guided()
+        before = worker.snapshot()['cursor']
+        latest = worker.latest.status
+        result = worker.steer(latest.task, 0, -1250, latest.measurement_tick_ms)
+        self.assertEqual(result.opcode, STEER)
+        self.assertTrue(result.status.flags & STEER_VALID)
+        self.assertEqual(struct.unpack_from('<HhI', bytes.fromhex(result.request_hex), 34),
+                         (0, -1250, latest.measurement_tick_ms))
+        replies = [reply for reply in worker.history_since(before)['exchanges'] if reply.opcode == STEER]
+        self.assertEqual([asdict(reply) for reply in replies], [asdict(result)])
+
+    def test_stop_cancels_queued_steer_before_any_steer_transmission(self):
+        worker = self.launch_guided()
+        latest = worker.latest.status
+        revision = worker.stop_revision
+        cursor = worker.transmissions_since(0)['cursor']
+        worker.request_stop()
+        with self.assertRaisesRegex(ValueError, 'cancelled by STOP'):
+            worker.steer(latest.task, 0, 1000, latest.measurement_tick_ms, revision=revision)
+        self.assertTrue(worker.stop()['stop_verified'])
+        self.assertFalse(worker.failed)
+        self.assertNotIn(STEER, [entry['opcode'] for entry in worker.transmissions_since(cursor)['entries']])
+
+    def test_steer_rejection_is_not_retried_and_keeps_feedback_connected(self):
+        worker = self.launch_guided('steer_rejected')
+        latest = worker.latest.status
+        cursor = worker.transmissions_since(0)['cursor']
+        with self.assertRaises(Rejected):
+            worker.steer(latest.task, 0, 750, latest.measurement_tick_ms)
+        entries = worker.transmissions_since(cursor)['entries']
+        self.assertEqual(sum(entry['opcode'] == STEER for entry in entries), 1)
+        self.assertFalse(worker.failed)
+        self.assertTrue(worker.snapshot()['connected'])
+
+    def test_late_steer_ack_closes_worker_without_resending(self):
+        worker = self.launch_guided('steer_late')
+        latest = worker.latest.status
+        cursor = worker.transmissions_since(0)['cursor']
+        with self.assertRaisesRegex(LinkError, 'matching V13 reply'):
+            worker.steer(latest.task, 0, 500, latest.measurement_tick_ms)
+        entries = worker.transmissions_since(cursor)['entries']
+        self.assertEqual(sum(entry['opcode'] == STEER for entry in entries), 1)
+        worker.process.join(2.)
+        self.assertTrue(worker.failed)
+        self.assertFalse(worker.snapshot()['connected'])
 
     def free_grid(self):
         folder = TemporaryDirectory()

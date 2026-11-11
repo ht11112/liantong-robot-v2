@@ -33,7 +33,7 @@ static uint16_t r16(const uint8_t*p){return (uint16_t)(p[0]|((uint16_t)p[1]<<8))
 static uint32_t r32(const uint8_t*p){return (uint32_t)r16(p)|((uint32_t)r16(p+2)<<16);}
 static void pf(uint8_t*p,float v){uint32_t n;memcpy(&n,&v,4);p32(p,n);}
 static unsigned command(uint8_t*b,uint8_t op,uint64_t boot,uint32_t epoch,uint32_t req,uint64_t task){
-  unsigned n=(op==WIRE_BEGIN||op==WIRE_APPEND)?46:36;
+  unsigned n=(op==WIRE_BEGIN||op==WIRE_APPEND)?46:op==WIRE_STEER?44:36;
   memset(b,0,64);b[0]=0xa5;b[1]=0x5a;b[2]=WIRE_VERSION;b[3]=op;p16(b+4,(uint16_t)(n-8));
   p64(b+6,boot);p32(b+14,epoch);p32(b+18,req);p64(b+26,task);return n;
 }
@@ -73,11 +73,15 @@ static void discovery_and_legacy(void){
   assert(f.tx_count==2&&!f.stops&&!w.has_request);
   b[2]=11;send(&w,b,n,315);
   assert(f.tx_count==2&&!f.stops&&!w.has_request);
+  b[2]=12;send(&w,b,n,317);
+  assert(f.tx_count==2&&!f.stops&&!w.has_request);
   b[2]=WIRE_VERSION;seal(b,n);
   memset(old,0,sizeof(old));old[0]=0xa5;old[1]=0x5a;old[2]=10;old[3]=WIRE_APPEND;
   p16(old+4,sizeof(old)-8);memcpy(old+8,b,n);send(&w,old,sizeof(old),320);
   assert(f.tx_count==2&&!f.stops&&!w.has_request);
   old[2]=11;send(&w,old,sizeof(old),330);
+  assert(f.tx_count==2&&!f.stops&&!w.has_request);
+  old[2]=12;send(&w,old,sizeof(old),340);
   assert(f.tx_count==2&&!f.stops&&!w.has_request);
   puts("PASS no unsolicited frames, exact discovery reply, reply-time snapshot and full legacy-frame rejection");
 }
@@ -142,6 +146,29 @@ static void invalid_frames(void){
   b[0]=0xa5;b[1]=0x5a;b[2]=WIRE_VERSION;b[3]=WIRE_STOP;p16(b+4,255);
   receive(&w,b,6,60);assert(!w.used&&f.tx_count==4);
   puts("PASS CRC/length checks, reserved field, identity, epoch and dispatch-result watermark");
+}
+static void guided_steer_replay(void){
+  MQ q;Wire w;Fake f;uint8_t b[64];MQSegment s={MQ_KIND_MOVE_GUIDED,10.f};init(&q,&w,&f);
+  assert(mq_begin(&q,1,1,1,mq_segments_crc(&s,1),MQ_LEASE_MS)==MQ_OK);
+  assert(mq_append(&q,1,0,s)==MQ_OK && mq_commit(&q,1)==MQ_OK && mq_start(&q,1,20)==MQ_OK);
+  mq_tick(&q,20);
+  unsigned n=command(b,WIRE_STEER,q.boot_id,1,1,1);p16(b+34,0);p16(b+36,(uint16_t)-250);p32(b+38,0);
+  assert(n==44);send(&w,b,n,40);ack(&f,1,MQ_OK,1);
+  assert(q.steer_bias_millirpm==-250 && q.steer_basis_ms==0 && (r16(f.tx+48)&WIRE_STEER_VALID));
+  send(&w,b,n,80);ack(&f,1,MQ_OK,1);assert(q.steer_basis_ms==0);
+  for(unsigned i=1;i<=5;i++){
+    MQSample sample={.sequence=i+1,.tick_ms=i*100,.valid=true};mq_sample(&q,&sample);
+  }
+  send(&w,b,n,500);ack(&f,1,MQ_OK,1);
+  assert(!(r16(f.tx+48)&WIRE_STEER_VALID) && q.steer_basis_ms==0);
+  p32(b+18,2);p32(b+38,500);send(&w,b,n,504);ack(&f,2,MQ_EXPIRED,2);
+  assert(q.first_error==MQ_ERR_STEER && f.stops==1);
+  n=command(b,WIRE_STOP,q.boot_id,1,3,0);send(&w,b,n,510);ack(&f,3,MQ_OK,3);
+  n=command(b,WIRE_STEER,q.boot_id,1,4,1);p16(b+34,0);p16(b+36,250);p32(b+38,500);
+  send(&w,b,n,520);ack(&f,4,MQ_ORDER,4);
+  assert(q.first_error==MQ_ERR_STEER && f.arms==1 && !(r16(f.tx+48)&WIRE_STEER_VALID));
+  p32(b+18,1);send(&w,b,n,530);ack(&f,1,MQ_ORDER,4);assert(f.arms==1);
+  puts("PASS 44-byte guided correction, signed milliRPM, cached ACK never extends basis, expired and post-STOP controls inert");
 }
 static void pending_stop_and_expiry(void){
   MQ q;Wire w;Fake f;uint8_t b[64];init(&q,&w,&f);
@@ -212,6 +239,6 @@ static void golden(void){
 }
 int main(void){
   assert(wire_crc16((const uint8_t*)"123456789",9)==0x29b1);
-  discovery_and_legacy();upload_and_replay();renewal_and_replay();invalid_frames();pending_stop_and_expiry();
+  discovery_and_legacy();upload_and_replay();renewal_and_replay();guided_steer_replay();invalid_frames();pending_stop_and_expiry();
   changing_transmit_clock();critical_transport_stays_locked();golden();return 0;
 }

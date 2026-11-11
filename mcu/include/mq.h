@@ -13,6 +13,7 @@
 #define MQ_DIAMETER_M .20f
 #define MQ_SEPARATION_M .30f
 #define MQ_SAMPLE_TIMEOUT_MS 250u
+#define MQ_STEER_TIMEOUT_MS 500u
 
 /* 状态区分上传、执行、段间停车和最终停车确认。 */
 typedef enum { MQ_IDLE=0, MQ_LOADING, MQ_READY, MQ_ARMING, MQ_MOVE,
@@ -21,8 +22,8 @@ typedef enum { MQ_OK=0, MQ_INVALID=1, MQ_BUSY=2, MQ_IDENTITY=3,
   MQ_ORDER=4, MQ_CRC=5, MQ_UNHEALTHY=6, MQ_STALE=7, MQ_EXPIRED=8 } MQResult;
 typedef enum { MQ_ERR_NONE=0, MQ_ERR_CANCEL=1, MQ_ERR_ODOM=2,
   MQ_ERR_DEADLINE=3, MQ_ERR_DRIVE=4, MQ_ERR_APPLY=5,
-  MQ_ERR_HANDOFF=6, MQ_ERR_UART=7, MQ_ERR_BOOT=8 } MQError;
-enum { MQ_KIND_MOVE=1, MQ_KIND_TURN=2 };
+  MQ_ERR_HANDOFF=6, MQ_ERR_UART=7, MQ_ERR_BOOT=8, MQ_ERR_STEER=9 } MQError;
+enum { MQ_KIND_MOVE=1, MQ_KIND_TURN=2, MQ_KIND_MOVE_GUIDED=3 };
 /* 队列由 MOVE/TURN 段组成；段内容和顺序由 CRC 绑定。 */
 /* 里程计和驱动回读均携带真实测量时间和样本序号。 */
 typedef struct { uint32_t kind; float value; } MQSegment;
@@ -64,13 +65,16 @@ typedef struct {
   uint32_t first_error,first_drive_error,epoch_at_upload;
   uint32_t target_generation,target_requested_ms,last_target_ms;
   uint32_t barrier_started_ms,barrier_sample,zero_count;
+  uint32_t steer_basis_ms,steer_wait_ms;
+  int16_t steer_bias_millirpm;
+  uint16_t steer_residual;
   uint16_t count,received,index;
   MQState state;
   int16_t desired_left,desired_right;
   float segment_travel,segment_yaw,progress,yaw_deviation,lateral_deviation;
   float segment_x,segment_y;
   bool committed,has_started,arrival_reached,physical_stop_confirmed;
-  bool barrier_applied,target_pending,critical_latched;
+  bool barrier_applied,target_pending,critical_latched,steer_valid;
 } MQ;
 
 void mq_init(MQ *q,uint64_t boot_id,const MQDriveOps *ops,void *user);
@@ -83,6 +87,9 @@ MQResult mq_append(MQ *q,uint64_t task,uint16_t index,MQSegment segment);
 MQResult mq_commit(MQ *q,uint64_t task);
 MQResult mq_start(MQ *q,uint64_t task,uint32_t now);
 MQResult mq_renew(MQ *q,uint64_t task,uint32_t now);
+MQResult mq_steer(MQ *q,uint64_t task,uint16_t index,int16_t bias_millirpm,
+                  uint32_t basis_ms,uint32_t now);
+bool mq_steer_active(const MQ *q,uint32_t now);
 uint32_t mq_lease_remaining_ms(const MQ *q,uint32_t now);
 void mq_stop(MQ *q,uint32_t now);
 MQResult mq_reset_odom(MQ *q,uint32_t now);

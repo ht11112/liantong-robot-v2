@@ -72,11 +72,13 @@ class V11EkfTests(unittest.TestCase):
         self.subscribers['/imu/raw'](message)
         return message
 
-    def send_estimate(self, seconds, *, orientation=None):
+    def send_estimate(self, seconds, *, orientation=None, position=(0., 0.), twist=(0., 0.)):
         message = odometry()
         message.header.frame_id, message.header.stamp = ODOM_FRAME, self.stamp(seconds)
         if orientation is not None:
             message.pose.pose.orientation = orientation
+        message.pose.pose.position.x, message.pose.pose.position.y = position
+        message.twist.twist.linear.x, message.twist.twist.angular.z = twist
         self.subscribers[ESTIMATE_TOPIC](message)
         return message
 
@@ -140,8 +142,49 @@ class V11EkfTests(unittest.TestCase):
         self.assertAlmostEqual(estimate['yaw_rad'], -1.2870022176)
         self.now = 10.351
         self.send_gyro(10.34)
-        self.assertEqual(self.ekf.ekf_snapshot(), dict(fresh=False, age_ms=261., yaw_rad=None))
+        self.assertEqual(self.ekf.ekf_snapshot(), dict(fresh=False, age_ms=261., yaw_rad=None,
+                         pose=None, angular_z_rad_s=None, linear_x_m_s=None))
         self.assertTrue(self.ekf.imu_snapshot()['fresh'])
+
+    def test_fused_pose_history_interpolates_position_and_wrapped_heading(self):
+        import math
+        self.ekf.publish(exchange(1, 100, 10.021))
+        self.send_gyro(10.08)
+        for seconds, yaw, position in ((10.04, 170., (0., 0.)), (10.09, -170., (1., 2.))):
+            radians = math.radians(yaw)
+            self.send_estimate(seconds, orientation=Record(x=0., y=0., z=math.sin(radians/2),
+                               w=math.cos(radians/2)), position=position, twist=(.03, .2))
+        pose = self.ekf.pose_at(self.stamp(10.065).to_nsec())
+        self.assertAlmostEqual(pose['x'], .5)
+        self.assertAlmostEqual(pose['y'], 1.)
+        self.assertAlmostEqual(abs(pose['yaw']), math.pi)
+        snapshot = self.ekf.ekf_snapshot()
+        self.assertEqual(snapshot['pose']['x'], 1.)
+        self.assertEqual(snapshot['angular_z_rad_s'], .2)
+        self.assertEqual(snapshot['linear_x_m_s'], .03)
+        self.assertIsNone(self.ekf.pose_at(self.stamp(10.03).to_nsec()))
+        self.assertIsNone(self.ekf.pose_at(self.stamp(10.10).to_nsec()))
+
+    def test_fused_pose_history_is_unavailable_after_source_expiry_or_invalidation(self):
+        self.ekf.publish(exchange(1, 100, 10.021))
+        self.send_gyro(10.08)
+        self.send_estimate(10.09, position=(1., 2.))
+        self.assertIsNotNone(self.ekf.pose_at(self.stamp(10.09).to_nsec()))
+        self.now = 10.351
+        self.assertIsNone(self.ekf.pose_at(self.stamp(10.09).to_nsec()))
+        self.ekf.invalidate_history()
+        self.assertEqual(tuple(self.ekf.pose_history), ())
+
+    def test_fused_pose_history_does_not_interpolate_across_estimate_gap(self):
+        self.ekf.publish(exchange(1, 100, 10.021))
+        self.send_gyro(10.08)
+        self.send_estimate(10.09)
+        self.now = 10.46
+        self.ekf.publish(exchange(2, 450, 10.371))
+        self.send_gyro(10.44)
+        self.send_estimate(10.45, position=(1., 0.))
+        self.assertTrue(self.ekf.ekf_snapshot()['fresh'])
+        self.assertIsNone(self.ekf.pose_at(self.stamp(10.25).to_nsec()))
 
     def test_fresh_wheel_and_new_estimate_cannot_mask_stale_imu(self):
         self.ekf.publish(exchange(1, 100, 10.021))

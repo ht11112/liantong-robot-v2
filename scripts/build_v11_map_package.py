@@ -1,4 +1,4 @@
-"""Build an RK V12 navigation package from source and an external saved map."""
+"""Build the RK navigation package with explicit wire-version metadata."""
 
 import argparse
 import ast
@@ -13,12 +13,14 @@ from verify_source import ROOT
 sys.path.insert(0, str(ROOT / 'app'))
 sys.path.insert(0, str(ROOT / 'mcu' / 'tools'))
 from v11_map_plan import load_map
+from mcu_v11 import VERSION
 
 
 SOURCES = (
     'app/v12_feedback_worker.py', 'scripts/benchmark_v12_feedback.py',
     'app/v11_map_runtime.py', 'app/v11_map_plan.py', 'app/v11_ros.py', 'app/v11_obstacles.py',
     'app/v11_ekf.py', 'app/v11_ekf_worker.py',
+    'app/v13_move_control.py',
     'app/manual_mapping_runtime.py', 'app/simple_p2p_history.py',
     'mcu/tools/mcu_v10.py', 'mcu/tools/mcu_v11.py',
 )
@@ -35,7 +37,7 @@ def assemble(args):
     if sha256(files[yaml]) != metadata['yaml_sha256']:
         raise ValueError('Map YAML changed during packaging')
     manifest = dict(schema='v12-map-rk-package-1', entry_point='app/v11_map_runtime.py',
-                    map=metadata, map_pgm=pgm, map_yaml=yaml, default_mode='ready',
+                    map=metadata, map_pgm=pgm, map_yaml=yaml, default_mode='ready', wire_version=VERSION,
                     files={name: sha256(raw) for name, raw in sorted(files.items())})
     files['manifest.json'] = (json.dumps(manifest, indent=2) + '\n').encode('utf-8')
     return files, manifest

@@ -1,8 +1,8 @@
 # 联通机器人：手推建图与简版点到点控制
 
-第九分支 `feature/navigation-snapshot-9` 保存 2026-11-11 的完整导航工作区，包括独立 EKF、网页试转、雷达缓存修复、矩形车体与 15 厘米规划净距、短 MOVE 规划修复，以及 START 应答等待 1 秒。保存时应用 338 项、MCU Python 86 项回归通过，其中 MCU 有 2 项既有跳过。START 等待修改随本次工作区快照保存，现场部署版本另见部署收据。
+第十分支 `feature/ekf-move-correction-10` 增加 EKF 航向与横向偏差的 MOVE 闭环纠偏，配套 MCU V13、独立串口主站及网页诊断。使用 `--ekf-move-correction` 启用，定位后在同一地图坐标下跟踪每段规划直线。交付状态为离线验证，控制增益和机械响应待实车标定。见[直行闭环说明](docs/EKF_MOVE_CONTROL.md)和[V13 协议](mcu/docs/PROTOCOL_V13.md)。
 
-第十分支从本快照开发 EKF 直行闭环纠偏，开发验证范围见该分支的功能说明。
+第九分支 `feature/navigation-snapshot-9` 的 `8e92c4e` 保存本分支出发时的完整导航工作区，包括独立 EKF、网页试转、雷达缓存修复、矩形车体与 15 厘米规划净距、短 MOVE 修复及 START 应答等待 1 秒。
 
 第八分支 `feature/rk-feedback-worker` 将 V12 串口收发移到独立进程：正常链路以 50 Hz 为目标查询并缓存反馈，导航与雷达读取最新状态和短历史，A* 不再占用串口循环。保留当前 2 秒启动配对等待及 2 cm／2° 位姿容差；不包含已撤回的绕行路线缓存。MCU 固件不变，真实轮速采样仍约 20 Hz。[独立查询与验证](docs/V12_MAP_NAVIGATION.md#rk-独立查询与内存缓存)
 

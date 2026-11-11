@@ -138,7 +138,7 @@ uint32_t mq_segments_crc(const MQSegment *segments,uint16_t count) {
   return ~crc;
 }
 static bool segment_valid(MQSegment s) {
-  return isfinite(s.value) && (s.kind==MQ_KIND_MOVE ? s.value>0.f && s.value<=1000.f :
+  return isfinite(s.value) && (s.kind==MQ_KIND_MOVE || s.kind==MQ_KIND_MOVE_GUIDED ? s.value>0.f && s.value<=1000.f :
     s.kind==MQ_KIND_TURN && absf(s.value)>0.f && absf(s.value)<=2.f*MQ_PI);
 }
 /* BEGIN 建立待上传队列，不启动电机；任务号在本次启动内单调递增。 */
@@ -207,6 +207,31 @@ MQResult mq_renew(MQ *q,uint64_t task,uint32_t now) {
   q->lease_started_ms=now;
   return MQ_OK;
 }
+static bool guided_move(const MQ *q) {
+  return q->state==MQ_MOVE && q->segments[q->index].kind==MQ_KIND_MOVE_GUIDED;
+}
+bool mq_steer_active(const MQ *q,uint32_t now) {
+  return guided_move(q) && q->steer_valid && now-q->steer_basis_ms<MQ_STEER_TIMEOUT_MS;
+}
+static bool steer_expired(MQ *q,uint32_t now) {
+  if(now-(q->steer_valid?q->steer_basis_ms:q->steer_wait_ms)<MQ_STEER_TIMEOUT_MS)return false;
+  mq_fault(q,MQ_ERR_STEER,now);return true;
+}
+MQResult mq_steer(MQ *q,uint64_t task,uint16_t index,int16_t bias_millirpm,
+                  uint32_t basis_ms,uint32_t now) {
+  if(task!=q->task_id || q->epoch_at_upload!=q->odom.epoch)return MQ_IDENTITY;
+  if(bias_millirpm < -2000 || bias_millirpm > 2000)return MQ_INVALID;
+  if(!guided_move(q) || index!=q->index)return MQ_ORDER;
+  if(!mq_lease_remaining_ms(q,now)){mq_fault(q,MQ_ERR_DEADLINE,now);return MQ_EXPIRED;}
+  if(steer_expired(q,now))return MQ_EXPIRED;
+  MQDriveView d=view(q);
+  if(q->first_error || q->critical_latched || d.error || !d.guard_valid || d.state!=MQ_DRIVE_ENABLED)return MQ_UNHEALTHY;
+  if(!q->odom.valid || now-q->odom.measurement_tick_ms>=MQ_SAMPLE_TIMEOUT_MS ||
+     now-basis_ms>=MQ_STEER_TIMEOUT_MS || (q->steer_valid && after(q->steer_basis_ms,basis_ms)))return MQ_STALE;
+  if(!bias_millirpm || (bias_millirpm<0)!=(q->steer_bias_millirpm<0))q->steer_residual=0;
+  q->steer_basis_ms=basis_ms;q->steer_bias_millirpm=bias_millirpm;q->steer_valid=true;
+  return MQ_OK;
+}
 /* STOP 作废尚未执行的队列；物理停稳由驱动反馈确认。 */
 void mq_stop(MQ *q,uint32_t now) {
   if(q->has_started && q->state!=MQ_COMPLETE && q->state!=MQ_FAILED)mq_fault(q,MQ_ERR_CANCEL,now);
@@ -232,20 +257,34 @@ MQResult mq_reset_odom(MQ *q,uint32_t now) {
   q->count=q->received=q->index=0;q->first_error=q->first_drive_error=0;
   return MQ_OK;
 }
-static void begin_segment(MQ *q) {
+static void begin_segment(MQ *q,uint32_t now) {
   q->segment_travel=q->odom.travel;q->segment_yaw=q->odom.yaw_total;
   q->segment_x=q->odom.x;q->segment_y=q->odom.y;
   q->progress=q->yaw_deviation=q->lateral_deviation=0.f;
   q->desired_left=q->desired_right=0;q->target_generation=0;q->target_pending=false;
-  q->state=q->segments[q->index].kind==MQ_KIND_MOVE?MQ_MOVE:MQ_TURN;
+  q->steer_valid=false;q->steer_residual=0;q->steer_bias_millirpm=0;q->steer_wait_ms=now;
+  q->state=q->segments[q->index].kind==MQ_KIND_TURN?MQ_TURN:MQ_MOVE;
 }
-static void request_target(MQ *q,int16_t l,int16_t r,uint32_t now) {
-  if(q->target_pending)return;
-  if(q->target_generation && l==q->desired_left && r==q->desired_right && now-q->last_target_ms<100u)return;
+static bool request_target(MQ *q,int16_t l,int16_t r,uint32_t now) {
+  if(q->target_pending)return false;
+  if(q->target_generation && l==q->desired_left && r==q->desired_right && now-q->last_target_ms<100u)return false;
   uint32_t generation=q->drive.target(q->drive_user,l,r,now);
-  if(!generation){mq_fault(q,MQ_ERR_DRIVE,now);return;}
+  if(!generation){mq_fault(q,MQ_ERR_DRIVE,now);return false;}
   q->desired_left=l;q->desired_right=r;q->target_generation=generation;
   q->target_requested_ms=q->last_target_ms=now;q->target_pending=true;
+  return true;
+}
+static void guided_target(MQ *q,int16_t rpm,uint32_t now) {
+  if(!q->steer_valid){request_target(q,0,0,now);return;}
+  /* Advance fractional RPM only when a real 100ms target slot is accepted.
+     Delayed CAN application stretches a slot; missed slots are never replayed. */
+  if(q->target_pending || (q->target_generation && now-q->last_target_ms<100u))return;
+  uint16_t total=q->steer_residual+(uint16_t)(q->steer_bias_millirpm<0?-q->steer_bias_millirpm:q->steer_bias_millirpm);
+  int16_t trim=(int16_t)(total/1000u);
+  if(trim>rpm)trim=rpm;
+  int16_t left=rpm,right=rpm;
+  if(q->steer_bias_millirpm>0)left-=trim;else right-=trim;
+  if(request_target(q,left,(int16_t)-right,now))q->steer_residual=total%1000u;
 }
 /* 周期状态机检查反馈与租约，段间先下发零速并等待实测停稳。 */
 void mq_tick(MQ *q,uint32_t now) {
@@ -267,6 +306,7 @@ void mq_tick(MQ *q,uint32_t now) {
   if(d.error || d.state==MQ_DRIVE_FAILED){mq_fault(q,MQ_ERR_DRIVE,now);return;}
   if(!q->odom.valid || now-q->odom.measurement_tick_ms>=MQ_SAMPLE_TIMEOUT_MS){mq_fault(q,MQ_ERR_ODOM,now);return;}
   if(!mq_lease_remaining_ms(q,now)){mq_fault(q,MQ_ERR_DEADLINE,now);return;}
+  if(guided_move(q) && steer_expired(q,now))return;
   if(q->target_pending) {
     if(d.applied_generation==q->target_generation) {
       if(now-q->target_requested_ms>=300u){mq_fault(q,MQ_ERR_APPLY,now);return;}
@@ -278,23 +318,23 @@ void mq_tick(MQ *q,uint32_t now) {
     } else if(now-q->target_requested_ms>=300u){mq_fault(q,MQ_ERR_APPLY,now);return;}
   }
   if(q->state==MQ_ARMING) {
-    if(d.state==MQ_DRIVE_ENABLED){begin_segment(q);}
+    if(d.state==MQ_DRIVE_ENABLED){begin_segment(q,now);}
     else if(now-q->started_ms>=3000u)mq_fault(q,MQ_ERR_DRIVE,now);
     return;
   }
   if(d.state!=MQ_DRIVE_ENABLED || !d.guard_valid){mq_fault(q,MQ_ERR_DRIVE,now);return;}
   if(q->state==MQ_BARRIER) {
     if(now-q->barrier_started_ms>=2000u){mq_fault(q,MQ_ERR_HANDOFF,now);return;}
-    if(q->barrier_applied && q->zero_count>=5u){q->index++;begin_segment(q);return;}
+    if(q->barrier_applied && q->zero_count>=5u){q->index++;begin_segment(q,now);return;}
     if(!q->barrier_applied)request_target(q,0,0,now);
     return;
   }
   MQSegment s=q->segments[q->index];
   q->yaw_deviation=q->odom.yaw_total-q->segment_yaw;
   q->lateral_deviation=-(q->odom.x-q->segment_x)*sinf(q->segment_yaw)+(q->odom.y-q->segment_y)*cosf(q->segment_yaw);
-  q->progress=s.kind==MQ_KIND_MOVE?q->odom.travel-q->segment_travel:
+  q->progress=s.kind!=MQ_KIND_TURN?q->odom.travel-q->segment_travel:
     (s.value>0.f?1.f:-1.f)*(q->odom.yaw_total-q->segment_yaw);
-  float tolerance=s.kind==MQ_KIND_MOVE?(q->index+1u==q->count?.10f:.02f):MQ_PI/60.f;
+  float tolerance=s.kind!=MQ_KIND_TURN?(q->index+1u==q->count?.10f:.02f):MQ_PI/60.f;
   float remaining=absf(s.value)-q->progress;
   if(remaining<=tolerance) {
     if(q->index+1u==q->count) {
@@ -308,9 +348,10 @@ void mq_tick(MQ *q,uint32_t now) {
     if(!q->target_pending){q->target_generation=0;request_target(q,0,0,now);}
     return;
   }
-  if(s.kind==MQ_KIND_MOVE) {
+  if(s.kind!=MQ_KIND_TURN) {
     int16_t rpm=remaining<=.30f?MQ_MOVE_NEAR_RPM:MQ_MOVE_CRUISE_RPM;
-    request_target(q,rpm,(int16_t)-rpm,now);
+    if(s.kind==MQ_KIND_MOVE_GUIDED)guided_target(q,rpm,now);
+    else request_target(q,rpm,(int16_t)-rpm,now);
   } else {
     int16_t rpm=s.value>0.f?-MQ_TURN_RPM:MQ_TURN_RPM;
     request_target(q,rpm,rpm,now);

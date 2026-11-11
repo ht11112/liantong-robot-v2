@@ -130,7 +130,7 @@ def firmware(args, out):
         obj = out/(source.name+'.o')
         run([gcc]+flags+['-c', str(source), '-o', str(obj)], out/(source.name+'.compile.log'))
         objects.append(obj)
-    elf, binary, mapping = (out/('mcu-v12.'+s) for s in ('elf', 'bin', 'map'))
+    elf, binary, mapping = (out/('mcu-v13.'+s) for s in ('elf', 'bin', 'map'))
     run([gcc]+flags+['-nostartfiles', '--specs=nano.specs', '--specs=nosys.specs']+objects+
         ['-T'+str(ROOT/'flash.ld'), '-Wl,--gc-sections', '-Wl,-Map='+str(mapping),
          '-Wl,--start-group', '-lc', '-lm', '-Wl,--end-group', '-o', elf], out/'link.log')
@@ -173,7 +173,7 @@ def main():
                         help='MOVE command at 0.30 m remaining or less (default: 1 RPM)')
     parser.add_argument('--turn-rpm', type=wheel_rpm, default=SPEED_DEFAULTS['turn_rpm'],
                         help='TURN command magnitude for either direction (default: 1 RPM)')
-    parser.add_argument('--name', default='mcu-v12-offline')
+    parser.add_argument('--name', default='mcu-v13-offline')
     parser.add_argument('--emscripten', type=Path, default=UNITY)
     parser.add_argument('--sdk', type=Path, default=SDK)
     parser.add_argument('--compiler-dir', type=Path, default=ARM if os.name=='nt' else None)

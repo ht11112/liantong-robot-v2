@@ -18,7 +18,7 @@ static uint32_t target(void *user,int16_t left,int16_t right,uint32_t now){
 static void stop(void *user,uint32_t now){(void)now;((Peer *)user)->stops++;}
 static MQDriveView view(void *user){return ((Peer *)user)->view;}
 
-static void check_target(MQSegment segment,int16_t left,int16_t right){
+static void check_target(MQSegment segment,int16_t left,int16_t right,int16_t bias){
   static const MQDriveOps ops={arm,target,stop,view};
   Peer p={.view={.state=MQ_DRIVE_STOPPED,.stop_verified=true,.guard_valid=true}};
   MQ q;mq_init(&q,1,&ops,&p);
@@ -26,15 +26,21 @@ static void check_target(MQSegment segment,int16_t left,int16_t right){
   assert(mq_begin(&q,1,q.odom.epoch,1,mq_segments_crc(&segment,1),MQ_LEASE_MS)==MQ_OK);
   assert(mq_append(&q,1,0,segment)==MQ_OK&&mq_commit(&q,1)==MQ_OK);
   assert(mq_start(&q,1,0)==MQ_OK);
-  mq_tick(&q,1);mq_tick(&q,2);
+  mq_tick(&q,1);
+  if(segment.kind==MQ_KIND_MOVE_GUIDED)assert(mq_steer(&q,1,0,bias,0,1)==MQ_OK);
+  mq_tick(&q,2);
   assert(p.targets==1&&p.left==left&&p.right==right&&!q.arrival_reached&&!p.stops);
 }
 
 int main(void){
-  check_target((MQSegment){MQ_KIND_MOVE,.301f},MQ_MOVE_CRUISE_RPM,-MQ_MOVE_CRUISE_RPM);
-  check_target((MQSegment){MQ_KIND_MOVE,.30f},MQ_MOVE_NEAR_RPM,-MQ_MOVE_NEAR_RPM);
-  check_target((MQSegment){MQ_KIND_TURN,1.f},-MQ_TURN_RPM,-MQ_TURN_RPM);
-  check_target((MQSegment){MQ_KIND_TURN,-1.f},MQ_TURN_RPM,MQ_TURN_RPM);
+  check_target((MQSegment){MQ_KIND_MOVE,.301f},MQ_MOVE_CRUISE_RPM,-MQ_MOVE_CRUISE_RPM,0);
+  check_target((MQSegment){MQ_KIND_MOVE,.30f},MQ_MOVE_NEAR_RPM,-MQ_MOVE_NEAR_RPM,0);
+  check_target((MQSegment){MQ_KIND_TURN,1.f},-MQ_TURN_RPM,-MQ_TURN_RPM,0);
+  check_target((MQSegment){MQ_KIND_TURN,-1.f},MQ_TURN_RPM,MQ_TURN_RPM,0);
+  int16_t cruise_trim=MQ_MOVE_CRUISE_RPM<2?MQ_MOVE_CRUISE_RPM:2;
+  int16_t near_trim=MQ_MOVE_NEAR_RPM<2?MQ_MOVE_NEAR_RPM:2;
+  check_target((MQSegment){MQ_KIND_MOVE_GUIDED,.301f},MQ_MOVE_CRUISE_RPM-cruise_trim,-MQ_MOVE_CRUISE_RPM,2000);
+  check_target((MQSegment){MQ_KIND_MOVE_GUIDED,.30f},MQ_MOVE_NEAR_RPM,near_trim-MQ_MOVE_NEAR_RPM,-2000);
   printf("PASS selected MOVE cruise %d RPM, near %d RPM, TURN %d RPM in both directions\n",
          MQ_MOVE_CRUISE_RPM,MQ_MOVE_NEAR_RPM,MQ_TURN_RPM);
   return 0;

@@ -165,6 +165,68 @@ class MapPlanTests(unittest.TestCase):
         self.assertTrue(grid.route_blocked(after_turn, plan, 1, 0., ahead))
         self.assertFalse(grid.route_blocked(after_turn, plan, 2, 0., ahead))
 
+    def test_guided_remaining_move_keeps_nominal_line_after_two_degree_turn_residual(self):
+        for sign, row in ((1, 120), (-1, 79)):
+            for dynamic in (False, True):
+                with self.subTest(sign=sign, dynamic=dynamic):
+                    cell = (145, row)
+                    grid = self.make_map(() if dynamic else ((*cell, 0),), resolution=.02,
+                                         width=250, height=250, clearance_m=BODY_CLEARANCE_M)
+                    plan = dict(start=pose(1., 2., -math.pi/2.), segments=[
+                        dict(kind='turn', angle_rad=math.pi/2.),
+                        dict(kind='move', distance_m=2., guided=True)])
+                    current = pose(1., 2., sign*math.radians(2.))
+                    cells = frozenset({cell}) if dynamic else frozenset()
+                    blind = dict(plan, segments=[plan['segments'][0],
+                                                dict(kind='move', distance_m=2.)])
+                    self.assertTrue(grid.route_blocked(current, blind, 1, 0., cells))
+                    self.assertFalse(grid.route_blocked(current, plan, 1, 0., cells))
+
+    def test_guided_reconnect_still_checks_static_and_dynamic_obstacles(self):
+        cell = (55, 118)
+        for dynamic in (False, True):
+            with self.subTest(dynamic=dynamic):
+                grid = self.make_map(() if dynamic else ((*cell, 0),), resolution=.02,
+                                     width=250, height=250, clearance_m=BODY_CLEARANCE_M)
+                plan = dict(start=pose(1., 2.), segments=[
+                    dict(kind='move', distance_m=2., guided=True)])
+                cells = frozenset({cell}) if dynamic else frozenset()
+                self.assertTrue(grid.route_blocked(pose(1., 2.05, math.radians(2.)),
+                                                   plan, 0, 0., cells))
+
+    def test_guided_reconnect_turn_space_is_local_and_conservative(self):
+        grid = self.make_map(((50, 120, 0),), resolution=.02, width=250, height=250,
+                             clearance_m=BODY_CLEARANCE_M)
+        plan = dict(start=pose(1., 2.), segments=[dict(kind='move', distance_m=2., guided=True)])
+        self.assertFalse(grid.route_blocked(pose(1., 2.), plan, 0, 0., ()))
+        self.assertFalse(grid.route_blocked(pose(1., 2., math.radians(.1)), plan, 0, 0., ()))
+        # A correction checks a full local TURN disk; an already aligned MOVE
+        # retains its rectangular corridor rather than requiring that disk.
+        self.assertTrue(grid.route_blocked(pose(1., 2., math.radians(2.)), plan, 0, 0., ()))
+
+    def test_guided_remaining_queue_preserves_future_turn_and_move(self):
+        grid = self.make_map(resolution=.02, width=250, height=250,
+                             clearance_m=BODY_CLEARANCE_M)
+        plan = dict(start=pose(1., 1.), segments=[
+            dict(kind='move', distance_m=1., guided=True),
+            dict(kind='turn', angle_rad=math.pi/2.),
+            dict(kind='move', distance_m=1., guided=True)])
+        current = pose(1.5, 1., math.radians(2.))
+        passed = grid.obstacle_cells(((.8, 1.),))
+        ahead = grid.obstacle_cells(((2., 1.8),))
+        self.assertFalse(grid.route_blocked(current, plan, 0, .5, passed))
+        self.assertTrue(grid.route_blocked(current, plan, 0, .5, ahead))
+
+    def test_guided_line_projection_respects_rotated_map_origin(self):
+        grid = self.make_map(((145, 120, 0),), resolution=.02, width=250, height=250,
+                             origin=(10., 20., math.pi/2.), clearance_m=BODY_CLEARANCE_M)
+        plan = dict(start=pose(8., 21., math.pi/2.), segments=[
+            dict(kind='move', distance_m=2., guided=True)])
+        current = pose(8., 21., math.pi/2.+math.radians(2.))
+        self.assertFalse(grid.route_blocked(current, plan, 0, 0., ()))
+        self.assertTrue(grid.route_blocked(current, plan, 0, 0.,
+                                          grid.obstacle_cells(((8., 22.8),))))
+
     def bent_route(self, grid):
         start = pose(1., 2.)
         plan = wire_preview(grid, dict(x=3., y=4.), [dict(kind='move', distance_m=2.),

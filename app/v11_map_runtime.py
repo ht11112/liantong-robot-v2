@@ -1,4 +1,4 @@
-"""RK V12 map navigation consuming an independent serial feedback worker."""
+"""RK map navigation and optional EKF-guided MOVE control over V13."""
 
 import argparse
 from collections import deque
@@ -19,6 +19,7 @@ from v12_feedback_worker import FeedbackWorker
 from v11_ekf_worker import EkfWorker
 from v11_map_plan import CollisionError, PlanningError, TURN_TOLERANCE_RAD, load_map
 from v11_obstacles import DynamicObstacles
+from v13_move_control import LineReference, MoveController
 
 
 PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
@@ -34,6 +35,8 @@ MCU_CANCELLED = 1
 ARRIVAL_REACHED = 8
 POSE_DISTANCE_TOLERANCE_M = .02
 POSE_HEADING_TOLERANCE_RAD = math.radians(2.)
+EKF_STOP_LINEAR_M_S = math.pi * .20 * .2 / 60.
+EKF_STOP_ANGULAR_RAD_S = 2. * EKF_STOP_LINEAR_M_S / .30
 
 
 def angle(value):
@@ -68,12 +71,20 @@ def inverse(pose):
 # 串口在独立进程持续查询；导航与 ROS 只消费内存中的反馈历史。
 class Navigation:
     def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
-                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False):
+                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False,
+                 move_correction=False):
         if not math.isfinite(obstacle_scan_timeout_s) or obstacle_scan_timeout_s <= 0:
             raise ValueError('Obstacle scan timeout must be positive and finite')
         self.grid, self.localizer, self.mode, self.clock = grid, localizer, mode, clock
         self.scanner = scanner
         self.ekf = ekf
+        if move_correction and ekf is None:
+            raise ValueError('直行纠偏需要 EKF')
+        self.move_correction = move_correction
+        self.ekf_alignment = None
+        self.move_controller = self.move_controller_key = None
+        self.move_sent_at = None
+        self.move_control = dict(enabled=move_correction, phase='idle', message=None)
         self.ekf_turn = (dict(phase='idle', message='仅试验单次原地转向 90°，不会直行',
                               target_deg=90., turned_deg=0., direction=None) if ekf_turn_test else None)
         self.ekf_turn_plan = None
@@ -117,6 +128,8 @@ class Navigation:
         if self.detour is not None:
             self._cancel_detour(reason)
         self.alignment = self.origin = self.plan = self.route = None
+        self.ekf_alignment = None
+        self.move_controller = self.move_controller_key = None
         self._clear_obstacles()
         self.trail.clear()
         self.localization = dict(mode='unlocalized', reason=reason)
@@ -132,8 +145,14 @@ class Navigation:
         if not self._fresh():
             return False
         sample = self.latest.status
-        return (not sample.flags & (EXECUTING | RX_FAULT) and not sample.first_drive_error
-                and max(abs(sample.left_tenths_rpm), abs(sample.right_tenths_rpm)) <= 2)
+        parked = (not sample.flags & (EXECUTING | RX_FAULT) and not sample.first_drive_error
+                  and max(abs(sample.left_tenths_rpm), abs(sample.right_tenths_rpm)) <= 2)
+        if parked and self.move_correction:
+            estimate = self.ekf.ekf_snapshot()
+            return (estimate is not None and estimate['fresh']
+                    and abs(estimate['linear_x_m_s']) <= EKF_STOP_LINEAR_M_S
+                    and abs(estimate['angular_z_rad_s']) <= EKF_STOP_ANGULAR_RAD_S)
+        return parked
 
     def _require_stationary(self):
         if not self._stationary():
@@ -143,6 +162,11 @@ class Navigation:
     def _map_pose(self):
         if self.alignment is None or not self._fresh():
             return None
+        if self.move_correction:
+            estimate = self.ekf.ekf_snapshot()
+            if self.ekf_alignment is None or estimate is None or not estimate['fresh']:
+                return None
+            return compose(self.ekf_alignment, estimate['pose'])
         return compose(self.alignment, pose_of(self.latest.status))
 
     # 只有新的有效 MCU 测量能续鲜；boot 或 epoch 改变时必须重新定位。
@@ -260,6 +284,7 @@ class Navigation:
             if self.alignment is None or not self._fresh():
                 return
             anchor, last_stamp = self.alignment, self.scan_stamp
+            ekf_anchor = self.ekf_alignment
             identity = self.latest.status.boot, self.latest.status.epoch
         frame = self.scanner.latest_observation()
         if frame is None or (last_stamp is not None and frame['stamp_ns'] <= last_stamp):
@@ -274,7 +299,13 @@ class Navigation:
                            'no_return' if frame.get('no_return_count', 0) else 'no_usable_ranges')
             points, hits, rays = None, frozenset(), ()
         else:
-            pose = compose(anchor, odom)
+            if self.move_correction:
+                estimate_pose = self.ekf.pose_at(stamp)
+                if estimate_pose is None:
+                    return
+                pose = compose(ekf_anchor, estimate_pose)
+            else:
+                pose = compose(anchor, odom)
             c, s = math.cos(pose['yaw']), math.sin(pose['yaw'])
 
             def project(x, y):
@@ -365,7 +396,15 @@ class Navigation:
                         odom_pose = pose_of(current)
                         if not same_pose(odom_pose, initial):
                             raise ValueError('置零期间车体位置发生变化，请停稳后重试')
-                    self.alignment = compose(map_pose, inverse(odom_pose))
+                    alignment = compose(map_pose, inverse(odom_pose))
+                    if self.move_correction:
+                        estimate = self.ekf.ekf_snapshot()
+                        if estimate is None or not estimate['fresh']:
+                            raise ValueError('定位需要新鲜 EKF 位姿')
+                        map_current = compose(alignment, pose_of(current))
+                        self.ekf_alignment = compose(map_current, inverse(estimate['pose']))
+                    self.alignment = alignment
+                    self.move_controller = self.move_controller_key = None
                     self._clear_obstacles()
                     self.origin = dict(x=odom_pose['x'], y=odom_pose['y'], yaw=odom_pose['yaw'])
                     self.localization = dict(mode=mode, reason=None, stamp_ns=map_pose.get('stamp_ns'),
@@ -388,11 +427,86 @@ class Navigation:
                 cells = self.obstacles.cells
             plan = (self.grid.plan(pose, goal, obstacle_cells=cells)
                     if self.scanner is not None else self.grid.plan(pose, goal))
+            plan = self._guided_plan(plan)
             with self.lock:
                 if (self.stop_revision != stop_revision or anchor is not self.alignment
                         or not same_pose(self._map_pose(), pose)):
                     raise ValueError('规划期间起点已变化，请重新预览')
                 self.plan = dict(plan, id=uuid.uuid4().hex)
+
+    def _guided_plan(self, plan):
+        if not self.move_correction or plan['no_motion']:
+            return plan
+        segments = [dict(segment, guided=True) if segment['kind'] == 'move' else dict(segment)
+                    for segment in plan['segments']]
+        checksum = QueuePlan.from_document(dict(segments=segments)).checksum
+        return dict(plan, segments=segments, queue_crc32=checksum)
+
+    def _move_control_failed(self, message):
+        self.move_control.update(phase='stopping', message=message)
+        self.error = message
+        if self.detour is not None:
+            self._cancel_detour(message)
+        self._queue_stop()
+
+    # 差速占用唯一串口 owner 的普通命令时隙，STOP 使用原来的独立取消代次。
+    def _move_correction_cycle(self, master):
+        if not self.move_correction:
+            return
+        if self.feedback is not None:
+            self._consume_feedback()
+        with self.lock:
+            status = self.latest.status if self.latest is not None else None
+            if (self.stop_requested or self.route is None or self.lease_task is None
+                    or status is None or status.state not in LEASE_STATES):
+                self.move_controller = self.move_controller_key = None
+                if not self.stop_requested and self.move_control['phase'] == 'active':
+                    self.move_control.update(phase='stopped', message='直行段已结束')
+                return
+            estimate = self.ekf.ekf_snapshot()
+            if not self._fresh() or self.ekf_alignment is None or estimate is None or not estimate['fresh']:
+                self._move_control_failed('直行纠偏的 EKF 或轮式反馈已过期')
+                return
+            segment = self.route['segments'][status.index]
+            if status.state != 4 or not segment.get('guided'):
+                self.move_controller = self.move_controller_key = None
+                self.move_control.update(phase='waiting', message='等待直行段')
+                return
+            now = self.clock()
+            key = status.boot, status.epoch, status.task, status.index
+            if key != self.move_controller_key:
+                self.move_controller = MoveController(LineReference.from_plan(self.route, status.index))
+                self.move_controller_key, self.move_sent_at = key, None
+            if self.move_sent_at is not None and now - self.move_sent_at < .1:
+                return
+            pose = compose(self.ekf_alignment, estimate['pose'])
+            control = self.move_controller.command(pose, estimate['angular_z_rad_s'])
+            self.move_sent_at = now
+            revision = self.feedback.stop_revision if self.feedback is not None else None
+            arguments = status.task, status.index, control['differential_millirpm'], status.measurement_tick_ms
+        try:
+            reply = (master.steer(*arguments, revision=revision) if self.feedback is not None
+                     else master.steer(*arguments))
+            self.observe(reply)
+        except RequestCancelled:
+            return
+        except (Rejected, ValueError) as exc:
+            if isinstance(exc, Rejected):
+                self.observe(exc.exchange)
+            elif self.feedback is not None:
+                self._consume_feedback()
+            with self.lock:
+                current = self.latest.status
+                if (current.boot, current.epoch, current.task, current.index) == key and current.state == 4:
+                    self._move_control_failed('MCU 拒绝本段直行修正')
+                else:
+                    self.move_controller = self.move_controller_key = None
+                    self.move_control.update(phase='waiting', message='直行段已切换')
+            return
+        with self.lock:
+            if not self.stop_requested and self.move_controller_key == key:
+                self.move_control.update(control, phase='active', message='沿规划直线纠偏',
+                                         segment_index=status.index)
 
     def _ekf_turn_active(self):
         return self.ekf_turn is not None and self.ekf_turn['phase'] in (
@@ -714,6 +828,8 @@ class Navigation:
             self.stop_evidence = result
             self.stop_ack = True
             self.stop_verified = result['stop_verified']
+            if self.move_correction:
+                self.move_control['phase'] = 'stopped' if self.stop_verified else 'stopping'
             if result['stop_verified']:
                 self.error = None
             elif error.get('code') == 'stop_proof_deadline':
@@ -823,6 +939,8 @@ class Navigation:
                                               else '暂无绕行路线，保持停车')
             return
 
+        plan = self._guided_plan(plan)
+
         # 等新的缓存反馈后复核起点。
         fresh = master.query()
         if fresh is not None:
@@ -865,6 +983,7 @@ class Navigation:
                 if self.feedback_error is not None:
                     raise self.feedback_error
                 self._ekf_turn_cycle()
+                self._move_correction_cycle(master)
                 with self.lock:
                     stop = self.stop_requested
                     plan, self.pending = self.pending, None
@@ -992,6 +1111,7 @@ class Navigation:
                         task=task, avoidance=avoidance, can_prepare=preparing,
                         ekf_turn=dict(self.ekf_turn) if self.ekf_turn is not None else None,
                         can_ekf_turn=can_ekf_turn,
+                        move_control=dict(self.move_control),
                         can_start=bool(preparing and pose and self.plan and self.plan['segments']),
                         can_stop=self.connected and self.mode == 'drive', error=self.error)
             if communication is not None:
@@ -1102,11 +1222,14 @@ def main(argv=None):
     parser.add_argument('--ekf-imu-topic', help='启用二维融合，使用此 IMU 陀螺仪话题')
     parser.add_argument('--ekf-executable', type=Path, help='使用指定的 robot_localization EKF 程序')
     parser.add_argument('--ekf-turn-test', action='store_true', help='允许显式触发单次 EKF 监督的原地 90° 转向试验')
+    parser.add_argument('--ekf-move-correction', action='store_true', help='启用 EKF 航向与横向误差的直行闭环纠偏')
     args = parser.parse_args(argv)
     if args.ekf_executable is not None and not args.ekf_imu_topic:
         parser.error('--ekf-executable 需要 --ekf-imu-topic')
     if args.ekf_turn_test and (not args.ekf_imu_topic or not args.obstacle_test):
         parser.error('--ekf-turn-test 需要 --ekf-imu-topic 和 --obstacle-test')
+    if args.ekf_move_correction and not args.ekf_imu_topic:
+        parser.error('--ekf-move-correction 需要 --ekf-imu-topic')
     if (not all(math.isfinite(v) for v in (args.laser_x, args.laser_y, args.laser_yaw,
                                           args.obstacle_min_range, args.obstacle_scan_timeout))
             or args.obstacle_min_range < 0 or args.obstacle_scan_timeout <= 0):
@@ -1126,7 +1249,7 @@ def main(argv=None):
     if args.ekf_imu_topic:
         ekf = EkfWorker(args.ekf_imu_topic, args.ekf_executable)
     nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner, ekf=ekf, ekf_turn_test=args.ekf_turn_test,
-                     obstacle_scan_timeout_s=args.obstacle_scan_timeout)
+                     obstacle_scan_timeout_s=args.obstacle_scan_timeout, move_correction=args.ekf_move_correction)
     closed = threading.Event()
     workers = [threading.Thread(target=nav.run, args=(args.port, closed, args.trace_feedback_timing),
                                 name='v12-navigation')]
