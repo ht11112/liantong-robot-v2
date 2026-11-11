@@ -148,10 +148,15 @@ class DockCamera:
         rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
         camera_to_body = rz @ ry @ rx @ np.array([[0, 0, -1], [1, 0, 0], [0, -1, 0]])
         outward = -camera_to_body @ rotation[:, 2]
-        tag_right = camera_to_body @ rotation[:, 0]
+        horizontal = math.hypot(outward[0], outward[1])
+        if horizontal < 1e-6:
+            result['reason'] = '标签水平法线无法确定'
+            return result
+        nx, ny = outward[0] / horizontal, outward[1] / horizontal
+        tag_position = camera_to_body @ tvec + np.array([-.20, 0., 0.])
         result['distance_m'] = float(rotation[:, 2] @ tvec)
-        result['lateral_m'] = float(-rotation[:, 0] @ tvec + .20 * tag_right[0])
-        result['yaw_deg'] = math.degrees(-math.atan2(outward[1], outward[0]))
+        result['lateral_m'] = float(-(-ny * tag_position[0] + nx * tag_position[1]))
+        result['yaw_deg'] = math.degrees(-math.atan2(ny, nx))
         if result['distance_m'] <= 0:
             result.update(distance_m=None, lateral_m=None, yaw_deg=None, reason='标签位姿无效')
             return result

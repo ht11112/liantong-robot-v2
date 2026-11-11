@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 from v12_dock_camera import DockCamera
 
@@ -36,27 +37,36 @@ class RealTagTest(unittest.TestCase):
         camera = DockCamera('/dev/video0', target_id=42, tag_size_m=size,
                             mount_yaw_deg=0, mount_pitch_deg=0, mount_roll_deg=0,
                             camera_height_m=.14, verified=True)
-        for tx, theta in ((0, 0), (-.04, 0), (.04, 0), (0, 10), (0, -10)):
-            rotation = np.array([0., math.radians(theta), 0.])
-            projected, _ = cv2.projectPoints(points, rotation, np.array([tx, 0., .4]), matrix, distortion)
-            destination = projected.reshape(4, 2).astype(np.float32)
-            source = np.array([[0, 0], [299, 0], [299, 299], [0, 299]], dtype=np.float32)
-            transform = cv2.getPerspectiveTransform(source, destination)
-            frame = cv2.warpPerspective(marker, transform, (640, 480), borderValue=255)
-            corners, ids, _ = (cv2.aruco.ArucoDetector(dictionary).detectMarkers(frame)
-                               if hasattr(cv2.aruco, 'ArucoDetector') else cv2.aruco.detectMarkers(frame, dictionary))
-            self.assertIsNotNone(ids)
-            image = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            before = image.copy()
+        for quarter_turns in range(4):
+            for tx, theta in ((0, 0), (-.04, 0), (.04, 0), (0, 10), (0, -10)):
+                with self.subTest(pattern_rotation=90 * quarter_turns, tx=tx, theta=theta):
+                    rotation = np.array([0., math.radians(theta), 0.])
+                    projected, _ = cv2.projectPoints(points, rotation, np.array([tx, 0., .4]), matrix, distortion)
+                    destination = projected.reshape(4, 2).astype(np.float32)
+                    source = np.array([[0, 0], [299, 0], [299, 299], [0, 299]], dtype=np.float32)
+                    transform = cv2.getPerspectiveTransform(source, destination)
+                    frame = cv2.warpPerspective(np.rot90(marker, quarter_turns).copy(), transform, (640, 480), borderValue=255)
+                    corners, ids, _ = (cv2.aruco.ArucoDetector(dictionary).detectMarkers(frame)
+                                       if hasattr(cv2.aruco, 'ArucoDetector') else cv2.aruco.detectMarkers(frame, dictionary))
+                    self.assertIsNotNone(ids)
+                    image = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    before = image.copy()
+                    observed = camera._observe(cv2, np, image, corners, ids, matrix, distortion)
+                    self.assertTrue(observed['ready'])
+                    self.assertEqual(observed['tag_id'], 42)
+                    self.assertEqual(len(observed['corners']), 4)
+                    self.assertTrue(np.any(image != before))
+                    self.assertAlmostEqual(observed['distance_m'], .4 * math.cos(math.radians(theta)) + tx * math.sin(math.radians(theta)), delta=.012)
+                    expected_y = -tx * math.cos(math.radians(theta)) + .6 * math.sin(math.radians(theta))
+                    self.assertAlmostEqual(observed['lateral_m'], expected_y, delta=.015)
+                    self.assertAlmostEqual(observed['yaw_deg'], theta, delta=4.)
+
+        vertical_normal = np.array([[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]])
+        with patch.object(cv2, 'Rodrigues', return_value=(vertical_normal, None)):
             observed = camera._observe(cv2, np, image, corners, ids, matrix, distortion)
-            self.assertTrue(observed['ready'])
-            self.assertEqual(observed['tag_id'], 42)
-            self.assertEqual(len(observed['corners']), 4)
-            self.assertTrue(np.any(image != before))
-            self.assertAlmostEqual(observed['distance_m'], .4 * math.cos(math.radians(theta)) + tx * math.sin(math.radians(theta)), delta=.012)
-            expected_y = -tx * math.cos(math.radians(theta)) + .6 * math.sin(math.radians(theta))
-            self.assertAlmostEqual(observed['lateral_m'], expected_y, delta=.015)
-            self.assertAlmostEqual(observed['yaw_deg'], theta, delta=4.)
+        self.assertFalse(observed['ready'])
+        self.assertIsNone(observed['lateral_m'])
+        self.assertIn('水平法线', observed['reason'])
 
 
 if __name__ == '__main__':
