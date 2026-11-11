@@ -25,7 +25,7 @@
     .costmap-content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.costmap-box{display:grid;place-items:center;height:148px;background:#e8edf4}.costmap-box canvas{display:block;width:100%;height:100%;min-height:0}.costmap-box p{margin:12px;color:var(--muted);text-align:center}
     .costmap-content .map-foot{display:grid;align-content:center;justify-content:start}.costmap .cardhead a{color:var(--blue);font-size:12px;white-space:nowrap}
     .costmap-legend i{width:11px;height:11px;border-radius:2px;border:1px solid #c4cfdd}.costmap-legend .occupied{background:#000}.costmap-legend .inflated{background:#646464}.costmap-legend .unknown{background:#afafaf}.costmap-legend .free{background:#fff}
-    .legend .radar{background:#e45b30}
+    .legend .radar{background:#e45b30}.legend .amcl{background:#b43099}
     @media(max-width:850px){.layout{grid-template-columns:1fr;grid-template-areas:"map" "side" "costmap"}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
     @media(max-width:540px){main{padding:16px 12px}.heading{align-items:flex-start}.side{grid-template-columns:1fr}.canvas-box{height:390px}.cardhead{align-items:flex-start}.map-controls{justify-content:flex-end}h1{font-size:21px}}
   </style>
@@ -42,7 +42,7 @@
       <section class="card navigation-map" aria-label="保存地图与轨迹">
         <div class="cardhead"><h2>保存地图</h2><div class="map-controls" aria-label="地图选点模式"><button id="pick-goal" type="button" aria-pressed="true">选目标</button><button id="pick-seed" type="button" aria-pressed="false">设起点与车头</button></div></div>
         <div class="canvas-box"><canvas id="map" aria-label="保存地图、预览路径与车辆轨迹；可使用右侧坐标输入替代选点"></canvas><div class="map-help" id="map-help">等待地图信息</div></div>
-        <div class="map-foot"><div class="legend"><span><i></i>车辆 / 预览</span><span><i class="trail"></i>轨迹</span><span><i class="goal"></i>目标</span><span><i class="seed"></i>定位起点</span><span id="map-radar-legend" hidden><i class="radar"></i>雷达障碍</span></div><span id="map-details">等待已校验地图</span></div>
+        <div class="map-foot"><div class="legend"><span><i></i><span id="vehicle-legend">车辆 / 预览</span></span><span id="amcl-legend" hidden><i class="amcl"></i><span id="amcl-legend-label">AMCL 观测</span></span><span><i class="trail"></i>轨迹</span><span><i class="goal"></i>目标</span><span><i class="seed"></i>定位起点</span><span id="map-radar-legend" hidden><i class="radar"></i>雷达障碍</span></div><span id="map-details">等待已校验地图</span></div>
       </section>
       <aside class="side" aria-label="定位与任务控制">
         <section class="card">
@@ -51,6 +51,17 @@
             <div class="fields"><label>X（m）<input id="seed-x" type="number" step=".01" inputmode="decimal"></label><label>Y（m）<input id="seed-y" type="number" step=".01" inputmode="decimal"></label><label>朝向（°）<input id="seed-yaw" type="number" step=".1" inputmode="decimal" value="0"></label></div>
             <div class="actions"><button id="localize" type="button" disabled>单次定位</button><button id="zero" type="button" disabled>置0</button></div>
             <p class="summary" id="pose">当前位置尚未建立</p><small id="local-pose"></small><small id="localization-reason"></small>
+            <div id="amcl-tracking" hidden>
+              <dl style="margin-top:9px">
+                <div class="kv"><dt>AMCL 地图观测</dt><dd class="mono" id="amcl-pose">—</dd></div>
+                <div class="kv"><dt>定位观测年龄</dt><dd class="mono" id="amcl-age">—</dd></div>
+                <div class="kv"><dt>位置 / 航向标准差</dt><dd class="mono" id="amcl-quality">—</dd></div>
+                <div class="kv"><dt>相对执行参考的修正</dt><dd class="mono" id="amcl-correction">—</dd></div>
+              </dl>
+              <small>质量要求：3 个不同扫描时刻稳定，位置标准差 ≤10 cm、航向 ≤5°。</small>
+              <small>蓝色箭头为执行位置，洋红描边为 AMCL 观测。累计修正达 20 cm 或 10° 时，停稳后更新参考并重规划。</small>
+              <small>置0会停止 AMCL 跟踪，按填写的起点和车头切换为手动位姿。</small>
+            </div>
           </div>
         </section>
         <section class="card">
@@ -68,10 +79,14 @@
             <div class="kv"><dt>段序</dt><dd id="task-index">—</dd></div>
             <div class="kv"><dt>段内进度</dt><dd id="task-progress">—</dd></div>
             <div class="kv"><dt>任务授权剩余</dt><dd id="task-lease">—</dd></div>
-            <div class="kv"><dt>到点</dt><dd id="arrival">未报告</dd></div>
+            <div class="kv"><dt>MCU 动作状态</dt><dd id="mcu-phase">待命</dd></div>
+            <div class="kv"><dt>MCU 动作到点</dt><dd id="arrival">未报告</dd></div>
+            <div class="kv" id="map-arrival-row" hidden><dt>地图到点确认</dt><dd id="map-arrival">尚未验证</dd></div>
+            <div class="kv" id="map-distance-row" hidden><dt>AMCL 距目标</dt><dd class="mono" id="map-distance">—</dd></div>
             <div class="kv"><dt>STOP 回应</dt><dd id="stop-ack">—</dd></div>
             <div class="kv"><dt>实测停稳</dt><dd id="stop-proof">—</dd></div>
           </dl>
+          <p class="message" id="goal-status" role="status" hidden></p>
           <p class="message" id="avoidance-status" role="status" hidden></p>
           <p class="message error" id="task-error" hidden></p><div class="actions" style="margin-top:10px"><button id="stop" type="button" class="stop" disabled>停车</button></div></div>
         </section>
@@ -131,6 +146,8 @@
     const phaseNames = {idle:'待命',uploading:'上传队列',ready:'READY',starting:'启动中',arming:'使能中',move:'直行',turn:'转向',barrier:'段间停车',stopping:'停车中',complete:'已完成',failed:'失败',unknown:'未知'};
     const avoidanceNames = {watching:'监测路线',stopping:'遇障停车',replanning:'重规划中',waiting:'停车等待',resuming:'继续行驶',cancelled:'避障已结束'};
     const locNames = {amcl:'AMCL 已定位',manual:'手动位姿',unlocalized:'未定位'};
+    const trackingNames = {initializing:'AMCL 初始化',tracking:'AMCL 持续定位',odom_fallback:'里程计推算',manual:'手动位姿',unlocalized:'未定位'};
+    const goalPhaseNames = {idle:'待命',executing:'执行中',replanning:'地图重规划中',unverified:'地图到点待验证',complete:'地图到点已确认',cancelled:'已取消'};
     let state = {connected:false}, image = null, imageKey = '', view = null;
     let costmapImage = null, costmapKey = '', costmapError = false;
     let selectionMode = 'goal', drag = null, prepared = null, action = null, stopping = false;
@@ -167,15 +184,18 @@
       points.forEach((p,i) => {const q=screen(p);if(i)ctx.lineTo(q.x,q.y);else ctx.moveTo(q.x,q.y);});
       ctx.stroke();ctx.setLineDash([]);
     }
-    function marker(p,color,heading) {
+    function marker(p,color,heading,opacity=1,outline=false) {
       if(!p) return;
       const q=screen(p);
-      ctx.save();ctx.translate(q.x,q.y);ctx.fillStyle=color;ctx.strokeStyle='white';ctx.lineWidth=1.6;ctx.beginPath();
+      ctx.save();ctx.translate(q.x,q.y);ctx.globalAlpha=opacity;
+      ctx.fillStyle=color;ctx.strokeStyle=outline?color:'white';ctx.lineWidth=outline?2.2:1.6;ctx.beginPath();
       if(heading){
         ctx.rotate(view.map.origin[2]-p.yaw);
+        if(outline) ctx.scale(1.45,1.45);
         ctx.moveTo(13,0);ctx.lineTo(-7,7);ctx.lineTo(-4,0);ctx.lineTo(-7,-7);ctx.closePath();
       }else ctx.arc(0,0,6,0,2*Math.PI);
-      ctx.fill();ctx.stroke();ctx.restore();
+      if(!outline) ctx.fill();
+      ctx.stroke();ctx.restore();
     }
     function drawBase(surface, context, background, map) {
       const w=surface.clientWidth,h=surface.clientHeight,dpr=window.devicePixelRatio||1;
@@ -218,7 +238,12 @@
       line(state.trail,'#16866d');
       const route=state.preview||state.route;
       if(route) line(route.path,'#3767ea',[6,4]);
-      marker(seed(),'#7c45ac',true);marker(goal(),'#d58626',false);marker(state.source_fresh===false?null:state.pose,'#245bd4',true);
+      marker(seed(),'#7c45ac',true);marker(goal(),'#d58626',false);
+      const loc=state.localization||{};
+      if(loc.continuous && !['manual','unlocalized'].includes(loc.tracking_state)){
+        marker(loc.amcl_pose,'#b43099',true,state.connected===true && loc.tracking_state==='tracking'?1:.28,true);
+      }
+      marker(state.source_fresh===false?null:state.pose,'#245bd4',true);
       ctx.restore();
     }
     // 图像异步加载后仍核对地图身份，避免旧图覆盖当前图。
@@ -275,6 +300,8 @@
       costmapNote.textContent=!costmapAvailable?'等待代价地图':costmapError?'代价地图加载失败':'正在加载代价地图';
       const editable=online && matched && Boolean(state.csrf_token) && !action && !stopping;
       const loc=state.localization||{}, task=state.task||{}, preview=state.preview, route=preview||state.route;
+      const mapGoal=state.goal, continuous=loc.continuous===true;
+      const tracking=continuous && online && loc.tracking_state==='tracking';
       const avoidance=online ? state.avoidance : null;
       $('map-radar-legend').hidden=!avoidance;
       $('costmap-radar-legend').hidden=!avoidance;
@@ -293,11 +320,25 @@
       $('map-details').textContent=map?`${map.width} × ${map.height} · ${map.resolution.toFixed(3)} m/格`:'等待地图信息';
       $('pick-goal').setAttribute('aria-pressed',String(selectionMode==='goal'));
       $('pick-seed').setAttribute('aria-pressed',String(selectionMode==='seed'));
-      $('localization').textContent=locNames[loc.mode]||'未定位';$('localization-reason').textContent=loc.reason||'';
+      $('localization').textContent=continuous?(!online?'连接断开':trackingNames[loc.tracking_state]||'未定位'):(locNames[loc.mode]||'未定位');
+      $('localization').className='pill'+(tracking?' on':'');
+      $('localization-reason').textContent=loc.reason||'';
+      $('localize').textContent=continuous?'AMCL定位并跟踪':'单次定位';
+      $('amcl-tracking').hidden=!continuous;
+      const observation=continuous && !['manual','unlocalized'].includes(loc.tracking_state) ? loc.amcl_pose : null;
+      $('amcl-legend').hidden=!observation;
+      $('amcl-legend-label').textContent=tracking?'AMCL 观测':'AMCL 上次观测（已过期）';
+      $('vehicle-legend').textContent=continuous?'执行位置 / 预览':'车辆 / 预览';
+      $('amcl-pose').textContent=observation?`${tracking?'':'上次观测：'}${poseText(observation)}`:'—';
+      $('amcl-age').textContent=observation && finite(loc.amcl_age_ms)?`${loc.amcl_age_ms.toFixed(0)} ms${tracking?'':' · 已过期'}`:'—';
+      $('amcl-quality').textContent=observation && [loc.sigma_x_m,loc.sigma_y_m,loc.sigma_yaw_rad].every(finite)
+        ? `${(loc.sigma_x_m*100).toFixed(1)} / ${(loc.sigma_y_m*100).toFixed(1)} cm · ${(loc.sigma_yaw_rad*180/Math.PI).toFixed(1)}°`:'—';
+      $('amcl-correction').textContent=observation && [loc.correction_distance_m,loc.correction_yaw_rad].every(finite)
+        ? `${(loc.correction_distance_m*100).toFixed(1)} cm · ${(loc.correction_yaw_rad*180/Math.PI).toFixed(1)}°`:'—';
       const pose=state.source_fresh===false?null:state.pose;
       $('pose').textContent=pose?`${online?'地图位姿':'上次位姿'}：${poseText(pose)}`:'当前位置尚未建立';
       $('local-pose').textContent=pose && state.local_pose?`置零坐标：${poseText(state.local_pose)}`:'';
-      $('localize').disabled=!canPrepare||!seed();$('zero').disabled=!canPrepare||!seed();
+      $('localize').disabled=!canPrepare||!seed()||state.can_localize===false;$('zero').disabled=!canPrepare||!seed();
       $('preview').disabled=!canPrepare||!goal()||!pose;
       $('start').textContent=ready?'上传至 READY':'开始';
       $('start').disabled=!editable||state.can_start!==true||!preview||prepared!==preview.id;
@@ -308,11 +349,24 @@
         `${preview?'预览':'已提交路线'} · ${route.segments.length} 段 · 预计 ${route.nominal_duration_s.toFixed(1)} s · CRC32 ${crc ?? '—'}`;
       const obstaclePause=['waiting','replanning','resuming'].includes(avoidance?.phase)
         && task.phase==='failed' && task.stop_verified===true && task.error==='MCU 错误 1 / 驱动 0';
-      const taskError=obstaclePause?'':task.error;
-      $('task-phase').textContent=obstaclePause?'遇障暂停':phaseNames[task.phase]||task.phase||'待命';
+      const mapPause=['replanning','unverified','complete','cancelled'].includes(mapGoal?.phase)
+        && task.phase==='failed' && task.stop_verified===true && task.error==='MCU 错误 1 / 驱动 0';
+      const taskError=obstaclePause||mapPause?'':task.error;
+      const mcuPhase=phaseNames[task.phase]||task.phase||'待命';
+      const mapPhase=mapGoal && ['replanning','unverified','complete','cancelled'].includes(mapGoal.phase)
+        ? goalPhaseNames[mapGoal.phase]:null;
+      $('task-phase').textContent=taskError?mcuPhase:mapPhase||(obstaclePause?'遇障暂停':mcuPhase);
+      $('mcu-phase').textContent=mcuPhase;
       $('task-id').textContent=task.id??'—';
       $('task-index').textContent=task.count?`${Math.min(task.index+1,task.count)} / ${task.count}`:'—';
       $('arrival').textContent=task.arrival?'已报告到点':'未报告';
+      $('map-arrival-row').hidden=!continuous;
+      $('map-arrival').textContent=mapGoal?.map_arrived===true?'已确认（≤10 cm）':mapGoal?.map_arrived===false?'尚未到点':
+        mapGoal?.phase==='unverified'?'动作完成，地图到点未验证':mapGoal?.phase==='cancelled'?'已取消':'尚未验证';
+      $('map-distance-row').hidden=!continuous;
+      $('map-distance').textContent=tracking && finite(mapGoal?.distance_m)?`${(mapGoal.distance_m*100).toFixed(1)} cm`:'—';
+      $('goal-status').hidden=!continuous||!mapGoal?.reason;
+      $('goal-status').textContent=mapGoal?.reason||'';
       $('stop-ack').textContent=task.stop_ack==null?'—':task.stop_ack?'已收到':'未收到';
       $('stop-proof').textContent=task.stop_verified==null?'—':task.stop_verified?'已确认':'尚未确认';
       $('task-progress').textContent=!finite(task.progress)?'—':task.phase==='move'?`${task.progress.toFixed(3)} m`:
@@ -388,7 +442,7 @@
       else action=op;
       prepared=null;
       if(ekfTurn) ekfTurnError='';
-      else note(op==='localize'?'正在进行单次定位，请等待 RK 应答。':'正在提交请求。');
+      else note(op==='localize'?(state.localization?.continuous?'正在建立 AMCL 持续定位，请等待 RK 应答。':'正在进行单次定位，请等待 RK 应答。'):'正在提交请求。');
       render();
       try {
         const response=await fetch('/api/'+op,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':state.csrf_token},body:JSON.stringify(body)});

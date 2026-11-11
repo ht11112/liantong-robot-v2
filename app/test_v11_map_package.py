@@ -44,6 +44,7 @@ class MapPackageTests(unittest.TestCase):
                                    map_sha256=sha(pgm.read_bytes()),
                                    yaml_sha256=sha(yaml.read_bytes()))
             files, manifest = builder.assemble(args)
+            self.assertEqual(manifest['wire_version'], 12)
             self.assertIn('app/v11_obstacles.py', files)
             self.assertIn('app/v12_feedback_worker.py', files)
             self.assertIn('scripts/benchmark_v12_feedback.py', files)
@@ -116,6 +117,7 @@ if __name__ == '__main__':
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 outputs.append(result.stdout)
             self.assertIn('--obstacle-scan-timeout', outputs[0])
+            self.assertIn('--continuous-amcl', outputs[0])
             self.assertIn('offline imports OK', outputs[1])
             self.assertIn('packaged feedback spawn OK', outputs[2])
             self.assertFalse((destination / 'must-not-exist').exists())

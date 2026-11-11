@@ -13,6 +13,7 @@ from verify_source import ROOT
 sys.path.insert(0, str(ROOT / 'app'))
 sys.path.insert(0, str(ROOT / 'mcu' / 'tools'))
 from v11_map_plan import load_map
+from mcu_v11 import VERSION
 
 
 SOURCES = (
@@ -36,6 +37,7 @@ def assemble(args):
         raise ValueError('Map YAML changed during packaging')
     manifest = dict(schema='v12-map-rk-package-1', entry_point='app/v11_map_runtime.py',
                     map=metadata, map_pgm=pgm, map_yaml=yaml, default_mode='ready',
+                    wire_version=VERSION,
                     files={name: sha256(raw) for name, raw in sorted(files.items())})
     files['manifest.json'] = (json.dumps(manifest, indent=2) + '\n').encode('utf-8')
     return files, manifest

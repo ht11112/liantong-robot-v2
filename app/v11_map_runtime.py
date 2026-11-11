@@ -34,6 +34,9 @@ MCU_CANCELLED = 1
 ARRIVAL_REACHED = 8
 POSE_DISTANCE_TOLERANCE_M = .02
 POSE_HEADING_TOLERANCE_RAD = math.radians(2.)
+AMCL_CORRECTION_DISTANCE_M = .20
+AMCL_CORRECTION_YAW_RAD = math.radians(10.)
+MAP_ARRIVAL_DISTANCE_M = .10
 
 
 def angle(value):
@@ -68,10 +71,17 @@ def inverse(pose):
 # 串口在独立进程持续查询；导航与 ROS 只消费内存中的反馈历史。
 class Navigation:
     def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
-                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False):
+                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False,
+                 continuous_amcl=False):
         if not math.isfinite(obstacle_scan_timeout_s) or obstacle_scan_timeout_s <= 0:
             raise ValueError('Obstacle scan timeout must be positive and finite')
         self.grid, self.localizer, self.mode, self.clock = grid, localizer, mode, clock
+        self.continuous_amcl = continuous_amcl
+        self.amcl_session_id = None
+        self.goal = (dict(target=None, phase='idle', map_arrived=None, distance_m=None, reason=None)
+                     if continuous_amcl else None)
+        self.goal_stop_time = None
+        self.goal_task = None
         self.scanner = scanner
         self.ekf = ekf
         self.ekf_turn = (dict(phase='idle', message='仅试验单次原地转向 90°，不会直行',
@@ -82,6 +92,7 @@ class Navigation:
         self.obstacles = DynamicObstacles(grid)
         self.obstacle_scan_timeout_s = obstacle_scan_timeout_s
         self.scan_stamp = self.last_usable_scan = None
+        self.scan_not_before_mono = None
         self.scan_points = self.scan_expires = None
         self.scan_status = 'unavailable'
         self.obstacle_hits = {}
@@ -112,6 +123,13 @@ class Navigation:
         self.feedback_error = None
 
     def _invalidate(self, reason):
+        if self.continuous_amcl and self.localizer is not None:
+            self.localizer.stop_tracking()
+        self.amcl_session_id = None
+        if self.goal is not None:
+            self.goal.update(target=None, phase='cancelled', map_arrived=None, distance_m=None, reason=reason)
+            self.goal_stop_time = None
+            self.goal_task = None
         if self._ekf_turn_active():
             self._end_ekf_turn('failed', reason)
         if self.detour is not None:
@@ -120,6 +138,97 @@ class Navigation:
         self._clear_obstacles()
         self.trail.clear()
         self.localization = dict(mode='unlocalized', reason=reason)
+
+    def _tracking(self):
+        if not self.continuous_amcl or self.localizer is None:
+            return None
+        return self.localizer.tracking_snapshot()
+
+    def _amcl_observation(self, tracking):
+        if (tracking is None or self.localization['mode'] != 'amcl'
+                or self.amcl_session_id != tracking['session_id']):
+            return False
+        odom = tracking['odom_pose']
+        sample = self.latest.status if self.latest is not None else None
+        return bool(odom and sample and (odom['boot'], odom['epoch']) == (sample.boot, sample.epoch))
+
+    def _apply_amcl_reference(self, tracking):
+        self.alignment = dict(tracking['alignment'])
+        self.localization.update(stamp_ns=tracking['map_pose']['stamp_ns'])
+        self._clear_obstacles()
+        self.scan_not_before_mono = self.clock()
+        self.trail.clear()
+        self.trail.append(self._map_pose())
+
+    def _amcl_correction(self, tracking):
+        if self.alignment is None or not self._amcl_observation(tracking):
+            return None, None
+        predicted = compose(self.alignment, tracking['odom_pose'])
+        measured = tracking['map_pose']
+        return (math.hypot(measured['x'] - predicted['x'], measured['y'] - predicted['y']),
+                angle(measured['yaw'] - predicted['yaw']))
+
+    def _map_replan(self, reason, *, stopped=False):
+        self.goal.update(phase='replanning', map_arrived=False, reason=reason)
+        self.detour = dict(goal=dict(self.goal['target']), attempt=None, retry_at=0.,
+                           map_replan=True, reference_applied=False)
+        self.avoidance_phase, self.avoidance_message = 'stopping', reason
+        if stopped:
+            self.stop_verified = True
+            self.lease_task = None
+        else:
+            self._queue_stop()
+
+    # 执行参考只在真实停车后改变；AMCL 新帧仅决定是否停车，不移动行驶中的车标。
+    def _amcl_cycle(self):
+        tracking = self._tracking()
+        with self.lock:
+            if self.goal is None or self.alignment is None or self.latest is None:
+                return
+            if self._ekf_turn_active() or (self.route is self.ekf_turn_plan and self.ekf_turn_plan is not None):
+                return
+            sample = self.latest.status
+            goal = self.goal
+            if goal['target'] is None or goal['phase'] in ('complete', 'cancelled', 'idle'):
+                return
+            if sample.first_error not in (0, MCU_CANCELLED) or sample.first_drive_error or sample.flags & RX_FAULT:
+                return
+            stopped = self._stationary() and bool(sample.flags & STOP_CONFIRMED)
+            if (sample.state == 8 and sample.flags & ARRIVAL_REACHED and stopped and self.detour is None
+                    and self.goal_task == (sample.boot, sample.epoch, sample.task)):
+                if self.goal_stop_time is None:
+                    self.goal_stop_time = self.source_time
+                goal.update(phase='unverified', map_arrived=None, reason='动作完成，等待停车后的 AMCL 确认地图到点')
+            if not self._amcl_observation(tracking):
+                return
+            if goal['phase'] == 'unverified':
+                if (not stopped or not tracking['fresh']
+                        or tracking['source_monotonic_s'] <= self.goal_stop_time):
+                    return
+                measured, target = tracking['map_pose'], goal['target']
+                distance = math.hypot(measured['x'] - target['x'], measured['y'] - target['y'])
+                goal['distance_m'] = distance
+                if distance <= MAP_ARRIVAL_DISTANCE_M:
+                    self._apply_amcl_reference(tracking)
+                    goal.update(phase='complete', map_arrived=True, reason='AMCL 已确认地图到点')
+                    return
+                self._map_replan('动作完成但地图未到点，重新规划', stopped=True)
+            elif goal['phase'] == 'executing' and tracking['fresh']:
+                distance, yaw = self._amcl_correction(tracking)
+                if distance >= AMCL_CORRECTION_DISTANCE_M or abs(yaw) >= AMCL_CORRECTION_YAW_RAD:
+                    self._map_replan('AMCL 累计修正达到阈值，停车后重新规划')
+            detour = self.detour
+            if (detour is not None and self.stop_verified and not self.stop_requested
+                    and stopped and not detour.get('reference_applied')):
+                # 失效时使用同会话最后可信变换，不能制造新的定位结果。
+                self._apply_amcl_reference(tracking)
+                detour['reference_applied'] = True
+                detour.pop('remaining', None)
+                detour['map_replan'] = True
+                detour['attempt'] = None
+                self.goal.update(phase='replanning', map_arrived=False,
+                                 reason='已停稳并更新地图参考，等待新雷达配对后重新规划')
+                self.avoidance_phase, self.avoidance_message = 'waiting', self.goal['reason']
 
     def _fresh(self):
         if not self.connected or self.latest is None:
@@ -224,6 +333,7 @@ class Navigation:
     def _clear_obstacles(self):
         self.obstacles.clear()
         self.scan_stamp = self.last_usable_scan = None
+        self.scan_not_before_mono = None
         self.scan_points = self.scan_expires = None
         self.scan_status = 'unavailable'
         self.obstacle_hits.clear()
@@ -259,10 +369,12 @@ class Navigation:
         with self.lock:
             if self.alignment is None or not self._fresh():
                 return
-            anchor, last_stamp = self.alignment, self.scan_stamp
+            anchor, last_stamp, not_before = self.alignment, self.scan_stamp, self.scan_not_before_mono
             identity = self.latest.status.boot, self.latest.status.epoch
         frame = self.scanner.latest_observation()
         if frame is None or (last_stamp is not None and frame['stamp_ns'] <= last_stamp):
+            return
+        if not_before is not None and frame['source_mono'] <= not_before:
             return
         odom = frame['pose']
         if (odom['boot'], odom['epoch']) != identity:
@@ -323,6 +435,8 @@ class Navigation:
             work()
 
     def _cancel_detour(self, reason):
+        if self.detour is not None and self.goal is not None:
+            self.goal.update(target=None, phase='cancelled', map_arrived=None, reason=reason)
         self.detour = None
         self.avoidance_phase, self.avoidance_message = 'cancelled', reason
 
@@ -348,12 +462,23 @@ class Navigation:
                 before = self.latest.status
                 initial = pose_of(before)
                 self.plan = self.route = None
+                previous_alignment = self.alignment
+                if self.goal is not None:
+                    self.goal.update(target=None, phase='idle', map_arrived=None, distance_m=None, reason=None)
+                    self.goal_stop_time = None
+                    self.goal_task = None
             try:
                 if mode == 'amcl':
                     if self.localizer is None:
                         raise ValueError('AMCL 当前不可用，可手动对齐')
-                    map_pose, odom_pose = self.localizer.localize(seed)
+                    if self.continuous_amcl:
+                        map_pose, odom_pose = self.localizer.localize(
+                            seed, cancelled=lambda: self.stop_revision != stop_revision)
+                    else:
+                        map_pose, odom_pose = self.localizer.localize(seed)
                 else:
+                    if self.continuous_amcl and self.localizer is not None:
+                        self.localizer.stop_tracking()
                     map_pose = seed
                 with self.lock:
                     current = self._require_stationary()
@@ -370,17 +495,27 @@ class Navigation:
                     self.origin = dict(x=odom_pose['x'], y=odom_pose['y'], yaw=odom_pose['yaw'])
                     self.localization = dict(mode=mode, reason=None, stamp_ns=map_pose.get('stamp_ns'),
                                              boot=str(current.boot), epoch=current.epoch)
+                    self.amcl_session_id = (self._tracking()['session_id']
+                                            if mode == 'amcl' and self.continuous_amcl else None)
                     self.trail.clear()
                     self.trail.append(self._map_pose())
             except Exception as exc:
+                if self.continuous_amcl and self.localizer is not None:
+                    self.localizer.stop_tracking()
                 with self.lock:
-                    self._invalidate(str(exc))
+                    if self.continuous_amcl and previous_alignment is not None and self.alignment is previous_alignment:
+                        self.localization['reason'] = str(exc)
+                    else:
+                        self._invalidate(str(exc))
                 raise
 
     # 规划后重新核对起点和定位，避免执行过期预览。
     def preview(self, goal):
         with self._stationary_work('planning') as stop_revision:
+            tracking = self._tracking()
             with self.lock:
+                if self._amcl_observation(tracking) and tracking['fresh']:
+                    self._apply_amcl_reference(tracking)
                 anchor, pose = self.alignment, self._map_pose()
                 self.plan = None
                 if pose is None:
@@ -435,6 +570,11 @@ class Navigation:
                 self.ekf_turn.update(phase='uploading', message='准备单次转向；MCU 上限 102°，EKF 接近 90° 时停车',
                                      direction=direction, turned_deg=0.)
                 self.ekf_turn_plan = plan
+                if self.goal is not None:
+                    self.goal.update(target=None, phase='cancelled', map_arrived=None, distance_m=None,
+                                     reason='已切换为单次 EKF 转向试验')
+                    self.goal_stop_time = None
+                    self.goal_task = None
                 self.ekf_turn_last_yaw = self.ekf_turn_outcome = None
                 self.plan = None
                 self.pending = self.route = plan
@@ -517,6 +657,11 @@ class Navigation:
             self.avoidance_phase, self.avoidance_message, self.replans = 'watching', None, 0
             self.pending = self.route = self.plan
             self.plan = None
+            if self.goal is not None:
+                self.goal.update(target=dict(self.route['goal']), phase='executing', map_arrived=None,
+                                 distance_m=None, reason='正在执行 MCU 动作队列')
+                self.goal_stop_time = None
+                self.goal_task = None
             self.work, self.error = 'uploading', None
             self.stop_ack = self.stop_verified = None
             self.stop_evidence = None
@@ -527,6 +672,11 @@ class Navigation:
                 raise ValueError('静止验收模式使用查询和上传')
             if not self.connected:
                 raise ValueError('串口状态未知，请在现场停车')
+            if self.goal is not None:
+                self.goal.update(target=None, phase='cancelled', map_arrived=None, distance_m=None,
+                                 reason='已人工停车，自动续行已取消')
+                self.goal_stop_time = None
+                self.goal_task = None
             if self._ekf_turn_active():
                 self._end_ekf_turn('cancelled', '已人工取消 EKF 转向')
                 return
@@ -545,6 +695,7 @@ class Navigation:
 
     def _observe_upload(self, exchange):
         self.observe(exchange)
+        self._amcl_cycle()
         with self.lock:
             if self.stop_requested:
                 raise ValueError('上传已取消')
@@ -617,6 +768,7 @@ class Navigation:
                 return
             revalidate = self.detour is not None
         while True:
+            self._amcl_cycle()
             snapshot = self._upload_snapshot(master, scan_deadline, 'before_start', pose)
             if snapshot is None:
                 return
@@ -652,6 +804,10 @@ class Navigation:
                 self.ekf_turn.update(phase='turning', message='EKF 正在监督转角；试验结束后不直行')
             if not self.stop_requested and status.state in LEASE_STATES and status.lease_remaining_ms:
                 self.lease_task = status.boot, status.epoch, status.task
+                if self.goal is not None and self.goal['target'] is not None:
+                    self.goal.update(phase='executing', map_arrived=None, reason='正在执行 MCU 动作队列')
+                    self.goal_stop_time = None
+                    self.goal_task = (status.boot, status.epoch, status.task)
                 if self.detour is not None:
                     rejoining = self.detour.get('rejoining', False)
                     self.detour = None
@@ -780,7 +936,8 @@ class Navigation:
                 return
             detour = self.detour
         if detour is None:
-            self._check_route(reply)
+            if self.scanner is not None:
+                self._check_route(reply)
             return
         with self.lock:
             if self.detour is not detour:
@@ -791,15 +948,15 @@ class Navigation:
             if status.first_error not in (0, MCU_CANCELLED):
                 self._cancel_detour('底盘有故障，取消自动续行')
                 return
-            if status.flags & ARRIVAL_REACHED:
+            if status.flags & ARRIVAL_REACHED and not detour.get('map_replan'):
                 self.detour = None
                 self.avoidance_phase, self.avoidance_message = 'watching', '原任务已到点'
                 return
             points = self._scan_points()
-            if points is None or self.clock() < detour['retry_at']:
+            if (self.scanner is not None and points is None) or self.clock() < detour['retry_at']:
                 return
             cells = self.obstacles.cells
-            if cells == detour['attempt']:
+            if cells == detour['attempt'] and not detour.get('map_replan'):
                 return
             detour['attempt'], detour['retry_at'] = cells, self.clock() + REPLAN_INTERVAL_S
             pose = self._map_pose()
@@ -865,6 +1022,7 @@ class Navigation:
                 if self.feedback_error is not None:
                     raise self.feedback_error
                 self._ekf_turn_cycle()
+                self._amcl_cycle()
                 with self.lock:
                     stop = self.stop_requested
                     plan, self.pending = self.pending, None
@@ -881,7 +1039,8 @@ class Navigation:
                             self.observe(reply)
                             with self.lock:
                                 reply = self.latest
-                            if self.scanner is not None and self.mode == 'drive':
+                            self._amcl_cycle()
+                            if self.mode == 'drive' and (self.scanner is not None or self.continuous_amcl):
                                 self._avoidance_cycle(master, reply)
                             self._renew_if_due(master, reply)
                     if master.failed:
@@ -898,7 +1057,7 @@ class Navigation:
                         if self.scanner is not None:
                             self._record_scan_failure('v12_navigation_rejected',
                                                       self.work or 'query', self.error)
-                        if self.detour is not None:
+                        if self.detour is not None and (stop or not self.stop_requested):
                             self._cancel_detour(self.error)
                         if stop:
                             self.stop_ack, self.stop_verified = False, False
@@ -932,6 +1091,7 @@ class Navigation:
 
     # 网页读取缓存快照；过期反馈不能证明当前位置或停车状态。
     def snapshot(self):
+        tracking = self._tracking()
         feedback = self.feedback.snapshot() if self.feedback is not None else None
         communication = self.feedback.cached_diagnostics(feedback) if feedback is not None else None
         cached = feedback['latest'] if feedback is not None else None
@@ -983,13 +1143,35 @@ class Navigation:
                         error=self.error or (f'MCU 错误 {status.first_error} / 驱动 {status.first_drive_error}'
                                              if status and (status.first_error or status.first_drive_error)
                                              else None))
-            result = dict(map=self.grid.metadata(), localization=dict(self.localization), pose=pose,
+            localization = dict(self.localization)
+            if self.continuous_amcl:
+                usable = self._amcl_observation(tracking)
+                correction_distance, correction_yaw = self._amcl_correction(tracking)
+                tracking_state = (tracking['status'] if tracking is not None else 'inactive')
+                if localization['mode'] == 'amcl' and (not usable or not tracking['fresh']):
+                    tracking_state = 'odom_fallback'
+                elif localization['mode'] == 'manual':
+                    tracking_state = 'manual'
+                elif localization['mode'] == 'unlocalized' and tracking_state != 'initializing':
+                    tracking_state = 'unlocalized'
+                localization.update(continuous=True, tracking_state=tracking_state,
+                                    amcl_pose=tracking['map_pose'] if usable else None,
+                                    amcl_age_ms=tracking['age_ms'] if usable else None,
+                                    sigma_x_m=tracking['sigma_x_m'] if usable else None,
+                                    sigma_y_m=tracking['sigma_y_m'] if usable else None,
+                                    sigma_yaw_rad=tracking['sigma_yaw_rad'] if usable else None,
+                                    correction_distance_m=correction_distance,
+                                    correction_yaw_rad=correction_yaw)
+            result = dict(map=self.grid.metadata(), localization=localization, pose=pose,
                         local_pose=(compose(inverse(self.origin), pose_of(status))
                                     if pose is not None and self.origin else None),
                         trail=list(self.trail), preview=self.plan, route=self.route,
                         connected=self.connected,
                         source_fresh=fresh, busy=bool(self.work or self.stop_requested or self._ekf_turn_active()), mode=self.mode,
                         task=task, avoidance=avoidance, can_prepare=preparing,
+                        can_localize=preparing and self.localizer is not None,
+                        goal=dict(self.goal, target=dict(self.goal['target']) if self.goal['target'] else None)
+                             if self.goal is not None else None,
                         ekf_turn=dict(self.ekf_turn) if self.ekf_turn is not None else None,
                         can_ekf_turn=can_ekf_turn,
                         can_start=bool(preparing and pose and self.plan and self.plan['segments']),
@@ -1093,7 +1275,9 @@ def main(argv=None):
     parser.add_argument('--obstacle-scan-timeout', type=float, default=OBSTACLE_SCAN_TIMEOUT_S,
                         help='持续缺少可用扫描后的 RK 停车等待时间（秒）')
     parser.add_argument('--mode', choices=('ready', 'drive'), default='ready')
-    parser.add_argument('--manual-only', action='store_true', help='只启用地图手动对齐')
+    localization = parser.add_mutually_exclusive_group()
+    localization.add_argument('--manual-only', action='store_true', help='只启用地图手动对齐')
+    localization.add_argument('--continuous-amcl', action='store_true', help='持续 AMCL 跟踪，停车后修正地图参考并重规划')
     parser.add_argument('--no-modeled-error-margin', action='store_true',
                         help='路线扫掠只检查车体包络，不叠加动作结束误差')
     parser.add_argument('--obstacle-test', action='store_true', help='启用前方雷达挡路停车与自动重规划')
@@ -1117,7 +1301,7 @@ def main(argv=None):
     localizer = None
     if not args.manual_only:
         from v11_ros import RosLocalizer
-        localizer = RosLocalizer(args.map_yaml, args.scan_topic, **mounting)
+        localizer = RosLocalizer(args.map_yaml, args.scan_topic, continuous=args.continuous_amcl, **mounting)
     scanner = None
     if args.obstacle_test:
         from v11_ros import RosObstacleScanner
@@ -1126,7 +1310,7 @@ def main(argv=None):
     if args.ekf_imu_topic:
         ekf = EkfWorker(args.ekf_imu_topic, args.ekf_executable)
     nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner, ekf=ekf, ekf_turn_test=args.ekf_turn_test,
-                     obstacle_scan_timeout_s=args.obstacle_scan_timeout)
+                     obstacle_scan_timeout_s=args.obstacle_scan_timeout, continuous_amcl=args.continuous_amcl)
     closed = threading.Event()
     workers = [threading.Thread(target=nav.run, args=(args.port, closed, args.trace_feedback_timing),
                                 name='v12-navigation')]
