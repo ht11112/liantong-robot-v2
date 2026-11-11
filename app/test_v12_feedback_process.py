@@ -38,8 +38,8 @@ class GuidedSimulatedPort(SimulatedPort):
             values['ack_result'] = 4
             body = HEADER[2:] + STATUS.pack(*values.values())
             self.pending[:] = b'\xa5\x5a' + body + struct.pack('<H', crc16(body))
-        elif self.profile == 'steer_late':
-            self.ready_at = time.monotonic() + .15
+        elif self.profile in ('steer_delayed', 'steer_late'):
+            self.ready_at = time.monotonic() + (.9 if self.profile == 'steer_delayed' else 1.001)
         return len(packet)
 
 
@@ -138,6 +138,21 @@ class FeedbackProcessTests(unittest.TestCase):
         worker.process.join(2.)
         self.assertTrue(worker.failed)
         self.assertFalse(worker.snapshot()['connected'])
+
+    def test_steer_ack_after_nine_hundred_ms_is_cached_without_resending(self):
+        worker = self.launch_guided('steer_delayed')
+        latest = worker.latest.status
+        cursor = worker.snapshot()['cursor']
+        tx_cursor = worker.transmissions_since(0)['cursor']
+        reply = worker.steer(latest.task, 0, -250, latest.measurement_tick_ms)
+        self.assertGreaterEqual(reply.received_at-reply.sent_at, .9)
+        self.assertLess(reply.received_at-reply.sent_at, 1.)
+        entries = worker.transmissions_since(tx_cursor)['entries']
+        self.assertEqual(sum(entry['opcode'] == STEER for entry in entries), 1)
+        replies = [r for r in worker.history_since(cursor)['exchanges'] if r.opcode == STEER]
+        self.assertEqual([asdict(r) for r in replies], [asdict(reply)])
+        self.assertFalse(worker.failed)
+        self.assertTrue(worker.snapshot()['connected'])
 
     def free_grid(self):
         folder = TemporaryDirectory()

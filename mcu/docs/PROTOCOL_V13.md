@@ -57,7 +57,7 @@ master.steer(task, index, bias_millirpm, basis_tick)
 worker.steer(task, index, bias_millirpm, basis_tick, revision=stop_revision)
 ```
 
-`RkMaster` 和 `FeedbackWorker` 沿用文件名 `mcu_v11.py` 与 `v12_feedback_worker.py`。STEER 的 ACK 进入共享反馈缓存，导航读取同一缓存。主站按实际发送时刻计算默认 100 毫秒应答期限，所有控制事务串行处理。STOP 的取消代次在命令出队和实际串口写入前核对，已取消的 STEER 不发送。
+`RkMaster` 和 `FeedbackWorker` 沿用文件名 `mcu_v11.py` 与 `v12_feedback_worker.py`。STEER 的 ACK 进入共享反馈缓存，导航读取同一缓存。主站按实际发送时刻计算应答期限，APPEND、START 和 STEER 默认等待 1 秒，其余事务默认 100 毫秒，所有控制事务串行处理。串口写入超时仍使用默认 100 毫秒；STEER 应答等待不延长 MCU 的 500 毫秒修正有效期。STOP 的取消代次在命令出队和实际串口写入前核对，已取消的 STEER 不发送。
 
 MCU 显式拒绝保留原始 ACK 和结果。STEER 应答超时或其他结果不确定时，主站结束本次通信会话。每次调用发送至多一条 STEER。V13 主站只接受版本 13 应答，V13 固件只执行版本 13 控制帧。
 

@@ -13,7 +13,8 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
-from mcu_v11 import (APPEND_REPLY_TIMEOUT_S, START_REPLY_TIMEOUT_S, Exchange, LinkError, PERIOD_S,
+from mcu_v11 import (APPEND_REPLY_TIMEOUT_S, START_REPLY_TIMEOUT_S, STEER_REPLY_TIMEOUT_S,
+                     Exchange, LinkError, PERIOD_S,
                      QUERY, QueuePlan, Rejected, RequestCancelled, RkMaster, STATUS, STOP, Telemetry,
                      error_record, open_port)
 
@@ -499,8 +500,9 @@ class FeedbackWorker:
         return self._submit('renew', task, revision, self.reply_timeout + STOP_PROOF_TIMEOUT_S + 2.)
 
     def steer(self, task, index, bias_millirpm, basis_tick, *, revision=None):
+        steer_timeout = max(self.reply_timeout, STEER_REPLY_TIMEOUT_S)
         return self._submit('steer', (task, index, bias_millirpm, basis_tick), revision,
-                            self.reply_timeout + STOP_PROOF_TIMEOUT_S + 2.)
+                            steer_timeout + STOP_PROOF_TIMEOUT_S + 2.)
 
     def request_stop(self):
         self._check_owner()

@@ -219,19 +219,58 @@ class MasterTests(unittest.TestCase):
             master.steer(TASK + 1, 0, 1000, 995)
         self.assertEqual(len(port.writes), 2)
 
-    def test_late_steer_reply_times_out_from_actual_send_without_retry(self):
+    def test_steer_accepts_900ms_ack_measured_from_actual_send(self):
         def response(index, kind, request, task):
             rows = active_move_response(index, kind, request, task)
-            return [(delay if kind != v11.STEER else .101, frame) for delay, frame in rows]
+            return [(delay if kind != v11.STEER else .900, frame) for delay, frame in rows]
 
         master, port = self.make_master(response)
         master.discover()
+        called_at = port.clock()
+        master.sleep = lambda seconds: port.clock.sleep(seconds + .400)
+        reply = master.steer(TASK, 0, 500, 995)
+        self.assertGreaterEqual(reply.sent_at - called_at, .400)
+        self.assertAlmostEqual(reply.received_at - reply.sent_at, .900)
+        self.assertGreater(reply.received_at - called_at, 1.)
+        self.assertEqual(master.reply_timeout, .100)
+        self.assertFalse(master.failed)
+        self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STEER])
+
+    def test_late_steer_reply_times_out_from_actual_send_without_retry(self):
+        def response(index, kind, request, task):
+            rows = active_move_response(index, kind, request, task)
+            return [(delay if kind != v11.STEER else 1.001, frame) for delay, frame in rows]
+
+        master, port = self.make_master(response)
+        master.discover()
+        master.sleep = lambda seconds: port.clock.sleep(seconds + .400)
         with self.assertRaises(v11.ReplyTimeout) as fault:
             master.steer(TASK, 0, 500, 995)
         self.assertEqual(fault.exception.details['sent_at'], port.writes[-1][0])
-        self.assertGreaterEqual(master.clock() - port.writes[-1][0], .100)
+        self.assertAlmostEqual(master.clock() - port.writes[-1][0], 1., delta=.0021)
         self.assertTrue(master.failed)
+        with self.assertRaises(v11.LinkError):
+            master.steer(TASK, 0, 500, 995)
         self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, v11.STEER])
+
+    def test_steer_extension_keeps_query_renew_and_stop_at_100ms(self):
+        for opcode in (v11.QUERY, v11.RENEW, v11.STOP):
+            with self.subTest(opcode=opcode):
+                def response(index, kind, request, task):
+                    rows = active_move_response(index, kind, request, task)
+                    return [(delay if index == 0 else .101, frame) for delay, frame in rows]
+
+                master, port = self.make_master(response)
+                master.discover()
+                if opcode == v11.QUERY:
+                    self.assertIsNone(master.query())
+                    self.assertFalse(master.failed)
+                else:
+                    with self.assertRaises(v11.ReplyTimeout):
+                        master.renew(TASK) if opcode == v11.RENEW else master.stop()
+                    self.assertTrue(master.failed)
+                self.assertAlmostEqual(master.clock() - port.writes[-1][0], .100, delta=.0021)
+                self.assertEqual([packet[3] for _, packet in port.writes], [v11.QUERY, opcode])
 
     def test_rejected_steer_reply_is_retained_without_resending(self):
         def response(index, kind, request, task):
