@@ -139,7 +139,9 @@ uint32_t mq_segments_crc(const MQSegment *segments,uint16_t count) {
 }
 static bool segment_valid(MQSegment s) {
   return isfinite(s.value) && (s.kind==MQ_KIND_MOVE ? s.value>0.f && s.value<=1000.f :
-    s.kind==MQ_KIND_TURN && absf(s.value)>0.f && absf(s.value)<=2.f*MQ_PI);
+    s.kind==MQ_KIND_TURN ? absf(s.value)>0.f && absf(s.value)<=2.f*MQ_PI :
+    s.kind==MQ_KIND_DOCK_MOVE ? s.value<-.005f && s.value>=-.05f :
+    s.kind==MQ_KIND_DOCK_TURN && absf(s.value)>MQ_PI/180.f && absf(s.value)<=MQ_PI/36.f);
 }
 /* BEGIN 建立待上传队列，不启动电机；任务号在本次启动内单调递增。 */
 MQResult mq_begin(MQ *q,uint64_t task,uint32_t epoch,uint16_t count,
@@ -163,7 +165,7 @@ MQResult mq_begin(MQ *q,uint64_t task,uint32_t epoch,uint16_t count,
 /* 相同序号和内容可重复确认；新段必须按顺序上传。 */
 MQResult mq_append(MQ *q,uint64_t task,uint16_t index,MQSegment s) {
   if(task!=q->task_id)return MQ_IDENTITY;
-  if(!segment_valid(s) || index>=q->count)return MQ_INVALID;
+  if(!segment_valid(s) || index>=q->count || (s.kind>=MQ_KIND_DOCK_MOVE && q->count!=1u))return MQ_INVALID;
   if(index<q->received) {
     return q->segments[index].kind==s.kind && q->segments[index].value==s.value?MQ_OK:MQ_ORDER;
   }
@@ -237,7 +239,8 @@ static void begin_segment(MQ *q) {
   q->segment_x=q->odom.x;q->segment_y=q->odom.y;
   q->progress=q->yaw_deviation=q->lateral_deviation=0.f;
   q->desired_left=q->desired_right=0;q->target_generation=0;q->target_pending=false;
-  q->state=q->segments[q->index].kind==MQ_KIND_MOVE?MQ_MOVE:MQ_TURN;
+  uint32_t kind=q->segments[q->index].kind;
+  q->state=(kind==MQ_KIND_MOVE || kind==MQ_KIND_DOCK_MOVE)?MQ_MOVE:MQ_TURN;
 }
 static void request_target(MQ *q,int16_t l,int16_t r,uint32_t now) {
   if(q->target_pending)return;
@@ -292,9 +295,11 @@ void mq_tick(MQ *q,uint32_t now) {
   MQSegment s=q->segments[q->index];
   q->yaw_deviation=q->odom.yaw_total-q->segment_yaw;
   q->lateral_deviation=-(q->odom.x-q->segment_x)*sinf(q->segment_yaw)+(q->odom.y-q->segment_y)*cosf(q->segment_yaw);
-  q->progress=s.kind==MQ_KIND_MOVE?q->odom.travel-q->segment_travel:
-    (s.value>0.f?1.f:-1.f)*(q->odom.yaw_total-q->segment_yaw);
-  float tolerance=s.kind==MQ_KIND_MOVE?(q->index+1u==q->count?.10f:.02f):MQ_PI/60.f;
+  bool move=s.kind==MQ_KIND_MOVE || s.kind==MQ_KIND_DOCK_MOVE;
+  q->progress=(s.value>0.f?1.f:-1.f)*(move?q->odom.travel-q->segment_travel:
+    q->odom.yaw_total-q->segment_yaw);
+  float tolerance=s.kind==MQ_KIND_DOCK_MOVE?.005f:s.kind==MQ_KIND_DOCK_TURN?MQ_PI/180.f:
+    move?(q->index+1u==q->count?.10f:.02f):MQ_PI/60.f;
   float remaining=absf(s.value)-q->progress;
   if(remaining<=tolerance) {
     if(q->index+1u==q->count) {
@@ -308,11 +313,12 @@ void mq_tick(MQ *q,uint32_t now) {
     if(!q->target_pending){q->target_generation=0;request_target(q,0,0,now);}
     return;
   }
-  if(s.kind==MQ_KIND_MOVE) {
-    int16_t rpm=remaining<=.30f?MQ_MOVE_NEAR_RPM:MQ_MOVE_CRUISE_RPM;
+  if(move) {
+    int16_t rpm=s.kind==MQ_KIND_DOCK_MOVE?-1:remaining<=.30f?MQ_MOVE_NEAR_RPM:MQ_MOVE_CRUISE_RPM;
     request_target(q,rpm,(int16_t)-rpm,now);
   } else {
-    int16_t rpm=s.value>0.f?-MQ_TURN_RPM:MQ_TURN_RPM;
+    int16_t speed=s.kind==MQ_KIND_DOCK_TURN?1:MQ_TURN_RPM;
+    int16_t rpm=s.value>0.f?-speed:speed;
     request_target(q,rpm,rpm,now);
   }
 }

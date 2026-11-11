@@ -2,7 +2,6 @@
 #define MQ_DRIVE_H
 #include "mq.h"
 
-/* 驱动层维护 CAN 事务、实测轮速和停车证明，供任务队列读取。 */
 typedef struct {
   bool (*send)(void *user,const uint8_t data[8]);
   bool (*tx_ready)(void *user);
@@ -13,6 +12,8 @@ enum { DRIVE_ERR_STOP=40,DRIVE_ERR_STARTUP=52,DRIVE_ERR_CAN=72,
   DRIVE_ERR_UART=81,DRIVE_ERR_LIMIT=82,DRIVE_ERR_ARM_TIMEOUT=83,
   DRIVE_ERR_GUARD=86,DRIVE_ERR_SAMPLE=87 };
 enum { DRIVE_SDO_NONE=0,DRIVE_SDO_TIMEOUT,DRIVE_SDO_ABORT,DRIVE_SDO_MALFORMED,DRIVE_SDO_SEND };
+enum { DRIVE_ARM_FAILURE_NONE=0,DRIVE_ARM_FAILURE_READBACK,DRIVE_ARM_FAILURE_SDO,
+  DRIVE_ARM_FAILURE_INTERRUPTED };
 
 typedef struct {
   uint16_t index;
@@ -20,6 +21,12 @@ typedef struct {
   uint32_t value,started_ms,generation,completed_ms;
   bool pending,done,ok;
 } DriveTransaction;
+
+typedef struct {
+  uint32_t tick,can_status,expected,actual;
+  uint16_t index,step;
+  uint8_t sub,check,reason;
+} DriveArmFailure;
 
 typedef struct {
   MQDriveView view;
@@ -44,6 +51,7 @@ typedef struct {
   bool target_pending,sample_ready,tx_suppressed;
   bool zero_ok,shutdown_ok,disable_ok,stationary_ok,status_ok,fault_ok;
   bool guard_known,stop_explicit,boot_finished,uart_failed,sdo_ambiguous;
+  DriveArmFailure arm_failure;
 } Drive;
 
 void drive_init(Drive *d,const DriveBusOps *ops,void *user,uint32_t now);

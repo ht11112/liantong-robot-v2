@@ -22,8 +22,8 @@ typedef enum { MQ_OK=0, MQ_INVALID=1, MQ_BUSY=2, MQ_IDENTITY=3,
 typedef enum { MQ_ERR_NONE=0, MQ_ERR_CANCEL=1, MQ_ERR_ODOM=2,
   MQ_ERR_DEADLINE=3, MQ_ERR_DRIVE=4, MQ_ERR_APPLY=5,
   MQ_ERR_HANDOFF=6, MQ_ERR_UART=7, MQ_ERR_BOOT=8 } MQError;
-enum { MQ_KIND_MOVE=1, MQ_KIND_TURN=2 };
-/* 队列由 MOVE/TURN 段组成；段内容和顺序由 CRC 绑定。 */
+enum { MQ_KIND_MOVE=1, MQ_KIND_TURN=2, MQ_KIND_DOCK_MOVE=3, MQ_KIND_DOCK_TURN=4 };
+/* 段内容和顺序由 CRC 绑定；对接动作只能单段执行。 */
 /* 里程计和驱动回读均携带真实测量时间和样本序号。 */
 typedef struct { uint32_t kind; float value; } MQSegment;
 typedef struct {

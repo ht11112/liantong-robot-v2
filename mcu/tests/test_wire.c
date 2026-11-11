@@ -210,8 +210,18 @@ static void golden(void){
   printf("GOLDEN{\"telemetry\":\"");hex(t,110);printf("\",\"query\":\"");hex(query,nq);printf("\",\"begin\":\"");hex(b,nb);
   printf("\",\"append\":\"");hex(a,na);printf("\",\"queue_crc32\":%u}\n",(unsigned)mq_segments_crc(seg,2));
 }
+static void dock_wire(void){
+  MQ q;Wire w;Fake f;uint8_t b[64];unsigned n;MQSegment s={MQ_KIND_DOCK_MOVE,-.05f};init(&q,&w,&f);
+  n=command(b,WIRE_BEGIN,q.boot_id,1,1,1);p16(b+34,1);p32(b+36,mq_segments_crc(&s,1));p32(b+40,MQ_LEASE_MS);
+  send(&w,b,n,20);ack(&f,1,MQ_OK,1);
+  n=command(b,WIRE_APPEND,q.boot_id,1,2,1);p16(b+34,0);p32(b+36,s.kind);pf(b+40,s.value);
+  send(&w,b,n,40);ack(&f,2,MQ_OK,2);assert(q.received==1);
+  n=command(b,WIRE_COMMIT,q.boot_id,1,3,1);send(&w,b,n,60);ack(&f,3,MQ_OK,3);assert(q.state==MQ_READY);
+  n=command(b,WIRE_STOP,q.boot_id,1,4,0);send(&w,b,n,80);ack(&f,4,MQ_OK,4);assert(!q.committed&&!f.arms);
+  puts("PASS dock segment uses unchanged wire layout, CRC, ACK and STOP before START");
+}
 int main(void){
   assert(wire_crc16((const uint8_t*)"123456789",9)==0x29b1);
   discovery_and_legacy();upload_and_replay();renewal_and_replay();invalid_frames();pending_stop_and_expiry();
-  changing_transmit_clock();critical_transport_stays_locked();golden();return 0;
+  changing_transmit_clock();critical_transport_stays_locked();dock_wire();golden();return 0;
 }

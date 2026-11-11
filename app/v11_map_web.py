@@ -18,7 +18,7 @@ from v11_map_plan import load_map
 HERE = Path(__file__).resolve().parent
 HOST, PC_PORT, RK_PORT = '127.0.0.1', 8766, 8767
 ACTION_PATHS = frozenset(('/api/localize', '/api/zero', '/api/preview', '/api/start', '/api/stop',
-                          '/api/ekf-turn'))
+                          '/api/ekf-turn', '/api/dock/start', '/api/dock/step'))
 
 
 # PC 通过已校验主机密钥的 SSH 通道访问 RK 本机 API。
@@ -63,31 +63,48 @@ class SSHHTTP:
             self.client = client
             return client.get_transport()
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, binary=False):
         timeout = 35 if method == 'POST' else 6
-        channel = self.transport().open_channel('direct-tcpip', (HOST, RK_PORT), (HOST, PC_PORT), timeout=6)
-        connection = http.client.HTTPConnection(HOST, RK_PORT, timeout=timeout)
-        connection.sock = channel
+        transport = self.transport()
         try:
-            channel.settimeout(timeout)
-            headers = {'Connection': 'close'}
-            if body is not None:
-                headers['Content-Type'] = 'application/json'
-            connection.request(method, path, body=body, headers=headers)
-            # getresponse() closes a connection-close socket after its headers;
-            # unlike a native socket file, ChannelFile cannot outlive its channel.
-            with http.client.HTTPResponse(channel, method=method) as response:
-                response.begin()
-                limit = 8*1024*1024
-                raw = response.read(limit+1)
-                if len(raw) > limit:
-                    raise ValueError('RK response exceeds the size limit')
-                payload = json.loads(raw)
-                if not isinstance(payload, dict):
-                    raise ValueError('Expected a JSON object from RK')
-                return response.status, payload
-        finally:
-            connection.close()
+            channel = transport.open_channel('direct-tcpip', (HOST, RK_PORT), (HOST, PC_PORT), timeout=6)
+            connection = http.client.HTTPConnection(HOST, RK_PORT, timeout=timeout)
+            connection.sock = channel
+            try:
+                channel.settimeout(timeout)
+                headers = {'Connection': 'close'}
+                if body is not None:
+                    headers['Content-Type'] = 'application/json'
+                connection.request(method, path, body=body, headers=headers)
+                # getresponse() closes a connection-close socket after its headers;
+                # unlike a native socket file, ChannelFile cannot outlive its channel.
+                with http.client.HTTPResponse(channel, method=method) as response:
+                    response.begin()
+                    limit = 8*1024*1024
+                    raw = response.read(limit+1)
+                    if len(raw) <= limit and response.length:
+                        raise http.client.IncompleteRead(raw, response.length)
+                    status = response.status
+            finally:
+                connection.close()
+        except Exception:
+            with self.lock:
+                # A concurrent request may already have replaced this session.
+                if self.client is not None and self.client.get_transport() is transport:
+                    client, self.client = self.client, None
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            raise
+        if len(raw) > limit:
+            raise ValueError('RK response exceeds the size limit')
+        if binary and status == 200:
+            return status, raw
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError('Expected a JSON object from RK')
+        return status, payload
 
 
 # 本地地图先核对哈希，并与 RK 返回的地图身份比较。
@@ -125,6 +142,15 @@ class MapGateway:
                                                     and metadata.get('map_id') == self.costmap_id))
         return status, payload
 
+    def frame(self):
+        try:
+            status, payload = self.remote.request('GET', '/api/dock/frame.jpg', binary=True)
+            if status == 200:
+                return status, payload, 'image/jpeg'
+            return status, payload, 'application/json; charset=utf-8'
+        except Exception:
+            return 502, dict(error='无法读取后视画面'), 'application/json; charset=utf-8'
+
 
 # 网页服务限本机访问，操作请求还需携带当前会话令牌。
 def handler_for(gateway):
@@ -143,7 +169,7 @@ def handler_for(gateway):
             self.send_header('Content-Length', str(len(raw)))
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; form-action 'none'")
+            self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; form-action 'none'")
             self.end_headers()
             self.wfile.write(raw)
 
@@ -158,6 +184,8 @@ def handler_for(gateway):
                 return self.send(200, gateway.html, 'text/html; charset=utf-8')
             if target.path == '/api/state' and not target.query:
                 return self.send(*gateway.request('GET', '/api/state'))
+            if target.path == '/api/dock/frame.jpg' and not target.query:
+                return self.send(*gateway.frame())
             if target.path == '/map.png' and target.query == 'v='+gateway.sha256:
                 return self.send(200, gateway.png, 'image/png')
             if (target.path == '/costmap.png' and gateway.costmap_id is not None

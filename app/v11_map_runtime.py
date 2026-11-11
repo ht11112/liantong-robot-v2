@@ -19,6 +19,7 @@ from v12_feedback_worker import FeedbackWorker
 from v11_ekf_worker import EkfWorker
 from v11_map_plan import CollisionError, PlanningError, TURN_TOLERANCE_RAD, load_map
 from v11_obstacles import DynamicObstacles
+from v12_dock_control import dock_segment, next_action
 
 
 PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
@@ -68,12 +69,19 @@ def inverse(pose):
 # 串口在独立进程持续查询；导航与 ROS 只消费内存中的反馈历史。
 class Navigation:
     def __init__(self, grid, localizer=None, *, mode='ready', clock=time.monotonic, scanner=None,
-                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False):
+                 obstacle_scan_timeout_s=OBSTACLE_SCAN_TIMEOUT_S, ekf=None, ekf_turn_test=False, camera=None,
+                 dock_single_step_test=False):
         if not math.isfinite(obstacle_scan_timeout_s) or obstacle_scan_timeout_s <= 0:
             raise ValueError('Obstacle scan timeout must be positive and finite')
         self.grid, self.localizer, self.mode, self.clock = grid, localizer, mode, clock
         self.scanner = scanner
         self.ekf = ekf
+        self.camera = camera
+        self.dock = dict(phase='idle', message='等待视觉对准', frame_seq=None)
+        self.dock_plan = None
+        self.dock_single_plan = None
+        self.dock_single_step_test = dock_single_step_test
+        self.dock_stop_outcome = None
         self.ekf_turn = (dict(phase='idle', message='仅试验单次原地转向 90°，不会直行',
                               target_deg=90., turned_deg=0., direction=None) if ekf_turn_test else None)
         self.ekf_turn_plan = None
@@ -112,6 +120,8 @@ class Navigation:
         self.feedback_error = None
 
     def _invalidate(self, reason):
+        if self._dock_active():
+            self._end_dock('failed', reason)
         if self._ekf_turn_active():
             self._end_ekf_turn('failed', reason)
         if self.detour is not None:
@@ -213,6 +223,7 @@ class Navigation:
             while not closed.wait(.01):
                 self._consume_feedback()
                 self._ekf_turn_cycle()
+                self._dock_cycle()
         except Exception as exc:
             with self.lock:
                 self.feedback_error = exc
@@ -329,7 +340,7 @@ class Navigation:
     @contextmanager
     def _stationary_work(self, name):
         with self.lock:
-            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active():
+            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active() or self._dock_active():
                 raise ValueError('当前操作正在处理')
             self._require_stationary()
             self.work, self.error = name, None
@@ -397,6 +408,95 @@ class Navigation:
     def _ekf_turn_active(self):
         return self.ekf_turn is not None and self.ekf_turn['phase'] in (
             'uploading', 'starting', 'turning', 'stopping')
+
+    def _dock_active(self):
+        return self.dock['phase'] in ('observing', 'uploading', 'starting', 'moving', 'stopping')
+
+    def _dock_observation(self):
+        if self.camera is None:
+            raise ValueError('后视相机未启用')
+        observation = self.camera.snapshot()
+        if not observation['fresh'] or not observation['ready']:
+            raise ValueError(observation.get('reason') or '标签观测无效或画面过期')
+        return observation
+
+    def request_dock(self):
+        with self.lock:
+            if self.mode != 'drive':
+                raise ValueError('当前模式不允许对接动作')
+            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active() or self._dock_active():
+                raise ValueError('当前操作正在处理')
+            self._require_stationary()
+            if not (self.stop_verified or self.latest.status.flags & STOP_CONFIRMED):
+                raise ValueError('视觉对准需要先确认实测停稳')
+            observation = self._dock_observation()
+            self.plan = self.route = None
+            self.dock.update(phase='observing', message='等待新鲜视觉观测', frame_seq=observation['frame_seq'])
+            self.dock_single_plan = None
+            self.dock_stop_outcome = None
+
+    def request_dock_step(self, kind, value):
+        if not self.dock_single_step_test:
+            raise ValueError('未启用现场单步验收')
+        if kind == 'move' and not -.05 <= value <= -.02:
+            raise ValueError('验收倒车距离须为 2 至 5 厘米')
+        plan = dock_segment(kind, value)
+        with self.lock:
+            self.request_dock()
+            self.dock_single_plan = plan
+            self.dock['message'] = '等待新鲜视觉观测以执行单步验收'
+
+    def _end_dock(self, outcome, message):
+        self.dock_stop_outcome = outcome
+        self.dock.update(phase='stopping' if self.connected else 'failed', message=message)
+        if self.connected and not self.stop_requested:
+            self._queue_stop()
+
+    def _dock_cycle(self):
+        with self.lock:
+            if not self._dock_active():
+                return
+            if self.dock['phase'] == 'stopping':
+                if self.dock_stop_outcome in ('continue', 'step_complete'):
+                    try:
+                        self._dock_observation()
+                    except ValueError as exc:
+                        self.dock_stop_outcome = 'failed'
+                        self.dock['message'] = str(exc)
+                return
+            try:
+                observation = self._dock_observation()
+                if not self._fresh():
+                    raise ValueError('底盘反馈已过期')
+                status = self.latest.status
+                if status.first_drive_error or status.first_error not in (0, MCU_CANCELLED):
+                    raise ValueError('底盘故障，取消视觉对准')
+                if self.dock['phase'] == 'moving':
+                    if status.state in (7, 8) and status.flags & ARRIVAL_REACHED:
+                        outcome = 'step_complete' if self.dock_single_plan is not None else 'continue'
+                        self._end_dock(outcome, '单步完成，正在确认停稳')
+                    elif status.state not in LEASE_STATES or not status.flags & EXECUTING:
+                        raise ValueError('底盘动作意外结束')
+                    return
+                if self.dock['phase'] != 'observing' or self.work or self.stop_requested:
+                    return
+                self._require_stationary()
+                if observation['frame_seq'] == self.dock['frame_seq']:
+                    return
+                if self.dock_single_plan is not None:
+                    self.dock_plan = self.dock_single_plan
+                else:
+                    action = next_action(observation)
+                    if action is None:
+                        self.dock.update(phase='complete', message='视觉对准完成', frame_seq=observation['frame_seq'])
+                        return
+                    self.dock_plan = dock_segment(*action)
+                self.dock.update(phase='uploading', message='正在上传对接单步', frame_seq=observation['frame_seq'])
+                self.pending = self.dock_plan
+                self.work, self.error = 'uploading', None
+                self.stop_ack = self.stop_verified = self.stop_evidence = None
+            except ValueError as exc:
+                self._end_dock('failed', str(exc))
 
     def _turn_feedback(self):
         if self.mode != 'drive' or self.ekf_turn is None:
@@ -510,7 +610,7 @@ class Navigation:
     def request_start(self, plan_id):
         with self.lock:
             self._require_stationary()
-            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active():
+            if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active() or self._dock_active():
                 raise ValueError('当前操作正在处理')
             if self.plan is None or self.plan['id'] != plan_id or not self.plan['segments']:
                 raise ValueError('请预览一条可执行的新路径')
@@ -527,6 +627,9 @@ class Navigation:
                 raise ValueError('静止验收模式使用查询和上传')
             if not self.connected:
                 raise ValueError('串口状态未知，请在现场停车')
+            if self._dock_active():
+                self._end_dock('cancelled', '已人工取消视觉对准')
+                return
             if self._ekf_turn_active():
                 self._end_ekf_turn('cancelled', '已人工取消 EKF 转向')
                 return
@@ -664,6 +767,35 @@ class Navigation:
             elif self.detour is not None:
                 self._cancel_detour('底盘未进入续行状态，请人工处理')
 
+    def _upload_dock(self, master, plan):
+        with self.lock:
+            self._dock_observation()
+            self._require_stationary()
+            if self.stop_requested:
+                return
+            revision = self.feedback.stop_revision if self.feedback is not None else None
+        reply = (master.upload(plan, on_ack=self._observe_upload, revision=revision) if self.feedback is not None
+                 else master.upload(plan, on_ack=self._observe_upload))[-1]
+        with self.lock:
+            if self.stop_requested:
+                return
+            self._dock_observation()
+            self._require_stationary()
+            self.work = 'starting'
+            self.dock.update(phase='starting', message='正在启动对接单步')
+            revision = self.feedback.stop_revision if self.feedback is not None else None
+        started = (master.start(reply.status.task, revision=revision) if self.feedback is not None
+                   else master.start(reply.status.task))
+        self.observe(started)
+        with self.lock:
+            if self.stop_requested:
+                return
+            status = started.status
+            if status.state not in LEASE_STATES or not status.lease_remaining_ms:
+                raise ValueError('底盘未进入对接执行状态')
+            self.lease_task = status.boot, status.epoch, status.task
+            self.dock.update(phase='moving', message='正在执行对接单步')
+
     def _lease_seconds(self, exchange):
         # The MCU computes its remaining time after this send, so this is a lower bound.
         return max(0., exchange.sent_at + exchange.status.lease_remaining_ms / 1000. - self.clock())
@@ -720,6 +852,18 @@ class Navigation:
                 self.error = '停稳确认到期，仍在更新底盘状态'
             else:
                 self.error = error.get('message', '停车未确认')
+
+            if self.dock['phase'] == 'stopping':
+                outcome = self.dock_stop_outcome if self.stop_verified else 'failed'
+                if outcome == 'continue':
+                    observation = self.camera.snapshot()
+                    self.dock.update(phase='observing', message='已停稳，等待新的视觉观测',
+                                     frame_seq=observation['frame_seq'])
+                else:
+                    message = self.dock['message'] + ('；实测停稳已确认' if self.stop_verified else '；停稳尚未确认')
+                    if outcome == 'step_complete':
+                        message += '；单步验收结束，未自动续行'
+                    self.dock.update(phase=outcome, message=message)
 
             if self.ekf_turn is not None and self.ekf_turn['phase'] == 'stopping':
                 estimate = self.ekf.ekf_snapshot() if self.ekf is not None else None
@@ -874,14 +1018,17 @@ class Navigation:
                     if stop:
                         self._stop(master)
                     elif plan is not None:
-                        self._upload(master, plan)
+                        if plan is self.dock_plan:
+                            self._upload_dock(master, plan)
+                        else:
+                            self._upload(master, plan)
                     else:
                         reply = master.query()
                         if reply is not None:
                             self.observe(reply)
                             with self.lock:
                                 reply = self.latest
-                            if self.scanner is not None and self.mode == 'drive':
+                            if self.scanner is not None and self.mode == 'drive' and not self._dock_active():
                                 self._avoidance_cycle(master, reply)
                             self._renew_if_due(master, reply)
                     if master.failed:
@@ -893,6 +1040,11 @@ class Navigation:
                         self.observe(exc.exchange)
                     with self.lock:
                         self.error = str(exc)
+                        if self._dock_active():
+                            if stop:
+                                self.dock.update(phase='failed', message='停车未确认：' + self.error)
+                            else:
+                                self._end_dock('failed', self.error)
                         if self._ekf_turn_active():
                             self._end_ekf_turn('failed', self.error)
                         if self.scanner is not None:
@@ -942,7 +1094,7 @@ class Navigation:
             status_fresh = (self.connected and self.latest is not None
                             and 0 <= self.clock() - self.latest.sent_at < SOURCE_MAX_AGE_S)
             preparing = (not self.work and not self.stop_requested and self.detour is None
-                         and not self._ekf_turn_active() and self._stationary())
+                         and not self._ekf_turn_active() and not self._dock_active() and self._stationary())
             can_ekf_turn = False
             if preparing and self.ekf_turn is not None:
                 try:
@@ -988,12 +1140,18 @@ class Navigation:
                                     if pose is not None and self.origin else None),
                         trail=list(self.trail), preview=self.plan, route=self.route,
                         connected=self.connected,
-                        source_fresh=fresh, busy=bool(self.work or self.stop_requested or self._ekf_turn_active()), mode=self.mode,
+                        source_fresh=fresh, busy=bool(self.work or self.stop_requested or self._ekf_turn_active() or self._dock_active()), mode=self.mode,
                         task=task, avoidance=avoidance, can_prepare=preparing,
                         ekf_turn=dict(self.ekf_turn) if self.ekf_turn is not None else None,
                         can_ekf_turn=can_ekf_turn,
                         can_start=bool(preparing and pose and self.plan and self.plan['segments']),
                         can_stop=self.connected and self.mode == 'drive', error=self.error)
+            result['camera'] = self.camera.snapshot() if self.camera is not None else None
+            result['dock'] = dict(self.dock)
+            result['can_dock'] = bool(preparing and self.mode == 'drive' and result['camera']
+                                      and (self.stop_verified or status.flags & STOP_CONFIRMED)
+                                      and result['camera']['fresh'] and result['camera']['ready'])
+            result['can_dock_step'] = bool(self.dock_single_step_test and result['can_dock'])
             if communication is not None:
                 communication = dict(communication, consumer_missed=self.feedback_missed,
                                      consumer_lag_ms=(None if cached is None or self.latest is None else
@@ -1036,6 +1194,12 @@ def handler_for(nav):
         def do_GET(self):
             if self.path == '/api/state':
                 self.send(200, nav.snapshot())
+            elif self.path == '/api/dock/frame.jpg' and nav.camera is not None:
+                frame = nav.camera.frame()
+                if frame is None:
+                    self.send(503, dict(error='后视画面不可用'))
+                else:
+                    self.send(200, frame, 'image/jpeg')
             elif (self.path == '/api/feedback-timing' and nav.feedback is not None
                   and nav.feedback.timing is not None):
                 self.send(200, nav.feedback.timing.snapshot())
@@ -1064,6 +1228,15 @@ def handler_for(nav):
                     nav.request_start(checked_body(body, ('plan_id',))['plan_id'])
                 elif self.path == '/api/ekf-turn':
                     nav.request_ekf_turn(checked_body(body, ('direction',))['direction'])
+                elif self.path == '/api/dock/start':
+                    checked_body(body, ())
+                    nav.request_dock()
+                elif self.path == '/api/dock/step':
+                    if (not isinstance(body, dict) or set(body) != {'kind', 'value'}
+                            or body['kind'] not in ('move', 'turn')
+                            or type(body['value']) not in (int, float) or not math.isfinite(body['value'])):
+                        raise ValueError('单步验收参数不正确')
+                    nav.request_dock_step(body['kind'], body['value'])
                 elif self.path == '/api/stop':
                     checked_body(body, ())
                     nav.request_stop()
@@ -1102,6 +1275,15 @@ def main(argv=None):
     parser.add_argument('--ekf-imu-topic', help='启用二维融合，使用此 IMU 陀螺仪话题')
     parser.add_argument('--ekf-executable', type=Path, help='使用指定的 robot_localization EKF 程序')
     parser.add_argument('--ekf-turn-test', action='store_true', help='允许显式触发单次 EKF 监督的原地 90° 转向试验')
+    parser.add_argument('--dock-camera', help='后视相机设备，启用只读画面')
+    parser.add_argument('--dock-tag-id', type=int, help='实际识别并确认的 tag36h11 ID')
+    parser.add_argument('--dock-tag-size-m', type=float, help='尺量的标签黑边边长（米）')
+    parser.add_argument('--dock-camera-height-m', type=float, help='尺量的相机高度（米）')
+    parser.add_argument('--dock-camera-yaw-deg', type=float, help='相机安装偏航（度）')
+    parser.add_argument('--dock-camera-pitch-deg', type=float, help='相机安装俯仰（度）')
+    parser.add_argument('--dock-camera-roll-deg', type=float, help='相机安装横滚（度）')
+    parser.add_argument('--dock-visual-verified', action='store_true', help='静态多距离和偏移验证通过后启用对接动作')
+    parser.add_argument('--dock-single-step-test', action='store_true', help='允许人工看护的对接单步现场验收')
     args = parser.parse_args(argv)
     if args.ekf_executable is not None and not args.ekf_imu_topic:
         parser.error('--ekf-executable 需要 --ekf-imu-topic')
@@ -1125,7 +1307,16 @@ def main(argv=None):
     ekf = None
     if args.ekf_imu_topic:
         ekf = EkfWorker(args.ekf_imu_topic, args.ekf_executable)
+    camera = None
+    if args.dock_camera:
+        from v12_dock_camera import DockCamera
+        camera = DockCamera(args.dock_camera, target_id=args.dock_tag_id, tag_size_m=args.dock_tag_size_m,
+                            mount_yaw_deg=args.dock_camera_yaw_deg, mount_pitch_deg=args.dock_camera_pitch_deg,
+                            mount_roll_deg=args.dock_camera_roll_deg, camera_height_m=args.dock_camera_height_m,
+                            verified=args.dock_visual_verified)
+        camera.start()
     nav = Navigation(grid, localizer, mode=args.mode, scanner=scanner, ekf=ekf, ekf_turn_test=args.ekf_turn_test,
+                     camera=camera, dock_single_step_test=args.dock_single_step_test,
                      obstacle_scan_timeout_s=args.obstacle_scan_timeout)
     closed = threading.Event()
     workers = [threading.Thread(target=nav.run, args=(args.port, closed, args.trace_feedback_timing),
@@ -1152,6 +1343,8 @@ def main(argv=None):
             scanner.close()
         if ekf is not None:
             ekf.close()
+        if camera is not None:
+            camera.close()
 
 
 if __name__ == '__main__':

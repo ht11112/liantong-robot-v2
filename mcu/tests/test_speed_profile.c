@@ -35,6 +35,9 @@ int main(void){
   check_target((MQSegment){MQ_KIND_MOVE,.30f},MQ_MOVE_NEAR_RPM,-MQ_MOVE_NEAR_RPM);
   check_target((MQSegment){MQ_KIND_TURN,1.f},-MQ_TURN_RPM,-MQ_TURN_RPM);
   check_target((MQSegment){MQ_KIND_TURN,-1.f},MQ_TURN_RPM,MQ_TURN_RPM);
+  check_target((MQSegment){MQ_KIND_DOCK_MOVE,-.05f},-1,1);
+  check_target((MQSegment){MQ_KIND_DOCK_TURN,MQ_PI/36.f},-1,-1);
+  check_target((MQSegment){MQ_KIND_DOCK_TURN,-MQ_PI/36.f},1,1);
   printf("PASS selected MOVE cruise %d RPM, near %d RPM, TURN %d RPM in both directions\n",
          MQ_MOVE_CRUISE_RPM,MQ_MOVE_NEAR_RPM,MQ_TURN_RPM);
   return 0;

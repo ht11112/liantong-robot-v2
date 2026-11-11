@@ -50,8 +50,21 @@ static void sdo_error(Drive *d,const DriveTransaction *t,uint8_t reason,uint32_t
   d->sdo_error_index=t->index;d->sdo_error_sub=t->sub;
   d->sdo_error_reason=reason;d->sdo_error_tick=tick;d->sdo_abort_code=abort_code;
 }
+static void record_arm_failure(Drive *d,const DriveTransaction *t,uint8_t reason){
+  if(d->arm_failure.reason)return;
+  const ArmStep *step=&arm_steps[d->flow_step];
+  /* The check identifies how to interpret the expected operand and raw readback. */
+  uint32_t expected=step->check==LIMIT_VERIFY?d->limit_values[step->value]:step->value;
+  if(step->check==LIMIT_WRITE&&t)expected=t->value;
+  d->arm_failure=(DriveArmFailure){.tick=d->now,.can_status=d->last_can_status,
+    .expected=expected,.actual=t&&t->ok?t->value:0,.index=step->index,.step=d->flow_step,
+    .sub=step->sub,.check=step->check,.reason=reason};
+}
 static void fault(Drive *d,uint32_t error){
-  if(!d->view.error){d->view.error=error;d->first_error_tick=d->now;}
+  if(!d->view.error){
+    if(d->flow==FLOW_ARM)record_arm_failure(d,NULL,DRIVE_ARM_FAILURE_INTERRUPTED);
+    d->view.error=error;d->first_error_tick=d->now;
+  }
   if(d->flow!=FLOW_STOP&&!d->tx_suppressed&&d->view.state!=MQ_DRIVE_FAILED)begin_stop(d,false);
 }
 
@@ -66,7 +79,6 @@ static bool start(Drive *d,uint16_t index,uint8_t sub,uint8_t bytes,bool write,u
   return true;
 }
 
-/* CAN 回复按当前事务匹配，错误和超时由驱动状态机处理。 */
 void drive_receive_can(Drive *d,uint32_t id,uint32_t dlc,const uint8_t b[8],uint32_t now){
   d->last_rx_ms=now;
   DriveTransaction *t=&d->transaction;
@@ -83,7 +95,6 @@ void drive_receive_can(Drive *d,uint32_t id,uint32_t dlc,const uint8_t b[8],uint
   t->pending=false;t->done=true;t->ok=true;
 }
 
-/* 速度样本保留接收时刻，供上层判断新鲜度和连续性。 */
 static void publish_speed(Drive *d,uint32_t value,uint32_t tick){
   d->speed_raw=value;d->speed_tick=tick;d->cache_mask|=C_SPEED;
   bool fresh=(d->cache_mask&(C_STATUS|C_FAULT|C_CURRENT))==(C_STATUS|C_FAULT|C_CURRENT)
@@ -117,7 +128,7 @@ static uint32_t arm_value(Drive *d,const ArmStep *s){
 static bool arm_check(Drive *d,const ArmStep *s,uint32_t v){
   switch(s->check){
   case EQ:return v==s->value;
-  case BUS_RANGE:return v>=2000u&&v<=3250u;
+  case BUS_RANGE:return v>=2000u&&v<=3300u;
   case SPEED_ZERO:return magnitude((int16_t)v)<=2u&&magnitude((int16_t)(v>>16))<=2u;
   case STATUS_ZERO:return statuses(v,0);
   case HALL_RANGE:return v>=1u&&v<=6u;
@@ -147,7 +158,10 @@ static void finish_stop(Drive *d){
 
 static void complete_flow(Drive *d,const DriveTransaction *t){
   if(d->flow==FLOW_ARM){
-    if(!t->ok||!arm_check(d,&arm_steps[d->flow_step],t->value)){fault(d,DRIVE_ERR_CAN);return;}
+    if(!t->ok||!arm_check(d,&arm_steps[d->flow_step],t->value)){
+      record_arm_failure(d,t,t->ok?DRIVE_ARM_FAILURE_READBACK:DRIVE_ARM_FAILURE_SDO);
+      fault(d,DRIVE_ERR_CAN);return;
+    }
     d->flow_step++;
     if(d->flow_step==sizeof(arm_steps)/sizeof(arm_steps[0])){
       d->flow=0;d->view.state=MQ_DRIVE_ENABLED;d->view.stop_verified=false;
@@ -195,7 +209,6 @@ static void completed(Drive *d){
   }
 }
 
-/* 停车是独立驱动流程，停稳确认依赖后续速度回读。 */
 static void begin_stop(Drive *d,bool explicit_stop){
   d->flow=FLOW_STOP;d->flow_step=0;d->flow_started_ms=d->now;
   d->view.state=MQ_DRIVE_STOPPING;d->view.stop_verified=false;
@@ -260,7 +273,6 @@ static bool auxiliary(Drive *d,uint32_t interval){
   d->last_aux_start=d->now;d->aux_index=(uint8_t)((i+1u)%5u);return true;
 }
 
-/* 按事务顺序推进使能、速度设置、反馈查询和停车流程。 */
 void drive_poll(Drive *d,uint32_t now){
   d->now=now;
   uint32_t errors=d->bus.bus_errors(d->bus_user);

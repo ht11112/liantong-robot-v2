@@ -18,7 +18,8 @@
     .pill{display:inline-block;border-radius:20px;background:#eef2f8;color:var(--muted);padding:4px 10px;font-size:12px;font-weight:650;white-space:nowrap}.pill.on{background:#e9f7f0;color:var(--green)}
     main{max-width:1440px;margin:auto;padding:22px 20px 34px}.heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}h1{margin:0 0 5px;font-size:24px}h2{margin:0;font-size:15px}p{margin:6px 0}
     .notice{padding:9px 12px;border:1px solid #e9d7af;background:#fff7e8;color:#7c531b;border-radius:8px;margin-bottom:12px}
-    .layout{display:grid;grid-template-columns:minmax(0,1fr) 350px;grid-template-areas:"map side" "costmap side";gap:16px;align-items:start}.navigation-map{grid-area:map}.costmap{grid-area:costmap}.side{grid-area:side;display:grid;gap:12px}.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+    .layout{display:grid;grid-template-columns:minmax(0,1fr) 350px;grid-template-areas:"map side" "costmap side" "dock side";gap:16px;align-items:start}.navigation-map{grid-area:map}.costmap{grid-area:costmap}.dock{grid-area:dock}.side{grid-area:side;display:grid;gap:12px}.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+    .dock-image{display:block;width:100%;max-width:640px;aspect-ratio:4/3;object-fit:contain;background:#1f2937}.dock-status{color:#a9303c}.dock .body{display:grid;gap:8px}
     .cardhead{display:flex;align-items:center;justify-content:space-between;gap:9px;border-bottom:1px solid var(--line);padding:12px 15px}.body{padding:12px 15px}.map-controls,.actions,.legend{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.map-controls button{padding:5px 9px;font-size:12px}.map-controls button[aria-pressed="true"]{background:#eaf0ff;border-color:#cbd9fd;color:#254ba8}
     .canvas-box{position:relative;height:clamp(430px,64vh,680px);background:#e8edf4}.canvas-box canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.map-help{position:absolute;top:9px;left:10px;right:10px;width:fit-content;max-width:calc(100% - 20px);padding:5px 8px;border-radius:6px;background:#fffffff2;color:var(--muted);font-size:12px;pointer-events:none}.map-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;padding:10px 13px;color:var(--muted)}.legend span{display:inline-flex;align-items:center;gap:5px}.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--blue)}.legend .trail{background:var(--green)}.legend .goal{background:#d58626}.legend .seed{background:var(--violet)}
     .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 10px}.fields.two{grid-template-columns:repeat(2,minmax(0,1fr))}.fields label{font-size:12px;color:var(--muted)}input{width:100%;min-width:0;background:white;color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 8px;margin-top:3px}.actions button{flex:1}.summary,.message{margin:9px 0 0;background:#f4f7fc;padding:7px 9px;border-radius:7px;font-size:12px;overflow-wrap:anywhere}.message.error{color:var(--red);background:#ffeff1}.body small{display:block;color:var(--muted);line-height:1.55}.body dl{margin:0}.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #eef2f7;font-size:12px}.kv dt{color:var(--muted)}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}progress{width:100%;height:8px;margin-top:9px;accent-color:var(--blue)}
@@ -26,7 +27,7 @@
     .costmap-content .map-foot{display:grid;align-content:center;justify-content:start}.costmap .cardhead a{color:var(--blue);font-size:12px;white-space:nowrap}
     .costmap-legend i{width:11px;height:11px;border-radius:2px;border:1px solid #c4cfdd}.costmap-legend .occupied{background:#000}.costmap-legend .inflated{background:#646464}.costmap-legend .unknown{background:#afafaf}.costmap-legend .free{background:#fff}
     .legend .radar{background:#e45b30}
-    @media(max-width:850px){.layout{grid-template-columns:1fr;grid-template-areas:"map" "side" "costmap"}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
+    @media(max-width:850px){.layout{grid-template-columns:1fr;grid-template-areas:"map" "side" "costmap" "dock"}.side{grid-template-columns:repeat(2,minmax(0,1fr))}.canvas-box{height:500px}}
     @media(max-width:540px){main{padding:16px 12px}.heading{align-items:flex-start}.side{grid-template-columns:1fr}.canvas-box{height:390px}.cardhead{align-items:flex-start}.map-controls{justify-content:flex-end}h1{font-size:21px}}
   </style>
 </head>
@@ -115,6 +116,16 @@
             </div>
             <span>直行按 40 × 35 cm 矩形检查，灰色标示转向所需空间</span>
           </div>
+        </div>
+      </section>
+      <section class="card dock" aria-labelledby="dock-title">
+        <div class="cardhead"><h2 id="dock-title">倒车画面</h2><span id="dock-age" class="pill">等待画面</span></div>
+        <div class="body"><img id="dock-image" class="dock-image" alt="后视相机画面，未镜像" width="640" height="480">
+          <p id="dock-camera-status" class="dock-status" role="status">等待相机</p>
+          <p id="dock-observation" class="mono">标签及位姿：等待观测</p>
+          <p id="dock-task" class="message">视觉对准待命</p>
+          <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。识别框与该图来自同一帧，数值为最新状态。画面年龄自读取后计算，相机缓冲延迟尚需现场核对。</small>
+          <div class="actions"><button id="dock-start" type="button" class="primary" disabled>开始视觉对准</button></div>
         </div>
       </section>
     </div>
@@ -276,6 +287,14 @@
       const editable=online && matched && Boolean(state.csrf_token) && !action && !stopping;
       const loc=state.localization||{}, task=state.task||{}, preview=state.preview, route=preview||state.route;
       const avoidance=online ? state.avoidance : null;
+      const camera=online?state.camera:null, dock=state.dock||{};
+      const fresh=camera?.fresh===true && !frameFailed && frameReceived!==null && performance.now()-frameReceived<1000;
+      $('dock-age').textContent=!fresh?'画面过期或不可用':finite(camera?.age_ms)?`读取后 · ${camera.age_ms.toFixed(0)} ms`:'等待画面';
+      $('dock-camera-status').textContent=online?(camera?.reason||'后视相机未接入'):'RK 连接断开，画面已过期';
+      const metric=(v,unit)=>finite(v)?`${v.toFixed(3)} ${unit}`:'—';
+      $('dock-observation').textContent=fresh?`ID ${camera.tag_id??'—'} · 距离 ${metric(camera.distance_m,'m')} · 轮轴左偏 ${metric(camera.lateral_m,'m')} · 朝向 ${metric(camera.yaw_deg,'°')}`:'标签及位姿：画面过期或不可用';
+      $('dock-task').textContent=dock.message||'视觉对准待命';
+      $('dock-start').disabled=!online||!state.csrf_token||state.can_dock!==true||Boolean(action)||stopping;
       $('map-radar-legend').hidden=!avoidance;
       $('costmap-radar-legend').hidden=!avoidance;
       const avoidanceStatus=$('avoidance-status');
@@ -380,6 +399,19 @@
         render();window.setTimeout(poll,650);
       }
     }
+    let frameUrl=null, frameReceived=null, frameFailed=true;
+    async function pollFrame() {
+      const controller=new AbortController(), timeout=window.setTimeout(()=>controller.abort(),3000);
+      try {
+        const response=await fetch('/api/dock/frame.jpg',{cache:'no-store',signal:controller.signal});
+        if(!response.ok) throw new Error('frame unavailable');
+        const blob=await response.blob(), next=URL.createObjectURL(blob), previous=frameUrl;
+        $('dock-image').src=next;frameUrl=next;frameReceived=performance.now();frameFailed=false;
+        if(previous) URL.revokeObjectURL(previous);
+      } catch(error) {
+        frameFailed=true;
+      } finally {render();window.clearTimeout(timeout);window.setTimeout(pollFrame,200);}
+    }
     // 操作请求携带会话令牌；停车和其他操作各有独立界面状态。
     async function submit(op,body,buttonId=op) {
       if($(buttonId).disabled) return;
@@ -425,10 +457,11 @@
     $('localize').onclick=()=>submit('localize',seed());$('zero').onclick=()=>submit('zero',seed());
     $('preview').onclick=()=>submit('preview',goal());$('start').onclick=()=>submit('start',{plan_id:prepared});
     $('stop').onclick=()=>submit('stop',{});
+    $('dock-start').onclick=()=>submit('dock/start',{},'dock-start');
     $('ekf-turn-left').onclick=()=>submit('ekf-turn',{direction:1},'ekf-turn-left');
     $('ekf-turn-right').onclick=()=>submit('ekf-turn',{direction:-1},'ekf-turn-right');
     window.addEventListener('resize',draw);
-    render();poll();
+    render();poll();pollFrame();
   })();
   </script>
 </body>

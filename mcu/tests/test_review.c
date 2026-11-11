@@ -222,11 +222,51 @@ static void unavailable_can_fifo_is_bounded(void){
   assert(d.view.state==MQ_DRIVE_FAILED && d.tx_suppressed && !d.view.stop_verified && d.view.error);
   expect("permanently unavailable CAN FIFO cannot leave STOP pending forever");
 }
+static void dock_execution(void){
+  Fixture f;MQSegment s={MQ_KIND_DOCK_MOVE,-.05f};setup(&f,100u);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);
+  assert(f.q.state==MQ_MOVE && f.motor.requested_left==-1 && f.motor.requested_right==1);
+  ack(&f,f.now);mq_tick(&f.q,f.now);
+  for(unsigned i=0;i<20;i++)step(&f,10,-10);
+  assert(f.q.progress<0.f && !f.q.arrival_reached);
+  for(unsigned i=0;i<1200 && f.q.state==MQ_MOVE;i++)step_renewing(&f,-10,10);
+  assert(f.q.state==MQ_STOPPING && f.q.progress>=.045f && f.q.progress<.046f);
+  assert(f.q.arrival_reached && !f.q.physical_stop_confirmed);finish_stop(&f);
+  assert(f.q.state==MQ_COMPLETE && f.q.physical_stop_confirmed);
+  for(int sign=-1;sign<=1;sign+=2){
+    setup(&f,100u);s=(MQSegment){MQ_KIND_DOCK_TURN,sign*MQ_PI/36.f};
+    assert(load(&f,1,&s,1)==MQ_OK);start(&f);
+    assert(f.q.state==MQ_TURN && f.motor.requested_left==-sign && f.motor.requested_right==-sign);
+    ack(&f,f.now);mq_tick(&f.q,f.now);
+    for(unsigned i=0;i<1200 && f.q.state==MQ_TURN;i++)step_renewing(&f,-sign*10,-sign*10);
+    assert(f.q.state==MQ_STOPPING && f.q.progress>=4.f*MQ_PI/180.f && f.q.progress<4.1f*MQ_PI/180.f);
+    finish_stop(&f);assert(f.q.state==MQ_COMPLETE && f.q.physical_stop_confirmed);
+  }
+  setup(&f,100u);s=(MQSegment){MQ_KIND_DOCK_MOVE,-.05f};assert(load(&f,1,&s,1)==MQ_OK);start(&f);
+  mq_stop(&f.q,f.now);finish_stop(&f);
+  assert(f.q.state==MQ_FAILED && f.q.first_error==MQ_ERR_CANCEL && !f.q.arrival_reached);
+  expect("dock reverse and both turns use signed measurements, fine thresholds and real STOP path");
+}
+static void dock_upload_bounds(void){
+  Fixture f;MQSegment bad[]={{MQ_KIND_DOCK_MOVE,0.f},{MQ_KIND_DOCK_MOVE,-.005f},{MQ_KIND_DOCK_MOVE,.01f},
+    {MQ_KIND_DOCK_MOVE,-.051f},{MQ_KIND_DOCK_TURN,0.f},{MQ_KIND_DOCK_TURN,MQ_PI/36.f+.001f},
+    {MQ_KIND_DOCK_TURN,-MQ_PI/36.f-.001f},{MQ_KIND_DOCK_TURN,MQ_PI/180.f},
+    {MQ_KIND_DOCK_TURN,-MQ_PI/180.f}};
+  for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++){
+    setup(&f,100u);assert(load(&f,1,&bad[i],1)==MQ_INVALID);
+    assert(mq_start(&f.q,1,f.now)==MQ_ORDER && !f.motor.arms);
+  }
+  MQSegment pair[]={{MQ_KIND_MOVE,.2f},{MQ_KIND_DOCK_MOVE,-.05f}};
+  setup(&f,100u);assert(load(&f,1,pair,2)==MQ_INVALID);
+  assert(mq_start(&f.q,1,f.now)==MQ_ORDER && !f.motor.arms);
+  expect("dock upload rejects invalid ranges and mixed or multiple segments before START");
+}
 int main(void){
   offline_and_tick_wrap();deadline_and_late_ack();lease_renewal_and_expiration();malformed_or_partial_queue();
   idempotence_and_old_task();duplicate_and_missing_samples();move_yaw_is_observation_only();
   negative_turn_wrap();direct_stop_and_parking_sample();parking_fault_cannot_upgrade();
   handoff_requires_new_zero_application();
   unavailable_can_fifo_is_bounded();
+  dock_upload_bounds();dock_execution();
   puts("REVIEW COMPLETE 12 production-core/driver scenarios");return 0;
 }

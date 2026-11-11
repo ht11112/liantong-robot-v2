@@ -7,6 +7,7 @@
 typedef struct {
   Drive d;uint32_t now,status,guard,target,bus_error,delay,decel_until;
   uint32_t speed,current,positions[2],pole_override,max_speed,max_speed_reads,max_speed_writes;
+  uint32_t bus_centivolts;
   uint32_t sends,target_writes,zero_writes,fallback_writes,speed_reads,max_speed_gap,last_speed_sample;
   uint8_t request[8];bool waiting,drop_all,drop_next,force_speed,send_fail,fifo_blocked;
   uint32_t sent_at;MQSample samples[2000];unsigned sample_count;
@@ -23,7 +24,7 @@ static bool send(void *u,const uint8_t b[8]){
 static uint32_t read_value(Peer *p,uint16_t index,uint8_t sub,unsigned *bytes){
   *bytes=4;
   switch(index){
-  case 0x2035:*bytes=2;return 2400;
+  case 0x2035:*bytes=2;return p->bus_centivolts;
   case 0x603f:return 0;
   case 0x606c:
     p->speed_reads++;
@@ -77,6 +78,7 @@ static void tick(Peer *p){
 static void run(Peer *p,unsigned ms){for(unsigned i=0;i<ms;i++)tick(p);}
 static void init(Peer *p){
   memset(p,0,sizeof(*p));p->delay=1;p->guard=500;p->max_speed=87;p->now=1;
+  p->bus_centivolts=2400;
   static const DriveBusOps ops={send,ready,errors};drive_init(&p->d,&ops,p,p->now);
 }
 static void boot(Peer *p){init(p);run(p,350);assert(p->d.view.state==MQ_DRIVE_STOPPED);assert(p->d.view.stop_verified&&p->d.view.guard_valid);}
@@ -182,11 +184,47 @@ static void test_current_bus_guard(void){
 }
 static void test_bad_config_timeout_and_late_reply(void){
   Peer p;boot(&p);p.pole_override=16;drive_ops()->arm(&p.d,p.now);run(&p,100);assert(p.d.view.error==DRIVE_ERR_CAN);
+  DriveArmFailure failure=p.d.arm_failure;
+  assert(failure.reason==DRIVE_ARM_FAILURE_READBACK&&failure.index==0x200c&&failure.sub==1);
+  assert(failure.expected==15&&failure.actual==16&&failure.tick==p.d.first_error_tick);
+  drive_ops()->stop(&p.d,p.now);run(&p,300);
+  assert(p.d.arm_failure.tick==failure.tick&&p.d.arm_failure.index==failure.index&&p.d.arm_failure.actual==16);
   boot(&p);while(!p.d.transaction.pending)tick(&p);
+  assert(!p.d.arm_failure.reason);
   uint8_t bad[8]={0x43,0x99,0x99,0,0,0,0,0};drive_receive_can(&p.d,0x581,8,bad,p.now);assert(p.d.transaction.pending&&p.d.late_replies);
   p.drop_all=true;run(&p,2200);assert(p.d.view.error==DRIVE_ERR_CAN&&p.d.tx_suppressed&&!p.d.view.stop_verified);
   uint32_t sends=p.sends;run(&p,500);assert(p.sends==sends);
   puts("PASS drive wrong-index reply, CAN timeout, invalid preflight and bounded failed-STOP silence");
+}
+static void test_arm_transport_failure_record(void){
+  Peer p;boot(&p);drive_ops()->arm(&p.d,p.now);
+  for(unsigned i=0;i<30&&(!p.d.transaction.pending||p.d.transaction.index!=0x2035);i++)tick(&p);
+  assert(p.d.transaction.pending&&p.d.transaction.index==0x2035);
+  p.waiting=false;run(&p,60);
+  assert(p.d.view.error==DRIVE_ERR_CAN&&p.d.sdo_error_reason==DRIVE_SDO_TIMEOUT);
+  assert(p.d.arm_failure.reason==DRIVE_ARM_FAILURE_SDO&&p.d.arm_failure.index==0x2035);
+  assert(p.d.arm_failure.step==0&&p.d.arm_failure.actual==0);
+
+  boot(&p);drive_ops()->arm(&p.d,p.now);p.bus_error=1;tick(&p);
+  assert(p.d.view.error==DRIVE_ERR_CAN&&p.d.arm_failure.reason==DRIVE_ARM_FAILURE_INTERRUPTED);
+  assert(p.d.arm_failure.step==0&&p.d.arm_failure.can_status==1&&p.d.arm_failure.tick==p.d.first_error_tick);
+  puts("PASS drive captures first ARM readback, transport and bus-off causes");
+}
+static void test_arm_bus_voltage_limits(void){
+  const uint32_t accepted[]={2000,3252,3300};
+  const uint32_t rejected[]={1999,3301};
+  Peer p;
+  for(unsigned i=0;i<sizeof(accepted)/sizeof(accepted[0]);i++){
+    boot(&p);p.bus_centivolts=accepted[i];drive_ops()->arm(&p.d,p.now);run(&p,350);
+    assert(p.d.view.state==MQ_DRIVE_ENABLED&&!p.d.view.error&&!p.d.arm_failure.reason);
+  }
+  for(unsigned i=0;i<sizeof(rejected)/sizeof(rejected[0]);i++){
+    boot(&p);p.bus_centivolts=rejected[i];drive_ops()->arm(&p.d,p.now);run(&p,350);
+    assert(p.d.view.state==MQ_DRIVE_FAILED&&p.d.view.error==DRIVE_ERR_CAN&&p.d.view.stop_verified);
+    assert(p.d.arm_failure.reason==DRIVE_ARM_FAILURE_READBACK&&p.d.arm_failure.index==0x2035);
+    assert(p.d.arm_failure.actual==rejected[i]);
+  }
+  puts("PASS drive accepts 20.00, 32.52 and 33.00 V, rejects values outside that range");
 }
 static void test_boot_guard_and_target_encoding(void){
   Peer p;init(&p);p.guard=0;run(&p,350);assert(p.guard==500&&p.d.view.guard_valid&&p.d.view.stop_verified);
@@ -213,6 +251,7 @@ static void test_original_completion_clock(void){
 static void test_arm_keeps_aux_sources(void){
   Peer p;boot(&p);p.delay=10;drive_ops()->arm(&p.d,p.now);run(&p,1800);
   assert(p.d.view.state==MQ_DRIVE_ENABLED&&!p.d.view.error);
+  assert(!p.d.arm_failure.reason);
   assert((uint32_t)(p.now-p.d.left_tick)<250u&&(uint32_t)(p.now-p.d.right_tick)<250u);
   assert((uint32_t)(p.now-p.d.status_tick)<250u&&(uint32_t)(p.now-p.d.fault_tick)<250u);
   puts("PASS drive slow valid SDO preflight still refreshes encoder and health sources");
@@ -255,5 +294,7 @@ int main(void){
   test_speed_feedback_and_failed_stop();test_uart_fault_latch();test_current_bus_guard();test_bad_config_timeout_and_late_reply();test_boot_guard_and_target_encoding();
   test_original_completion_clock();test_arm_keeps_aux_sources();test_ambiguous_late_target_ack();test_unavailable_tx_is_bounded();
   test_counters_and_required_sources();
+  test_arm_transport_failure_record();
+  test_arm_bus_voltage_limits();
   puts("PASS all production drive C tests (memory-only CAN peer)");return 0;
 }
