@@ -1,14 +1,21 @@
 """Exercise guided navigation with production planning, tracking and frames."""
 
 from dataclasses import replace
+from contextlib import redirect_stdout
+import io
+import json
 import math
 import struct
+from threading import Event, Thread
+import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_v11_map_runtime as fixtures
-from mcu_v11 import EXECUTING, QueuePlan
+from mcu_v11 import EXECUTING, STEER, STOP, QueuePlan
 from v11_map_runtime import Navigation, compose
+from v12_feedback_worker import FeedbackWorker
+from test_v12_feedback_process import guided_simulated_port
 
 
 class EstimateSource:
@@ -165,6 +172,95 @@ class GuidedNavigationTests(unittest.TestCase):
         self.nav.scanner.latest_observation.return_value = dict(frame, stamp_ns=10)
         self.nav.update_scan()
         self.assertEqual(self.nav.scan_stamp, 9)
+
+    def wait_until(self, condition, timeout=3.):
+        deadline = time.monotonic()+timeout
+        while not condition():
+            if time.monotonic() >= deadline:
+                self.fail('Timed out waiting for navigation worker')
+            time.sleep(.005)
+
+    def test_real_consumer_keeps_steering_during_blocked_route_check_and_stop(self):
+        source = EstimateSource()
+        nav = Navigation(self.grid, mode='drive', scanner=Mock(), ekf=source, move_correction=True)
+        master = FeedbackWorker('normal', port_factory=guided_simulated_port)
+        closed, blocked, release = Event(), Event(), Event()
+        check_route = self.grid.route_blocked
+        log = io.StringIO()
+
+        def slow_check(*args):
+            if not blocked.is_set():
+                blocked.set()
+                release.wait(2.)
+            return check_route(*args)
+
+        with patch('v11_map_runtime.FeedbackWorker', return_value=master), \
+                patch.object(self.grid, 'route_blocked', side_effect=slow_check), redirect_stdout(log):
+            navigation = Thread(target=nav.run, args=('offline', closed, True))
+            navigation.start()
+            try:
+                self.wait_until(lambda: nav.connected and nav._fresh())
+                nav.align(dict(x=1., y=1., yaw=0.), 'manual')
+                nav.scan_points, nav.scan_expires = (), time.monotonic()+5.
+                nav.preview(dict(x=2., y=1.))
+                nav.request_start(nav.plan['id'])
+                self.assertTrue(blocked.wait(3.))
+                cursor = master.transmissions_since(0)['cursor']
+                history_cursor = master.snapshot()['cursor']
+                source.pose['yaw'] += .03
+                started = time.monotonic()
+                time.sleep(.72)
+                self.assertFalse(release.is_set())
+                replies = [r for r in master.history_since(history_cursor)['exchanges'] if r.opcode == STEER]
+                self.assertGreaterEqual(len(replies), 4)
+                times = [r.sent_at for r in replies]
+                self.assertLess(max(b-a for a, b in zip(times, times[1:])), .3)
+                bases = [struct.unpack_from('<I', bytes.fromhex(r.request_hex), 38)[0] for r in replies]
+                self.assertEqual(bases, sorted(set(bases)))
+                self.assertLess(times[0]-started, .3)
+                self.assertTrue(all(struct.unpack_from('<h', bytes.fromhex(r.request_hex), 36)[0] < 0
+                                    for r in replies[-3:]))
+
+                nav.request_stop()
+                self.wait_until(lambda: any(e['opcode'] == STOP
+                    for e in master.transmissions_since(cursor)['entries']))
+                time.sleep(.15)
+                entries = master.transmissions_since(cursor)['entries']
+                stop_index = next(i for i, e in enumerate(entries) if e['opcode'] == STOP)
+                self.assertNotIn(STEER, [e['opcode'] for e in entries[stop_index+1:]])
+                release.set()
+                self.wait_until(lambda: nav.stop_verified is True)
+                self.assertIsNone(nav.feedback_error)
+            finally:
+                release.set()
+                closed.set()
+                navigation.join(4.)
+                if navigation.is_alive():
+                    self.fail('Navigation did not release its consumer and serial owner')
+        self.assertFalse(master.process.is_alive())
+        traces = [json.loads(line) for line in log.getvalue().splitlines()
+                  if line.startswith('{') and json.loads(line).get('event') == 'v13_steer']
+        self.assertGreaterEqual(len(traces), 4)
+        for trace in traces:
+            if trace['result'] == 'acknowledged':
+                self.assertLessEqual(trace['submitted_monotonic_s'], trace['sent_monotonic_s'])
+                self.assertLessEqual(trace['sent_monotonic_s'], trace['received_monotonic_s'])
+                self.assertLessEqual(trace['received_monotonic_s'], trace['finished_monotonic_s'])
+                self.assertIn('publication_tick_ms', trace)
+                self.assertIn('flags', trace)
+
+    def test_correction_exception_reaches_existing_owner_error_path(self):
+        self.start()
+        self.nav.feedback = self.master
+        failure = RuntimeError('correction calculation failed')
+        self.master.history_since.return_value = dict(exchanges=[], cursor=0, missed=0, connected=True)
+        self.nav._move_correction_cycle = Mock(side_effect=failure)
+        self.nav._run_feedback_consumer(Event())
+        self.assertIs(self.nav.feedback_error, failure)
+        self.assertFalse(self.nav.connected)
+        self.assertIsNone(self.nav.route)
+        self.assertIsNone(self.nav.lease_task)
+        self.assertEqual(self.nav.error, str(failure))
 
 
 if __name__ == '__main__':

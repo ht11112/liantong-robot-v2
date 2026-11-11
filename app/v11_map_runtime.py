@@ -121,6 +121,7 @@ class Navigation:
         self.feedback_missed = 0
         self.feedback_lock = threading.Lock()
         self.feedback_error = None
+        self.trace_move_control = False
 
     def _invalidate(self, reason):
         if self._ekf_turn_active():
@@ -237,6 +238,8 @@ class Navigation:
             while not closed.wait(.01):
                 self._consume_feedback()
                 self._ekf_turn_cycle()
+                # 纠偏不能等待主导航的扫掠检查或重新规划完成。
+                self._move_correction_cycle(self.feedback, consume_feedback=False)
         except Exception as exc:
             with self.lock:
                 self.feedback_error = exc
@@ -450,10 +453,10 @@ class Navigation:
         self._queue_stop()
 
     # 差速占用唯一串口 owner 的普通命令时隙，STOP 使用原来的独立取消代次。
-    def _move_correction_cycle(self, master):
+    def _move_correction_cycle(self, master, *, consume_feedback=True):
         if not self.move_correction:
             return
-        if self.feedback is not None:
+        if self.feedback is not None and consume_feedback:
             self._consume_feedback()
         with self.lock:
             status = self.latest.status if self.latest is not None else None
@@ -481,17 +484,29 @@ class Navigation:
                 return
             pose = compose(self.ekf_alignment, estimate['pose'])
             control = self.move_controller.command(pose, estimate['angular_z_rad_s'])
+            interval = None if self.move_sent_at is None else now-self.move_sent_at
             self.move_sent_at = now
             revision = self.feedback.stop_revision if self.feedback is not None else None
             arguments = status.task, status.index, control['differential_millirpm'], status.measurement_tick_ms
+        trace = dict(event='v13_steer', task=status.task, index=status.index,
+                     basis_tick_ms=status.measurement_tick_ms,
+                     bias_millirpm=control['differential_millirpm'], submitted_monotonic_s=now,
+                     submission_gap_ms=None if interval is None else interval*1000,
+                     result='failed')
+        exchange = None
         try:
             reply = (master.steer(*arguments, revision=revision) if self.feedback is not None
                      else master.steer(*arguments))
+            exchange = reply
+            trace['result'] = 'acknowledged'
             self.observe(reply)
         except RequestCancelled:
+            trace['result'] = 'cancelled'
             return
         except (Rejected, ValueError) as exc:
+            trace.update(result='rejected', error=str(exc))
             if isinstance(exc, Rejected):
+                exchange = exc.exchange
                 self.observe(exc.exchange)
             elif self.feedback is not None:
                 self._consume_feedback()
@@ -503,6 +518,20 @@ class Navigation:
                     self.move_controller = self.move_controller_key = None
                     self.move_control.update(phase='waiting', message='直行段已切换')
             return
+        except LinkError as exc:
+            exchange = exc.exchange
+            trace['error'] = str(exc)
+            raise
+        finally:
+            if self.trace_move_control:
+                if exchange is not None:
+                    trace.update(sent_monotonic_s=exchange.sent_at,
+                                 received_monotonic_s=exchange.received_at,
+                                 ack_result=exchange.status.ack_result, mcu_error=exchange.status.first_error,
+                                 publication_tick_ms=exchange.status.publication_tick_ms, flags=exchange.status.flags)
+                trace.update(finished_monotonic_s=self.clock(),
+                             duration_ms=(self.clock()-now)*1000)
+                print(json.dumps(trace), flush=True)
         with self.lock:
             if not self.stop_requested and self.move_controller_key == key:
                 self.move_control.update(control, phase='active', message='沿规划直线纠偏',
@@ -969,6 +998,7 @@ class Navigation:
         self.feedback = master
         self.feedback_cursor = self.feedback_missed = 0
         self.feedback_error = None
+        self.trace_move_control = trace_feedback_timing
         consumer_closed = threading.Event()
         consumer = None
         try:
@@ -983,7 +1013,6 @@ class Navigation:
                 if self.feedback_error is not None:
                     raise self.feedback_error
                 self._ekf_turn_cycle()
-                self._move_correction_cycle(master)
                 with self.lock:
                     stop = self.stop_requested
                     plan, self.pending = self.pending, None
