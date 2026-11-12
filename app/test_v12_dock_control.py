@@ -65,13 +65,23 @@ class DockTest(unittest.TestCase):
         self.nav.camera = Camera()
         self.observe(flags=self.sample.flags | STOP_CONFIRMED)
 
-    def stop_proof(self, verified=True):
+    def stop_proof(self, verified=True, settle=True):
         master = Mock()
         master.stop.return_value = dict(stop_verified=verified)
         self.nav._stop(master)
         self.nav.stop_requested = False
         self.nav.work = None
+        if settle and self.nav.dock['phase'] == 'settling':
+            self.settle()
         return master
+
+    def settle(self, samples=5):
+        for _ in range(samples):
+            self.now += .05
+            tick = self.sample.measurement_tick_ms + 50
+            self.observe(sample_sequence=self.sample.sample_sequence + 1,
+                         measurement_tick_ms=tick, publication_tick_ms=tick + 5)
+            self.nav._dock_cycle()
 
     def begin(self, single=False):
         self.enable()
@@ -113,6 +123,81 @@ class DockTest(unittest.TestCase):
         self.assertIsNotNone(self.nav.pending)
         with self.assertRaises(ValueError):
             self.nav.align(dict(x=0., y=0., yaw=0.), 'manual')
+
+    def test_settling_requires_five_distinct_identical_samples_after_last_change(self):
+        self.enable()
+        self.nav.request_dock()
+        self.stop_proof(settle=False)
+        self.assertEqual(self.nav.dock['phase'], 'settling')
+        self.settle(samples=3)
+        for _ in range(5):
+            self.nav._dock_cycle()
+        self.assertEqual(self.nav.dock_capture['stable_samples'], 3)
+        self.assertEqual(self.nav.camera.sequence, 0)
+        self.now += .05
+        tick = self.sample.measurement_tick_ms + 50
+        self.observe(sample_sequence=self.sample.sample_sequence + 1, measurement_tick_ms=tick,
+                     publication_tick_ms=tick + 5, position_left=4, position_right=1)
+        self.nav._dock_cycle()
+        self.assertEqual(self.nav.dock_capture['stable_samples'], 1)
+        self.settle(samples=3)
+        self.assertEqual(self.nav.camera.sequence, 0)
+        self.settle(samples=1)
+        self.assertEqual(self.nav.dock['phase'], 'capturing')
+        self.assertEqual(self.nav.dock_capture['positions'], (4, 1))
+        self.assertEqual(self.nav.camera.sequence, 1)
+
+    def test_settling_and_capture_share_original_three_second_deadline(self):
+        self.enable()
+        self.nav.request_dock()
+        self.stop_proof(settle=False)
+        deadline = self.nav.dock_capture['deadline']
+        self.settle()
+        self.assertEqual(self.nav.dock_capture['deadline'], deadline)
+        self.now = deadline + .01
+        self.observe(sample_sequence=self.sample.sample_sequence + 1,
+                     measurement_tick_ms=self.sample.measurement_tick_ms + 50,
+                     publication_tick_ms=self.sample.measurement_tick_ms + 55)
+        self.nav._dock_cycle()
+        self.assertEqual(self.nav.camera.cancelled, [1])
+        self.assertEqual(self.nav.dock_stop_outcome, 'failed')
+        self.assertIsNone(self.nav.pending)
+
+    def test_settling_timeout_or_fault_never_requests_photo(self):
+        for failure in ('timeout', 'stale', 'drive', 'rx', 'manual', 'boot'):
+            with self.subTest(failure=failure):
+                self.setUp()
+                self.enable()
+                self.nav.request_dock()
+                self.stop_proof(settle=False)
+                if failure == 'timeout':
+                    self.now += 3.01
+                    self.observe(sample_sequence=2, measurement_tick_ms=145, publication_tick_ms=150)
+                elif failure == 'stale':
+                    self.now += .6
+                elif failure == 'drive':
+                    self.observe(first_drive_error=72)
+                elif failure == 'rx':
+                    self.observe(flags=self.sample.flags | RX_FAULT)
+                elif failure == 'manual':
+                    self.nav.request_stop()
+                else:
+                    self.observe(boot=43)
+                self.nav._dock_cycle()
+                self.assertEqual(self.nav.camera.sequence, 0)
+                self.assertIsNone(self.nav.pending)
+                self.assertTrue(self.nav.stop_requested)
+                self.assertEqual(self.nav.dock_stop_outcome, 'cancelled' if failure == 'manual' else 'failed')
+
+    def test_change_after_settling_still_cancels_photo(self):
+        self.begin()
+        self.observe(position_left=1, sample_sequence=self.sample.sample_sequence + 1,
+                     measurement_tick_ms=self.sample.measurement_tick_ms + 50,
+                     publication_tick_ms=self.sample.measurement_tick_ms + 55)
+        self.nav._dock_cycle()
+        self.assertEqual(self.nav.camera.cancelled, [1])
+        self.assertEqual(self.nav.dock_stop_outcome, 'failed')
+        self.assertIsNone(self.nav.pending)
 
     def test_photo_timeout_cancels_and_late_photo_cannot_start_next_task(self):
         self.begin()
@@ -263,10 +348,10 @@ class DockTest(unittest.TestCase):
         master.stop.return_value = dict(stop_verified=True)
         self.nav._stop(master)
         self.assertTrue(self.nav.stop_requested)
-        self.assertEqual(self.nav.dock['phase'], 'capturing')
+        self.assertEqual(self.nav.dock['phase'], 'settling')
         self.nav.request_stop()
         self.assertEqual(self.nav.dock['phase'], 'cancelled')
-        self.assertEqual(self.nav.camera.cancelled, [1])
+        self.assertEqual(self.nav.camera.cancelled, [])
         self.nav.stop_requested = False
         self.nav._dock_cycle()
         self.assertEqual(self.nav.dock['phase'], 'cancelled')

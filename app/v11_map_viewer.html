@@ -299,7 +299,7 @@
       $('dock-camera-status').textContent=online?(camera?.reason||'后视相机未接入'):'RK 连接断开，画面已过期';
       const metric=(v,unit)=>finite(v)?`${v.toFixed(3)} ${unit}`:'—';
       $('dock-observation').textContent=fresh?`ID ${camera.tag_id??'—'} · 距离 ${metric(camera.distance_m,'m')} · 轮轴左偏 ${metric(camera.lateral_m,'m')} · 朝向 ${metric(camera.yaw_deg,'°')}`:'标签及位姿：画面过期或不可用';
-      const dockPhases={capturing:'停车拍摄中',observing:'等待停稳拍摄',uploading:'本步参考照片已就绪，正在上传',starting:'本步参考照片已就绪，正在启动',moving:'执行本步中',stopping:'等待实测停稳',complete:'已用停稳后照片确认对准',step_complete:'单步完成，已确认停稳',failed:'对准已结束',cancelled:'对准已取消'};
+      const dockPhases={settling:'等待轮位稳定',capturing:'停车拍摄中',observing:'等待停稳拍摄',uploading:'本步参考照片已就绪，正在上传',starting:'本步参考照片已就绪，正在启动',moving:'执行本步中',stopping:'等待实测停稳',complete:'已用停稳后照片确认对准',step_complete:'单步完成，已确认停稳',failed:'对准已结束',cancelled:'对准已取消'};
       $('dock-phase').textContent=online?(dockPhases[dock.phase]||'视觉对准待命'):'RK 连接断开';
       updateReference(online ? dock.photo_id : null);
       $('dock-task').textContent=dock.message||'视觉对准待命';

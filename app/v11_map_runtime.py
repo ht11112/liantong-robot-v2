@@ -37,6 +37,7 @@ ARRIVAL_REACHED = 8
 POSE_DISTANCE_TOLERANCE_M = .02
 POSE_HEADING_TOLERANCE_RAD = math.radians(2.)
 DOCK_PHOTO_TIMEOUT_S = 3.
+DOCK_STABLE_SAMPLES = 5
 
 
 def angle(value):
@@ -414,7 +415,7 @@ class Navigation:
             'uploading', 'starting', 'turning', 'stopping')
 
     def _dock_active(self):
-        return self.dock['phase'] in ('capturing', 'uploading', 'starting', 'moving', 'stopping')
+        return self.dock['phase'] in ('settling', 'capturing', 'uploading', 'starting', 'moving', 'stopping')
 
     def _dock_anchor(self):
         status = self._require_stationary()
@@ -426,13 +427,12 @@ class Navigation:
         if status.first_error not in (0, MCU_CANCELLED):
             raise ValueError('底盘故障，取消视觉对准')
 
-    def _start_dock_capture(self):
+    def _start_dock_settling(self):
         status = self._require_stationary()
-        photo_id = self.camera.request_photo()
-        self.dock_capture = dict(id=photo_id, session=(status.boot, status.epoch),
-                                 positions=(status.position_left, status.position_right),
+        self.dock_capture = dict(id=None, session=(status.boot, status.epoch),
+                                 positions=None, sample_sequence=status.sample_sequence, stable_samples=0,
                                  revision=self.stop_revision, deadline=self.clock() + DOCK_PHOTO_TIMEOUT_S)
-        self.dock.update(phase='capturing', message='已停稳，正在拍摄对准照片', photo_id=None)
+        self.dock.update(phase='settling', message='已停稳，等待轮位稳定后拍照', photo_id=None)
 
     def request_dock(self):
         with self.lock:
@@ -463,13 +463,14 @@ class Navigation:
             self.dock['message'] = '正在停车并确认停稳，随后拍照单步验收'
 
     def _end_dock(self, outcome, message):
+        settling = self.dock['phase'] == 'settling'
         capturing = self.dock['phase'] == 'capturing'
         if capturing and self.dock_capture is not None:
             self.camera.cancel_photo(self.dock_capture['id'])
         if outcome in ('failed', 'cancelled'):
             self.dock['photo_id'] = None
         self.dock_stop_outcome = outcome
-        if capturing and self.stop_requested:
+        if (settling or capturing) and self.stop_requested:
             self.dock.update(phase=outcome, message=message)
             return
         self.dock.update(phase='stopping' if self.connected else 'failed', message=message)
@@ -500,6 +501,22 @@ class Navigation:
                     elif status.state not in LEASE_STATES or not status.flags & EXECUTING:
                         raise ValueError('底盘动作意外结束')
                     return
+                if self.dock['phase'] == 'settling' and not self.work and not self.stop_requested:
+                    status = self._require_stationary()
+                    capture = self.dock_capture
+                    if (status.boot, status.epoch) != capture['session'] or self.stop_revision != capture['revision']:
+                        raise ValueError('等待轮位稳定时底盘会话变化或动作已取消')
+                    if self.clock() >= capture['deadline']:
+                        raise ValueError('等待轮位稳定和拍摄超过 3 秒')
+                    if status.sample_sequence != capture['sample_sequence']:
+                        positions = status.position_left, status.position_right
+                        capture['stable_samples'] = (capture['stable_samples'] + 1
+                            if positions == capture['positions'] else 1)
+                        capture['sample_sequence'], capture['positions'] = status.sample_sequence, positions
+                        if capture['stable_samples'] >= DOCK_STABLE_SAMPLES:
+                            capture['id'] = self.camera.request_photo()
+                            self.dock.update(phase='capturing', message='轮位稳定，正在拍摄对准照片')
+                    return
                 if self.dock['phase'] != 'capturing' or self.work or self.stop_requested:
                     return
                 self._dock_anchor()
@@ -528,7 +545,7 @@ class Navigation:
                 self.pending = self.dock_plan
                 self.work, self.error = 'uploading', None
                 self.stop_ack = self.stop_verified = self.stop_evidence = None
-            except ValueError as exc:
+            except (ValueError, RuntimeError) as exc:
                 self._end_dock('failed', str(exc))
 
     def _turn_feedback(self):
@@ -888,7 +905,7 @@ class Navigation:
                 outcome = self.dock_stop_outcome if self.stop_verified else 'failed'
                 if outcome == 'continue':
                     try:
-                        self._start_dock_capture()
+                        self._start_dock_settling()
                     except Exception as exc:
                         self.dock.update(phase='failed', message='无法开始拍照：' + str(exc), photo_id=None)
                 else:
