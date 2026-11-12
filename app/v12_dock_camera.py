@@ -7,7 +7,6 @@ import time
 
 MAX_AGE_S = 0.5
 PHOTO_TIMEOUT_S = 3.0
-PHOTO_EXPOSURE_WAIT_S = .5
 CAMERA_REAR_OFFSET_M = .175
 
 
@@ -82,7 +81,7 @@ class DockCamera:
             self.photo_id += 1
             self.photo = dict(id=self.photo_id, status='pending',
                               deadline=time.monotonic() + PHOTO_TIMEOUT_S,
-                              result=None, jpeg=None)
+                              result=None, jpeg=None, last_image=None)
             return self.photo_id
 
     def photo_result(self, photo_id):
@@ -91,9 +90,15 @@ class DockCamera:
             if photo is None or photo['id'] != photo_id:
                 return None
             if photo['status'] == 'pending' and time.monotonic() >= photo['deadline']:
-                photo['status'] = 'failed'
-                photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
+                self._expire_photo(photo)
             return None if photo['result'] is None else dict(photo['result'])
+
+    def _expire_photo(self, photo):
+        image = photo['last_image']
+        if image is not None and time.monotonic() - image[0] < MAX_AGE_S:
+            photo.update(status='complete', result=image[1], jpeg=image[2])
+        else:
+            photo.update(status='failed', result=dict(photo_id=photo['id'], ready=False, reason='拍照超时，没有新的有效图像'))
 
     def cancel_photo(self, photo_id):
         with self.lock:
@@ -146,14 +151,12 @@ class DockCamera:
                     ok, _ = cap.read()
                     if not ok:
                         raise RuntimeError('后视相机预热读取失败')
-                    exposure_started = time.monotonic()
                     with self.lock:
                         photo = self.photo
                         if photo is None or photo['id'] != photo_id or photo['status'] != 'pending':
                             continue
                         if time.monotonic() >= photo['deadline']:
-                            photo['status'] = 'failed'
-                            photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
+                            self._expire_photo(photo)
                             continue
                 read_start = time.monotonic()
                 ok, image = cap.read()
@@ -183,10 +186,11 @@ class DockCamera:
                     self.observation, self.jpeg, self.stamp = result, jpeg, read_start
                     photo = self.photo
                     if photo_id is not None and photo is not None and photo['id'] == photo_id and photo['status'] == 'pending':
+                        if read_start < photo['deadline'] and has_tags and mode_ok:
+                            photo['last_image'] = (read_start, dict(result, photo_id=photo_id, image_valid=True), jpeg)
                         if time.monotonic() >= photo['deadline']:
-                            photo['status'] = 'failed'
-                            photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
-                        elif ids is not None or not has_tags or not mode_ok or read_start - exposure_started >= PHOTO_EXPOSURE_WAIT_S:
+                            self._expire_photo(photo)
+                        elif ids is not None or not has_tags or not mode_ok:
                             photo['status'] = 'complete'
                             photo['result'] = dict(result, photo_id=photo_id, image_valid=has_tags and mode_ok)
                             photo['jpeg'] = jpeg

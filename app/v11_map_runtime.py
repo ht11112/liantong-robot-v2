@@ -575,10 +575,10 @@ class Navigation:
                 if phase != 'capturing':
                     return
                 self._dock_anchor()
-                if self.clock() >= self.dock_capture['deadline']:
-                    raise ValueError('拍摄超过3秒或没有新的图像')
                 observation = self.camera.photo_result(self.dock_capture['id'])
                 if observation is None:
+                    if self.clock() >= self.dock_capture['deadline']:
+                        raise ValueError('拍摄超过3秒或没有新的图像')
                     return
                 if observation['photo_id'] != self.dock_capture['id']:
                     raise ValueError('照片编号不匹配')

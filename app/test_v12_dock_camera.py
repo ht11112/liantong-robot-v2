@@ -130,8 +130,7 @@ class RealTagTest(unittest.TestCase):
                                         mount_yaw_deg=0, mount_pitch_deg=0, mount_roll_deg=0,
                                         camera_height_m=.14, verified=True)
                     with patch.object(cv2, 'VideoCapture', side_effect=lambda *args: Capture()), \
-                         patch('v12_dock_camera.PHOTO_TIMEOUT_S', .4), \
-                         patch('v12_dock_camera.PHOTO_EXPOSURE_WAIT_S', .08):
+                         patch('v12_dock_camera.PHOTO_TIMEOUT_S', .4):
                         try:
                             camera.start()
                             started = time.monotonic()
@@ -146,7 +145,7 @@ class RealTagTest(unittest.TestCase):
                             if case == 'missing':
                                 self.assertIn('未识别', result['reason'])
                                 self.assertTrue(result['image_valid'])
-                                self.assertLess(time.monotonic() - started, .4)
+                                self.assertGreaterEqual(time.monotonic() - started, .4)
                                 self.assertIsNotNone(camera.reference_frame(photo_id))
                                 self.assertEqual(len(opens), 2)
                             else:
@@ -240,7 +239,13 @@ class RealTagTest(unittest.TestCase):
                         camera.cancel_photo(first)
                     elif outcome.startswith('timeout'):
                         time.sleep(.22)
-                        self.assertIn('超时', camera.photo_result(first)['reason'])
+                        expired = camera.photo_result(first)
+                        if outcome == 'timeout_retry':
+                            self.assertTrue(expired['image_valid'])
+                            self.assertFalse(expired['ready'])
+                            self.assertIsNone(expired['tag_id'])
+                        else:
+                            self.assertIn('超时', expired['reason'])
                     if outcome != 'success':
                         second = camera.request_photo()
                         self.assertEqual(second, 2)
