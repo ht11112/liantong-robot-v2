@@ -249,7 +249,7 @@ static void dock_execution(void){
 }
 static void dock_upload_bounds(void){
   Fixture f;MQSegment bad[]={{MQ_KIND_DOCK_MOVE,0.f},{MQ_KIND_DOCK_MOVE,-.005f},{MQ_KIND_DOCK_MOVE,.01f},
-    {MQ_KIND_DOCK_MOVE,-.051f},{MQ_KIND_DOCK_TURN,0.f},{MQ_KIND_DOCK_TURN,MQ_PI/36.f+.001f},
+    {MQ_KIND_DOCK_MOVE,-1.001f},{MQ_KIND_DOCK_TURN,0.f},{MQ_KIND_DOCK_TURN,MQ_PI/36.f+.001f},
     {MQ_KIND_DOCK_TURN,-MQ_PI/36.f-.001f},{MQ_KIND_DOCK_TURN,MQ_PI/180.f},
     {MQ_KIND_DOCK_TURN,-MQ_PI/180.f}};
   for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++){
@@ -261,12 +261,27 @@ static void dock_upload_bounds(void){
   assert(mq_start(&f.q,1,f.now)==MQ_ORDER && !f.motor.arms);
   expect("dock upload rejects invalid ranges and mixed or multiple segments before START");
 }
+static void continuous_dock(void){
+  Fixture f;MQSegment s={MQ_KIND_DOCK_MOVE,-1.f};setup(&f,100u);
+  assert(load(&f,1,&s,1)==MQ_OK);start(&f);ack(&f,f.now);mq_tick(&f.q,f.now);
+  assert(f.motor.requested_left==-1 && f.motor.requested_right==1);
+  for(unsigned i=0;i<2100 && f.q.state==MQ_MOVE;i++)step_renewing(&f,-10,10);
+  assert(f.now>90000u && f.q.arrival_reached && f.q.progress>=.995f && f.q.progress<.996f);
+  finish_stop(&f);assert(f.q.state==MQ_COMPLETE && f.q.physical_stop_confirmed);
+  setup(&f,100u);assert(load(&f,1,&s,1)==MQ_OK);start(&f);ack(&f,f.now);
+  for(unsigned i=0;i<601 && f.q.state==MQ_MOVE;i++)step(&f,-10,10);
+  assert(f.q.state==MQ_STOPPING && !f.q.arrival_reached);
+  finish_stop(&f);assert(f.q.state==MQ_FAILED);
+  setup(&f,100u);assert(load(&f,1,&s,1)==MQ_OK);start(&f);
+  mq_stop(&f.q,f.now);finish_stop(&f);assert(f.q.state==MQ_FAILED && !f.q.arrival_reached);
+  expect("one metre reverse uses 1RPM, 5mm tolerance, unchanged 30s lease and real STOP");
+}
 int main(void){
   offline_and_tick_wrap();deadline_and_late_ack();lease_renewal_and_expiration();malformed_or_partial_queue();
   idempotence_and_old_task();duplicate_and_missing_samples();move_yaw_is_observation_only();
   negative_turn_wrap();direct_stop_and_parking_sample();parking_fault_cannot_upgrade();
   handoff_requires_new_zero_application();
   unavailable_can_fifo_is_bounded();
-  dock_upload_bounds();dock_execution();
+  dock_upload_bounds();dock_execution();continuous_dock();
   puts("REVIEW COMPLETE 12 production-core/driver scenarios");return 0;
 }

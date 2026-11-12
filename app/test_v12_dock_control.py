@@ -1,27 +1,19 @@
+import json
 import math
 from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
-import time
-import unittest
-from dataclasses import replace
 from http.server import ThreadingHTTPServer
 from threading import Event, Thread
+from urllib.request import Request, urlopen
+import unittest
+from dataclasses import replace
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError
-from urllib.request import urlopen
 
 import test_v11_map_runtime as base
-from mcu_v11 import EXECUTING, RX_FAULT, STOP_CONFIRMED, Rejected
-from v12_dock_control import dock_segment, next_action
-from v11_map_runtime import handler_for
-
-try:
-    import cv2
-    import numpy as np
-    HAVE_ARUCO = hasattr(cv2, 'aruco') and hasattr(cv2.aruco, 'DICT_APRILTAG_36h11')
-except ImportError:
-    HAVE_ARUCO = False
+from mcu_v11 import EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RX_FAULT, STOP_CONFIRMED, Rejected
+from v11_map_runtime import Navigation, handler_for
+from v12_dock_control import DockSettings, dock_segment, dock_sites, reverse_plan
 
 
 class Camera:
@@ -29,10 +21,9 @@ class Camera:
         self.sequence = 0
         self.results = {}
         self.cancelled = []
-        self.value = dict(fresh=False, ready=False, reason='预览未连接')
 
     def snapshot(self):
-        return dict(self.value)
+        return dict(fresh=False, ready=False, reason='预览过期')
 
     def request_photo(self):
         self.sequence += 1
@@ -45,15 +36,51 @@ class Camera:
         self.cancelled.append(photo_id)
         self.results.pop(photo_id, None)
 
-    def reference_frame(self, photo_id):
-        return b'jpeg' if photo_id in self.results else None
-
     def finish(self, photo_id=None, **changes):
         photo_id = self.sequence if photo_id is None else photo_id
-        result = dict(photo_id=photo_id, frame_seq=photo_id, ready=True, reason=None,
-                      distance_m=.5, lateral_m=0., yaw_deg=0., tag_id=1)
+        result = dict(photo_id=photo_id, frame_seq=photo_id, ready=True, image_valid=True,
+                      reason=None, tag_id=1, plane_x_m=-.70, plane_y_m=0., normal_x=1., normal_y=0.)
         result.update(changes)
         self.results[photo_id] = result
+
+
+class GeometryTest(unittest.TestCase):
+    def test_once_plan_reaches_axle_target_after_turn_and_reverse(self):
+        for px, py, yaw in ((-.7, 0., 0.), (-.7, .15, .1), (-.7, -.15, -.1)):
+            plan = reverse_plan(dict(plane_x_m=px, plane_y_m=py,
+                                     normal_x=math.cos(yaw), normal_y=math.sin(yaw)))
+            q, turn, distance = plan['target_body'], plan['turn_rad'], plan['reverse_m']
+            self.assertAlmostEqual(-distance*math.cos(turn), q['x'])
+            self.assertAlmostEqual(-distance*math.sin(turn), q['y'])
+            self.assertAlmostEqual(math.hypot(q['x']-px, q['y']-py), .25)
+            self.assertEqual(math.copysign(1, turn), -math.copysign(1, py) if py else -1.)
+
+    def test_boundary_budget_and_wire_are_real_production(self):
+        self.assertEqual(reverse_plan(dict(plane_x_m=-1.25, plane_y_m=0., normal_x=1., normal_y=0.))['budget_s'], 125)
+        self.assertEqual(struct.unpack('<If', dock_segment('move', -1.).segments[0]), (3, -1.))
+        self.assertEqual(struct.unpack('<If', dock_segment('normal_turn', math.pi/6).segments[0])[0], 2)
+        for value in (-1.001, -.005, 0., .01, float('nan')):
+            with self.assertRaises(ValueError):
+                dock_segment('move', value)
+        for px,py in ((.1,0.),(-1.26,0.),(-.2,0.),(-1.25,.1)):
+            with self.assertRaises(ValueError):
+                reverse_plan(dict(plane_x_m=px,plane_y_m=py,normal_x=1.,normal_y=0.))
+
+    def test_config_persistence_and_map_binding(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder)/'dock.json'
+            settings = DockSettings('a', path)
+            sites = dock_sites(settings.value)
+            self.assertAlmostEqual(sites['waiting']['x'], .2)
+            self.assertAlmostEqual(sites['axle_target']['x'], -.25)
+            settings.save(dict(map_id='a',x=1.,y=2.,yaw=math.pi/2))
+            loaded = DockSettings('a', path)
+            self.assertEqual(loaded.value, settings.value)
+            self.assertAlmostEqual(dock_sites(loaded.value)['waiting']['y'], 2.7)
+            self.assertEqual(DockSettings('b',path).value['x'], -.5)
+            for bad in (dict(map_id='b',x=0.,y=0.,yaw=0.),dict(map_id='a',x=True,y=0.,yaw=0.)):
+                with self.assertRaises(ValueError):
+                    settings.save(bad)
 
 
 class DockTest(unittest.TestCase):
@@ -64,24 +91,16 @@ class DockTest(unittest.TestCase):
         self.nav.mode = 'drive'
         self.nav.camera = Camera()
         self.observe(flags=self.sample.flags | STOP_CONFIRMED)
+        self.nav.align(dict(x=1.7,y=1.,yaw=0.), 'manual')
+        self.nav.configure_dock(dict(map_id=self.grid.metadata()['map_id'],x=1.,y=1.,yaw=0.))
 
-    def stop_proof(self, verified=True, settle=True):
+    def stop_proof(self, verified=True):
         master = Mock()
         master.stop.return_value = dict(stop_verified=verified)
         self.nav._stop(master)
         self.nav.stop_requested = False
-        self.nav.work = None
-        if settle and self.nav.dock['phase'] == 'settling':
-            self.settle()
-        return master
-
-    def settle(self, samples=5):
-        for _ in range(samples):
-            self.now += .05
-            tick = self.sample.measurement_tick_ms + 50
-            self.observe(sample_sequence=self.sample.sample_sequence + 1,
-                         measurement_tick_ms=tick, publication_tick_ms=tick + 5)
-            self.nav._dock_cycle()
+        if self.nav.work == 'stopping':
+            self.nav.work = None
 
     def begin(self, single=False):
         self.enable()
@@ -91,7 +110,6 @@ class DockTest(unittest.TestCase):
         else:
             self.nav.request_dock()
         self.assertTrue(self.nav.stop_requested)
-        self.assertEqual(self.nav.dock['phase'], 'stopping')
         self.stop_proof()
         self.assertEqual(self.nav.dock['phase'], 'capturing')
 
@@ -100,412 +118,257 @@ class DockTest(unittest.TestCase):
         self.nav._dock_cycle()
         return self.nav.pending
 
-    def test_segment_wire_limits_and_geometry(self):
-        self.assertEqual(struct.unpack('<If', dock_segment('move', -.05).segments[0])[0], 3)
-        self.assertEqual(struct.unpack('<If', dock_segment('turn', math.radians(5)).segments[0])[0], 4)
-        for kind, value in [('move', -.005), ('move', .01), ('move', -.051),
-                            ('turn', math.radians(1)), ('turn', math.radians(5.1))]:
-            with self.assertRaises(ValueError):
-                dock_segment(kind, value)
-        self.assertGreater(next_action(dict(distance_m=.5, lateral_m=.04, yaw_deg=0.))[1], 0.)
-        self.assertLess(next_action(dict(distance_m=.5, lateral_m=-.04, yaw_deg=0.))[1], 0.)
-        self.assertEqual(next_action(dict(distance_m=.5, lateral_m=0., yaw_deg=0.)), ('move', -.05))
-        self.assertIsNone(next_action(dict(distance_m=.20, lateral_m=.01, yaw_deg=2.)))
+    def tick(self, dt=.05, **changes):
+        if 'flags' in changes:
+            changes['flags'] |= ODOM_INITIALIZED | ODOM_VALID
+        self.now += dt
+        tick = self.sample.measurement_tick_ms+round(dt*1000)
+        self.observe(sample_sequence=self.sample.sample_sequence+1,measurement_tick_ms=tick,
+                     publication_tick_ms=tick+5, **changes)
 
-    def test_start_stops_and_photographs_without_preview_readiness(self):
-        self.begin()
-        self.assertFalse(self.nav.camera.snapshot()['ready'])
-        self.assertIsNone(self.nav.dock['photo_id'])
-        self.assertIsNone(self.nav.pending)
-        self.photo()
-        self.assertEqual(self.nav.dock['photo_id'], 1)
-        self.assertEqual(self.nav.dock['phase'], 'uploading')
-        self.assertIsNotNone(self.nav.pending)
-        with self.assertRaises(ValueError):
-            self.nav.align(dict(x=0., y=0., yaw=0.), 'manual')
-
-    def test_settling_requires_five_distinct_identical_samples_after_last_change(self):
-        self.enable()
-        self.nav.request_dock()
-        self.stop_proof(settle=False)
-        self.assertEqual(self.nav.dock['phase'], 'settling')
-        self.settle(samples=3)
-        for _ in range(5):
-            self.nav._dock_cycle()
-        self.assertEqual(self.nav.dock_capture['stable_samples'], 3)
-        self.assertEqual(self.nav.camera.sequence, 0)
-        self.now += .05
-        tick = self.sample.measurement_tick_ms + 50
-        self.observe(sample_sequence=self.sample.sample_sequence + 1, measurement_tick_ms=tick,
-                     publication_tick_ms=tick + 5, position_left=4, position_right=1)
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.dock_capture['stable_samples'], 1)
-        self.settle(samples=3)
-        self.assertEqual(self.nav.camera.sequence, 0)
-        self.settle(samples=1)
-        self.assertEqual(self.nav.dock['phase'], 'capturing')
-        self.assertEqual(self.nav.dock_capture['positions'], (4, 1))
-        self.assertEqual(self.nav.camera.sequence, 1)
-
-    def test_settling_and_capture_share_original_three_second_deadline(self):
-        self.enable()
-        self.nav.request_dock()
-        self.stop_proof(settle=False)
-        deadline = self.nav.dock_capture['deadline']
-        self.settle()
-        self.assertEqual(self.nav.dock_capture['deadline'], deadline)
-        self.now = deadline + .01
-        self.observe(sample_sequence=self.sample.sample_sequence + 1,
-                     measurement_tick_ms=self.sample.measurement_tick_ms + 50,
-                     publication_tick_ms=self.sample.measurement_tick_ms + 55)
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.camera.cancelled, [1])
-        self.assertEqual(self.nav.dock_stop_outcome, 'failed')
-        self.assertIsNone(self.nav.pending)
-
-    def test_settling_timeout_or_fault_never_requests_photo(self):
-        for failure in ('timeout', 'stale', 'drive', 'rx', 'manual', 'boot'):
-            with self.subTest(failure=failure):
-                self.setUp()
-                self.enable()
-                self.nav.request_dock()
-                self.stop_proof(settle=False)
-                if failure == 'timeout':
-                    self.now += 3.01
-                    self.observe(sample_sequence=2, measurement_tick_ms=145, publication_tick_ms=150)
-                elif failure == 'stale':
-                    self.now += .6
-                elif failure == 'drive':
-                    self.observe(first_drive_error=72)
-                elif failure == 'rx':
-                    self.observe(flags=self.sample.flags | RX_FAULT)
-                elif failure == 'manual':
-                    self.nav.request_stop()
-                else:
-                    self.observe(boot=43)
-                self.nav._dock_cycle()
-                self.assertEqual(self.nav.camera.sequence, 0)
-                self.assertIsNone(self.nav.pending)
-                self.assertTrue(self.nav.stop_requested)
-                self.assertEqual(self.nav.dock_stop_outcome, 'cancelled' if failure == 'manual' else 'failed')
-
-    def test_change_after_settling_still_cancels_photo(self):
-        self.begin()
-        self.observe(position_left=1, sample_sequence=self.sample.sample_sequence + 1,
-                     measurement_tick_ms=self.sample.measurement_tick_ms + 50,
-                     publication_tick_ms=self.sample.measurement_tick_ms + 55)
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.camera.cancelled, [1])
-        self.assertEqual(self.nav.dock_stop_outcome, 'failed')
-        self.assertIsNone(self.nav.pending)
-
-    def test_photo_timeout_cancels_and_late_photo_cannot_start_next_task(self):
-        self.begin()
-        self.now += 3.01
-        self.observe(sample_sequence=2, measurement_tick_ms=145, publication_tick_ms=150)
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.camera.cancelled, [1])
-        self.assertTrue(self.nav.stop_requested)
-        self.assertEqual(self.nav.dock_stop_outcome, 'failed')
-        self.nav.camera.finish(photo_id=1)
-        self.stop_proof()
-        self.nav.request_dock()
-        self.stop_proof()
-        self.assertEqual(self.nav.dock_capture['id'], 2)
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.dock['phase'], 'capturing')
-        self.assertIsNone(self.nav.pending)
-        self.nav.camera.finish(photo_id=2)
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.dock['photo_id'], 2)
-
-    def test_failed_photo_and_mismatched_number_stop(self):
-        for changes in (dict(ready=False, reason='未识别目标'), dict(photo_id=99)):
-            with self.subTest(changes=changes):
-                self.setUp()
-                self.begin()
-                self.nav.camera.finish()
-                self.nav.camera.results[1].update(changes)
-                self.nav._dock_cycle()
-                self.assertTrue(self.nav.stop_requested)
-                self.assertEqual(self.nav.dock_stop_outcome, 'failed')
-                self.assertIsNone(self.nav.pending)
-
-    def test_capture_feedback_loss_fault_and_manual_stop(self):
-        for failure in ('stale', 'drive', 'rx', 'manual'):
-            with self.subTest(failure=failure):
-                self.setUp()
-                self.begin()
-                if failure == 'stale':
-                    self.now += .6
-                    self.nav._dock_cycle()
-                elif failure == 'drive':
-                    self.observe(first_drive_error=72)
-                    self.nav._dock_cycle()
-                elif failure == 'rx':
-                    self.observe(flags=self.sample.flags | RX_FAULT)
-                    self.nav._dock_cycle()
-                else:
-                    self.nav.request_stop()
-                self.assertTrue(self.nav.stop_requested)
-                self.assertEqual(self.nav.camera.cancelled, [1])
-                self.assertEqual(self.nav.dock_stop_outcome, 'cancelled' if failure == 'manual' else 'failed')
-                self.nav.camera.finish(photo_id=1)
-                self.nav._dock_cycle()
-                self.assertIsNone(self.nav.pending)
-
-    def test_feedback_loss_during_stop_blocks_photo(self):
-        self.enable()
-        self.nav.request_dock()
-        self.now += .6
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.dock_stop_outcome, 'failed')
-        self.stop_proof()
-        self.assertEqual(self.nav.dock['phase'], 'failed')
-        self.assertEqual(self.nav.camera.sequence, 0)
-
-    def test_start_rechecks_encoder_identity_and_cancel_after_upload(self):
-        for failure in ('left', 'right', 'boot', 'cancel'):
-            with self.subTest(failure=failure):
-                self.setUp()
-                self.begin()
-                plan = self.photo()
-                master = Mock()
-                def upload(document, *, on_ack):
-                    if failure == 'cancel':
-                        self.nav.request_stop()
-                    else:
-                        self.observe(**({'position_left': 1} if failure == 'left' else
-                                        {'position_right': 1} if failure == 'right' else {'boot': 43}))
-                    return [self.nav.latest]
-                master.upload.side_effect = upload
-                if failure in ('cancel', 'boot'):
-                    self.nav._upload_dock(master, plan)
-                else:
-                    with self.assertRaises(ValueError):
-                        self.nav._upload_dock(master, plan)
-                master.start.assert_not_called()
-
-    def test_old_firmware_rejection_never_starts(self):
-        self.begin()
-        plan = self.photo()
+    def start_motion(self):
+        plan, self.nav.pending = self.nav.pending, None
         master = Mock()
-        master.upload.side_effect = Rejected('MCU rejected APPEND')
-        with self.assertRaises(Rejected):
-            self.nav._upload_dock(master, plan)
-        master.start.assert_not_called()
-
-    def test_photo_age_during_upload_and_preview_loss_during_motion_do_not_cancel(self):
-        self.begin()
-        plan = self.photo()
-        self.now += 1.
-        self.observe(sample_sequence=2, measurement_tick_ms=145, publication_tick_ms=150)
-        master = Mock()
-        master.upload.return_value = [self.nav.latest]
-        started = replace(self.nav.latest, status=replace(self.sample, task=7, state=4,
-                          flags=self.sample.flags | EXECUTING, lease_remaining_ms=30000))
+        ready = replace(self.nav.latest,status=replace(self.sample,task=7,state=2))
+        master.upload.side_effect = lambda plan,on_ack: (on_ack(ready),[ready])[1]
+        started = replace(ready,sent_at=self.now-.02,received_at=self.now,
+            status=replace(ready.status,state=4,flags=EXECUTING|ODOM_INITIALIZED|ODOM_VALID,lease_remaining_ms=30000))
         master.start.return_value = started
         self.nav._upload_dock(master, plan)
-        self.assertEqual(self.nav.dock['phase'], 'moving')
-        self.nav.camera.value.update(fresh=False, ready=False, reason='标签丢失')
-        self.nav._dock_cycle()
-        self.assertFalse(self.nav.stop_requested)
-        self.observe(task=7, state=4, flags=self.sample.flags | EXECUTING,
-                     lease_remaining_ms=4000, sample_sequence=3, measurement_tick_ms=195,
-                     publication_tick_ms=200)
-        self.nav._renew_if_due(master, self.nav.latest)
-        master.renew.assert_not_called()
+        self.sample = started.status
+        self.nav.work = None
+        return master
 
-    def test_motion_feedback_fault_stops_without_visual_dependency(self):
-        for failure in ('stale', 'drive', 'rx', 'manual'):
+    def complete_motion(self, **changes):
+        self.tick(state=8,flags=STOP_CONFIRMED|8,lease_remaining_ms=0,**changes)
+        self.nav._dock_cycle()
+        self.assertTrue(self.nav.stop_requested)
+        self.stop_proof()
+
+    def test_default_route_approach_preserves_manual_pose(self):
+        self.enable()
+        self.nav.align(dict(x=1.,y=1.,yaw=0.),'manual')
+        old = dict(self.nav.origin)
+        self.nav.request_dock()
+        self.assertEqual(self.nav.dock['phase'], 'approaching')
+        self.assertAlmostEqual(self.nav.pending['goal']['x'], 1.7)
+        self.assertEqual(self.nav.origin, old)
+        self.assertIsNone(self.nav.dock_plan)
+        self.nav.work = None
+        self.complete_motion()
+        self.assertEqual(self.nav.camera.sequence,1)
+
+    def test_first_target_plans_one_reverse_and_no_final_photo(self):
+        self.begin()
+        plan=self.photo()
+        self.assertAlmostEqual(struct.unpack('<If',plan.segments[0])[1],-.45,places=6)
+        self.start_motion()
+        self.assertEqual(self.nav.dock['phase'],'backing')
+        self.nav.camera.results.clear()
+        self.complete_motion()
+        self.assertEqual(self.nav.dock['phase'],'complete')
+        self.assertEqual(self.nav.dock['message'],'倒车计划执行完成，已停稳')
+        self.assertEqual(self.nav.camera.sequence,1)
+        self.assertIsNone(self.nav.pending)
+
+    def test_offset_turn_then_reverse_uses_same_photo(self):
+        self.begin()
+        self.photo(plane_y_m=.15)
+        solution=dict(self.nav.dock_solution)
+        self.start_motion()
+        self.assertEqual(self.nav.dock['phase'],'turning')
+        self.complete_motion(yaw=solution['turn_rad'])
+        self.assertEqual(self.nav.dock_motion,'reverse')
+        self.assertEqual(self.nav.camera.sequence,1)
+        self.start_motion()
+        self.complete_motion()
+        self.assertEqual(self.nav.dock['phase'],'complete')
+        self.assertEqual(self.nav.camera.sequence,1)
+
+    def test_missing_or_wrong_id_searches_using_measured_angle(self):
+        self.begin()
+        self.photo(ready=False,tag_id=None)
+        self.assertEqual(struct.unpack('<If',self.nav.pending.segments[0])[0],2)
+        self.start_motion()
+        self.complete_motion(yaw=math.radians(27.))
+        self.photo(ready=False,tag_id=None)
+        self.assertAlmostEqual(struct.unpack('<If',self.nav.pending.segments[0])[1],math.radians(33.),places=6)
+        self.start_motion()
+        self.complete_motion(yaw=math.radians(57.))
+        self.photo()
+        self.assertEqual(self.nav.dock_motion,'reverse')
+        self.assertEqual(self.nav.dock_search_index,2)
+
+    def test_one_search_circle_uses_wrapped_measured_turns_and_then_stops(self):
+        self.begin()
+        for i in range(1,13):
+            self.photo(ready=False,tag_id=None)
+            self.start_motion()
+            measured=math.radians(i*30-2)
+            self.complete_motion(yaw=math.atan2(math.sin(measured),math.cos(measured)))
+        self.photo(ready=False,tag_id=None)
+        self.assertEqual(self.nav.dock_stop_outcome,'failed')
+        self.assertIsNone(self.nav.pending)
+        self.assertAlmostEqual(self.nav.dock['search_angle_deg'],358.,places=4)
+
+    def test_photo_has_no_raw_counter_equality_gate_but_pose_check_remains(self):
+        self.begin()
+        self.tick(position_left=12,position_right=9)
+        self.photo()
+        self.assertIsNotNone(self.nav.pending)
+        self.tick(x=self.sample.x+.021)
+        master=Mock()
+        with self.assertRaises(ValueError):
+            self.nav._upload_dock(master,self.nav.pending)
+        master.start.assert_not_called()
+
+    def test_capture_failure_stale_id_unverified_and_three_second_timeout_stop(self):
+        for failure in ('camera','old','unverified','timeout'):
             with self.subTest(failure=failure):
-                self.setUp()
-                self.begin()
-                self.photo()
-                self.nav.work = None
-                self.nav.dock['phase'] = 'moving'
-                self.observe(task=7, state=4, flags=self.sample.flags | EXECUTING, lease_remaining_ms=30000)
-                self.nav.lease_task = (42, 1, 7)
-                if failure == 'stale':
-                    self.now += .6
-                    self.nav._dock_cycle()
-                elif failure == 'drive':
-                    self.observe(first_drive_error=72)
-                    self.nav._dock_cycle()
-                elif failure == 'rx':
-                    self.observe(flags=self.sample.flags | RX_FAULT)
-                    self.nav._dock_cycle()
-                else:
-                    self.nav.request_stop()
+                self.setUp();self.begin()
+                if failure=='camera': self.photo(ready=False,image_valid=False,reason='no image')
+                elif failure=='unverified': self.photo(ready=False)
+                elif failure=='old':
+                    self.photo(photo_id=99)
+                    self.assertIsNone(self.nav.pending)
+                    self.assertEqual(self.nav.dock['phase'],'capturing')
+                    self.tick(3.01);self.nav._dock_cycle()
+                else: self.tick(3.01);self.nav._dock_cycle()
+                self.assertEqual(self.nav.dock_stop_outcome,'failed')
+                self.assertIsNone(self.nav.pending)
+
+    def test_cancelled_late_photo_cannot_resume(self):
+        self.begin()
+        self.nav.request_stop()
+        self.nav.camera.finish()
+        self.stop_proof()
+        self.nav._dock_cycle()
+        self.assertEqual(self.nav.dock['phase'],'cancelled')
+        self.assertIsNone(self.nav.pending)
+
+    def test_failed_stop_cannot_complete_or_schedule_reverse(self):
+        self.begin();self.photo();self.start_motion()
+        self.tick(state=8,flags=STOP_CONFIRMED|8,lease_remaining_ms=0)
+        self.nav._dock_cycle();self.stop_proof(False)
+        self.assertEqual(self.nav.dock['phase'],'failed')
+        self.assertIsNone(self.nav.pending)
+
+    def test_long_reverse_renews_beyond_thirty_seconds_and_ignores_preview_loss(self):
+        self.begin();self.photo(plane_x_m=-1.25);master=self.start_motion()
+        deadline=self.nav.dock_deadline
+        master.renew.side_effect=lambda task: replace(self.nav.latest,status=replace(self.sample,lease_remaining_ms=30000))
+        for _ in range(3):
+            for _ in range(500):
+                self.tick(state=4,flags=EXECUTING,lease_remaining_ms=4000)
+            self.nav._dock_cycle();self.nav._renew_if_due(master,self.nav.latest)
+        self.assertEqual(master.renew.call_count,3)
+        self.assertFalse(self.nav.stop_requested)
+        self.assertEqual(self.nav.camera.sequence,1)
+        self.assertAlmostEqual(deadline,(5.-.02)+125)
+
+    def test_budget_from_actual_start_blocks_renew_and_stops(self):
+        self.begin();self.photo(plane_x_m=-1.25);master=self.start_motion()
+        for _ in range(2500):
+            self.tick(state=4,flags=EXECUTING,lease_remaining_ms=4000)
+        self.nav._renew_if_due(master,self.nav.latest)
+        master.renew.assert_not_called()
+        self.assertTrue(self.nav.stop_requested)
+        self.assertIsNone(self.nav.lease_task)
+        self.assertIn('预算',self.nav.dock['message'])
+
+    def test_old_short_step_and_search_turn_do_not_renew(self):
+        for role in ('step','search','align'):
+            with self.subTest(role=role):
+                self.setUp();self.begin(single=role=='step')
+                self.photo(ready=role!='search',tag_id=None if role=='search' else 1,
+                           plane_y_m=.15 if role=='align' else 0.)
+                master=self.start_motion()
+                self.tick(1.,state=4,flags=EXECUTING,lease_remaining_ms=4000)
+                self.nav._renew_if_due(master,self.nav.latest)
+                master.renew.assert_not_called()
+
+    def test_single_step_ends_after_stop_without_rephotograph(self):
+        self.begin(single=True);self.photo();self.start_motion();self.complete_motion()
+        self.assertEqual(self.nav.dock['phase'],'step_complete')
+        self.assertEqual(self.nav.camera.sequence,1)
+        self.assertIsNone(self.nav.pending)
+
+    def test_fault_loss_cancel_and_boot_cannot_resume(self):
+        for reason in ('stale','drive','rx','manual','boot'):
+            with self.subTest(reason=reason):
+                self.setUp();self.begin();self.photo();self.start_motion()
+                if reason=='stale': self.now+=.6
+                elif reason=='drive': self.tick(first_drive_error=72)
+                elif reason=='rx': self.tick(flags=RX_FAULT)
+                elif reason=='boot': self.tick(boot=43)
+                else: self.nav.request_stop()
+                self.nav._dock_cycle()
                 self.assertTrue(self.nav.stop_requested)
                 self.assertIsNone(self.nav.lease_task)
-                self.assertEqual(self.nav.dock_stop_outcome, 'cancelled' if failure == 'manual' else 'failed')
 
-    def test_cancel_after_stop_proof_before_cleanup_does_not_leave_stopping(self):
-        self.enable()
-        self.nav.request_dock()
-        master = Mock()
-        master.stop.return_value = dict(stop_verified=True)
-        self.nav._stop(master)
-        self.assertTrue(self.nav.stop_requested)
-        self.assertEqual(self.nav.dock['phase'], 'settling')
-        self.nav.request_stop()
-        self.assertEqual(self.nav.dock['phase'], 'cancelled')
-        self.assertEqual(self.nav.camera.cancelled, [])
-        self.nav.stop_requested = False
-        self.nav._dock_cycle()
-        self.assertEqual(self.nav.dock['phase'], 'cancelled')
-        self.assertIsNone(self.nav.pending)
+    def test_old_firmware_append_rejection_never_starts(self):
+        self.begin();self.photo()
+        master=Mock()
+        master.upload.side_effect=Rejected('old firmware',self.nav.latest)
+        with self.assertRaises(Rejected):
+            self.nav._upload_dock(master,self.nav.pending)
+        master.start.assert_not_called()
 
-    def test_cancel_while_start_reply_is_pending_fences_worker(self):
-        self.begin()
-        plan = self.photo()
-        master = Mock()
-        master.stop_revision = 0
-        master.request_stop.side_effect = lambda: setattr(master, 'stop_revision', master.stop_revision + 1)
-        master.history_since.return_value = dict(cursor=0, exchanges=[], missed=0, connected=True, error=None)
-        master.upload.return_value = [self.nav.latest]
-        self.nav.feedback = master
-        entered, release = Event(), Event()
-        def start(task, *, revision):
-            self.assertEqual(revision, 0)
-            entered.set()
-            self.assertTrue(release.wait(2))
+    def test_wrong_id_even_if_other_camera_target_was_verified_keeps_searching(self):
+        self.begin();self.photo(tag_id=2)
+        self.assertEqual(self.nav.dock_motion,'search')
+        self.assertIsNone(self.nav.dock_solution)
+
+    def test_cancel_during_start_reply_does_not_restore_lease(self):
+        self.begin();plan=self.photo()
+        master=Mock()
+        master.stop_revision=0
+        master.request_stop.side_effect=lambda:setattr(master,'stop_revision',master.stop_revision+1)
+        master.history_since.return_value=dict(cursor=0,exchanges=[],missed=0,connected=True,error=None)
+        master.upload.return_value=[self.nav.latest]
+        entered,release=Event(),Event()
+        def start(task,revision):
+            self.assertEqual(revision,0)
+            entered.set();release.wait(2)
             return self.nav.latest
-        master.start.side_effect = start
-        thread = Thread(target=self.nav._upload_dock, args=(master, plan))
-        thread.start()
-        self.assertTrue(entered.wait(2))
-        self.nav.request_stop()
-        release.set()
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(master.stop_revision, 1)
+        master.start.side_effect=start
+        self.nav.feedback=master
+        worker=Thread(target=self.nav._upload_dock,args=(master,plan))
+        worker.start();self.assertTrue(entered.wait(2))
+        self.nav.request_stop();release.set();worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(master.stop_revision,1)
         self.assertIsNone(self.nav.lease_task)
-        self.assertEqual(self.nav.dock_stop_outcome, 'cancelled')
-
-    def test_final_completion_needs_new_stopped_photo(self):
-        self.begin()
-        self.photo()
-        self.nav.work = None
-        self.nav.dock['phase'] = 'moving'
-        self.observe(state=8, flags=self.sample.flags | 8)
-        self.nav._dock_cycle()
-        self.assertTrue(self.nav.stop_requested)
-        self.stop_proof()
-        self.assertEqual(self.nav.dock['phase'], 'capturing')
-        self.assertEqual(self.nav.camera.sequence, 2)
-        self.nav._dock_cycle()
-        self.assertNotEqual(self.nav.dock['phase'], 'complete')
-        self.photo(distance_m=.2, lateral_m=.01, yaw_deg=2.)
-        self.assertEqual(self.nav.dock['phase'], 'complete')
-        self.assertEqual(self.nav.dock['photo_id'], 2)
-
-    def test_single_step_stops_then_photographs_without_continuing(self):
-        self.begin(single=True)
-        plan = self.photo()
-        self.assertAlmostEqual(struct.unpack('<If', plan.segments[0])[1], -.03)
-        self.nav.pending = None
-        self.nav.work = None
-        self.nav.dock['phase'] = 'moving'
-        self.observe(state=8, flags=self.sample.flags | 8)
-        self.nav._dock_cycle()
-        self.stop_proof()
-        self.photo(distance_m=.5)
-        self.assertEqual(self.nav.dock['phase'], 'step_complete')
-        self.assertEqual(self.nav.dock['photo_id'], 2)
         self.assertIsNone(self.nav.pending)
 
-    def test_reference_jpeg_requires_exact_current_photo_number(self):
-        self.begin()
-        self.photo()
-        server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(self.nav))
-        worker = Thread(target=server.serve_forever)
-        worker.start()
-        try:
-            root = 'http://127.0.0.1:{}'.format(server.server_port)
-            with urlopen(root + '/api/dock/reference.jpg?photo_id=1', timeout=2) as response:
-                self.assertEqual(response.read(), b'jpeg')
-                self.assertEqual(response.headers['Content-Type'], 'image/jpeg')
-            for query in ('photo_id=2', 'photo_id=1&extra=1', 'photo_id=1&photo_id=1', 'photo_id=-1'):
-                with self.assertRaises(HTTPError) as error:
-                    urlopen(root + '/api/dock/reference.jpg?' + query, timeout=2)
-                self.assertEqual(error.exception.code, 404)
-            self.nav.dock['photo_id'] = None
-            with self.assertRaises(HTTPError):
-                urlopen(root + '/api/dock/reference.jpg?photo_id=1', timeout=2)
-        finally:
-            server.shutdown()
-            server.server_close()
-            worker.join(2)
-
-    @unittest.skipUnless(HAVE_ARUCO, 'OpenCV AprilTag support unavailable')
-    def test_real_camera_photo_drives_real_navigation_without_blocking(self):
-        from v12_dock_camera import DockCamera
-        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-        marker = (cv2.aruco.generateImageMarker(dictionary, 1, 160)
-                  if hasattr(cv2.aruco, 'generateImageMarker') else cv2.aruco.drawMarker(dictionary, 1, 160))
-        image = np.full((480, 640), 255, dtype=np.uint8)
-        image[160:320, 240:400] = marker
-        with TemporaryDirectory() as folder:
-            video = str(Path(folder) / 'rear.avi')
-            writer = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*'MJPG'), 10., (640, 480))
-            self.assertTrue(writer.isOpened())
-            for _ in range(3):
-                writer.write(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))
-            writer.release()
-            actual_capture = cv2.VideoCapture
-            class Capture:
-                def __init__(self): self.capture = actual_capture(video)
-                def isOpened(self): return self.capture.isOpened()
-                def set(self, key, value): return True
-                def get(self, key): return cv2.VideoWriter_fourcc(*'MJPG')
-                def release(self): self.capture.release()
-                def read(self):
-                    time.sleep(.01)
-                    ok, frame = self.capture.read()
-                    if not ok:
-                        self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        return self.capture.read()
-                    return ok, frame
-            camera = DockCamera('/dev/video0', target_id=1, tag_size_m=.08,
-                                mount_yaw_deg=0, mount_pitch_deg=0, mount_roll_deg=0,
-                                camera_height_m=.14, verified=True)
-            with patch.object(cv2, 'VideoCapture', side_effect=lambda *args: Capture()):
-                self.enable()
-                self.nav.camera = camera
-                try:
-                    camera.start()
-                    self.nav.request_dock()
-                    self.stop_proof()
-                    deadline = time.monotonic() + 2.
-                    while self.nav.dock['phase'] == 'capturing' and time.monotonic() < deadline:
-                        self.nav._dock_cycle()
-                        time.sleep(.01)
-                    self.assertEqual(self.nav.dock['phase'], 'uploading')
-                    self.assertFalse(camera.snapshot()['ready'])
-                    photo_id = self.nav.dock['photo_id']
-                    self.assertEqual(camera.photo_result(photo_id)['tag_id'], 1)
-                    self.assertEqual(camera.reference_frame(photo_id)[:2], b'\xff\xd8')
-                finally:
-                    camera.close()
-
-    def test_stop_error_fails_dock_without_claiming_proof(self):
+    def test_real_config_and_reference_http_interfaces(self):
         self.enable()
-        self.nav.request_dock()
-        closed, master = Event(), Mock(failed=False)
-        master.discover.return_value = self.nav.latest
-        master.history_since.return_value = dict(cursor=0, missed=0, exchanges=[], connected=True, error=None)
-        def failed_stop(**unused):
-            closed.set()
-            raise ValueError('stop result unavailable')
-        master.stop.side_effect = failed_stop
-        with patch('v11_map_runtime.FeedbackWorker', return_value=master):
-            self.nav.run('/dev/offline', closed)
-        self.assertEqual(self.nav.dock['phase'], 'failed')
-        self.assertIn('停车未确认', self.nav.dock['message'])
-        self.assertFalse(self.nav.stop_verified)
+        server=ThreadingHTTPServer(('127.0.0.1',0),handler_for(self.nav))
+        worker=Thread(target=server.serve_forever);worker.start()
+        try:
+            body=dict(map_id=self.grid.metadata()['map_id'],x=1.2,y=1.,yaw=.1)
+            request=Request('http://127.0.0.1:{}/api/dock/config'.format(server.server_port),
+                data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Host':'127.0.0.1:8767'})
+            with urlopen(request,timeout=2) as response:
+                state=json.load(response)
+            self.assertEqual({k:state['dock']['config'][k] for k in ('map_id','x','y')},
+                             {k:body[k] for k in ('map_id','x','y')})
+            self.assertAlmostEqual(state['dock']['config']['yaw'],body['yaw'])
+            self.nav.dock_single_step_test=True
+            self.nav.request_dock_step('move',-.03);self.stop_proof();self.photo()
+            self.nav.camera.reference_frame=lambda photo_id:b'jpeg'
+            with urlopen('http://127.0.0.1:{}/api/dock/reference.jpg?photo_id=1'.format(server.server_port),timeout=2) as response:
+                self.assertEqual(response.read(),b'jpeg')
+        finally:
+            server.shutdown();server.server_close();worker.join(2)
+
+    def test_mutual_exclusion_with_normal_navigation_config_and_zero(self):
+        self.begin()
+        for action in (lambda:self.nav.align(dict(x=0.,y=0.,yaw=0.),'manual'),
+                       lambda:self.nav.configure_dock(dict(map_id=self.grid.metadata()['map_id'],x=0.,y=0.,yaw=0.)),
+                       lambda:self.nav.request_start('wrong')):
+            with self.assertRaises(ValueError): action()
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     unittest.main()

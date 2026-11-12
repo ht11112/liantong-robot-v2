@@ -123,7 +123,11 @@
         <div class="body"><strong>后视预览（可能延迟）</strong><img id="dock-image" class="dock-image" alt="后视相机预览，未镜像" width="640" height="480">
           <p id="dock-camera-status" class="dock-status" role="status">等待相机</p>
           <p id="dock-observation" class="mono">标签及位姿：等待观测</p>
-          <p id="dock-phase" class="message">视觉对准待命</p>
+          <p id="dock-phase" class="message">回桩待命</p>
+          <p id="dock-plan" class="mono">尚无倒车计划</p>
+          <div class="fields"><label>桩 X（m）<input id="dock-x" type="number" step=".01" value="-0.5"></label><label>桩 Y（m）<input id="dock-y" type="number" step=".01" value="0"></label><label>桩朝空地方向（°）<input id="dock-yaw" type="number" step="1" value="0"></label></div>
+          <button id="dock-save" type="button" disabled>保存当前地图桩位</button>
+          <p>地图标记：棕色为桩，绿色为等待点，橙色为轮轴终点。先驶到桩前0.70米；停稳搜索ID1后只规划一次转向和连续倒车。轮轴距桩平面0.25米，不追加末端转向或拍照。</p>
           <div id="dock-reference" hidden>
             <strong id="dock-reference-label">本步参考照片</strong>
             <img id="dock-reference-image" class="dock-image" alt="本步停稳拍摄的参考照片，非实时画面" width="640" height="480" hidden>
@@ -131,7 +135,7 @@
           </div>
           <p id="dock-task" class="message">视觉对准待命</p>
           <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。预览和最新观测可能有延迟；每步使用停稳后的参考照片，执行后再次停稳拍照。</small>
-          <div class="actions"><button id="dock-start" type="button" class="primary" disabled>开始视觉对准</button></div>
+          <div class="actions"><button id="dock-start" type="button" class="primary" disabled>开始回桩</button></div>
         </div>
       </section>
     </div>
@@ -152,6 +156,7 @@
     let costmapImage = null, costmapKey = '', costmapError = false;
     let selectionMode = 'goal', drag = null, prepared = null, action = null, stopping = false;
     let ekfTurnError = '';
+    let dockConfigKey = '';
     const finite = Number.isFinite;
     const angle = n => Math.atan2(Math.sin(n),Math.cos(n));
     const poseText = pose => `(${pose.x.toFixed(3)}, ${pose.y.toFixed(3)}) m · ${(pose.yaw*180/Math.PI).toFixed(1)}°`;
@@ -236,6 +241,11 @@
       const route=state.preview||state.route;
       if(route) line(route.path,'#3767ea',[6,4]);
       marker(seed(),'#7c45ac',true);marker(goal(),'#d58626',false);marker(state.source_fresh===false?null:state.pose,'#245bd4',true);
+      if(state.dock?.sites){
+        marker(state.dock.sites.station,'#955d36',true);
+        marker(state.dock.sites.waiting,'#16866d',false);
+        marker(state.dock.plan?.target_map||state.dock.sites.axle_target,'#d58626',false);
+      }
       ctx.restore();
     }
     // 图像异步加载后仍核对地图身份，避免旧图覆盖当前图。
@@ -299,11 +309,19 @@
       $('dock-camera-status').textContent=online?(camera?.reason||'后视相机未接入'):'RK 连接断开，画面已过期';
       const metric=(v,unit)=>finite(v)?`${v.toFixed(3)} ${unit}`:'—';
       $('dock-observation').textContent=fresh?`ID ${camera.tag_id??'—'} · 距离 ${metric(camera.distance_m,'m')} · 轮轴左偏 ${metric(camera.lateral_m,'m')} · 朝向 ${metric(camera.yaw_deg,'°')}`:'标签及位姿：画面过期或不可用';
-      const dockPhases={settling:'等待轮位稳定',capturing:'停车拍摄中',observing:'等待停稳拍摄',uploading:'本步参考照片已就绪，正在上传',starting:'本步参考照片已就绪，正在启动',moving:'执行本步中',stopping:'等待实测停稳',complete:'已用停稳后照片确认对准',step_complete:'单步完成，已确认停稳',failed:'对准已结束',cancelled:'对准已取消'};
+      const dockPhases={approaching:'驶向等待点',capturing:'停稳拍照中',searching:'搜索ID1',turning:'一次初始转向',backing:'连续倒车中',uploading:'上传动作',starting:'启动动作',moving:'单步验收中',stopping:'等待实测停稳',complete:'倒车计划执行完成，已停稳',step_complete:'单步完成，已确认停稳',failed:'回桩已结束',cancelled:'回桩已取消'};
       $('dock-phase').textContent=online?(dockPhases[dock.phase]||'视觉对准待命'):'RK 连接断开';
       updateReference(online ? dock.photo_id : null);
       $('dock-task').textContent=dock.message||'视觉对准待命';
+      $('dock-plan').textContent=dock.plan?`初转 ${(dock.plan.turn_rad*180/Math.PI).toFixed(1)}° · 连续倒车 ${dock.plan.reverse_m.toFixed(3)} m · RK预算 ${dock.plan.budget_s} s`:
+        `搜索累计实测角：${finite(dock.search_angle_deg)?dock.search_angle_deg.toFixed(1):'—'}°`;
       $('dock-start').disabled=!online||!state.csrf_token||state.can_dock!==true||Boolean(action)||stopping;
+      const config=dock.config, key=JSON.stringify(config);
+      if(config && dockConfigKey!==key){
+        $('dock-x').value=config.x;$('dock-y').value=config.y;$('dock-yaw').value=config.yaw*180/Math.PI;
+        dockConfigKey=key;
+      }
+      $('dock-save').disabled=!online||!state.csrf_token||!state.can_prepare||Boolean(action)||stopping;
       $('map-radar-legend').hidden=!avoidance;
       $('costmap-radar-legend').hidden=!avoidance;
       const avoidanceStatus=$('avoidance-status');
@@ -496,6 +514,7 @@
     $('preview').onclick=()=>submit('preview',goal());$('start').onclick=()=>submit('start',{plan_id:prepared});
     $('stop').onclick=()=>submit('stop',{});
     $('dock-start').onclick=()=>submit('dock/start',{},'dock-start');
+    $('dock-save').onclick=()=>submit('dock/config',{map_id:state.map.map_id,x:$('dock-x').valueAsNumber,y:$('dock-y').valueAsNumber,yaw:angle($('dock-yaw').valueAsNumber*Math.PI/180)},'dock-save');
     $('ekf-turn-left').onclick=()=>submit('ekf-turn',{direction:1},'ekf-turn-left');
     $('ekf-turn-right').onclick=()=>submit('ekf-turn',{direction:-1},'ekf-turn-right');
     window.addEventListener('resize',draw);

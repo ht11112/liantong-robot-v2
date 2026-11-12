@@ -140,7 +140,7 @@ uint32_t mq_segments_crc(const MQSegment *segments,uint16_t count) {
 static bool segment_valid(MQSegment s) {
   return isfinite(s.value) && (s.kind==MQ_KIND_MOVE ? s.value>0.f && s.value<=1000.f :
     s.kind==MQ_KIND_TURN ? absf(s.value)>0.f && absf(s.value)<=2.f*MQ_PI :
-    s.kind==MQ_KIND_DOCK_MOVE ? s.value<-.005f && s.value>=-.05f :
+    s.kind==MQ_KIND_DOCK_MOVE ? s.value<-.005f && s.value>=-1.f :
     s.kind==MQ_KIND_DOCK_TURN && absf(s.value)>MQ_PI/180.f && absf(s.value)<=MQ_PI/36.f);
 }
 /* BEGIN 建立待上传队列，不启动电机；任务号在本次启动内单调递增。 */

@@ -12,7 +12,9 @@ from verify_source import ROOT
 
 sys.path.insert(0, str(ROOT / 'app'))
 sys.path.insert(0, str(ROOT / 'mcu' / 'tools'))
+sys.path.insert(0, str(ROOT / 'mcu' / 'tools'))
 from v11_map_plan import load_map
+from mcu_v11 import VERSION
 
 
 SOURCES = (
@@ -37,6 +39,7 @@ def assemble(args):
     if sha256(files[yaml]) != metadata['yaml_sha256']:
         raise ValueError('Map YAML changed during packaging')
     manifest = dict(schema='v12-map-rk-package-1', entry_point='app/v11_map_runtime.py',
+                    wire_version=VERSION,
                     map=metadata, map_pgm=pgm, map_yaml=yaml, default_mode='ready',
                     dock_firmware_candidate_sha256=(sha256(args.dock_firmware_bin.read_bytes())
                                                     if getattr(args, 'dock_firmware_bin', None) else None),

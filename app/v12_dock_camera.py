@@ -7,6 +7,8 @@ import time
 
 MAX_AGE_S = 0.5
 PHOTO_TIMEOUT_S = 3.0
+PHOTO_EXPOSURE_WAIT_S = .5
+CAMERA_REAR_OFFSET_M = .175
 
 
 class DockCamera:
@@ -144,6 +146,7 @@ class DockCamera:
                     ok, _ = cap.read()
                     if not ok:
                         raise RuntimeError('后视相机预热读取失败')
+                    exposure_started = time.monotonic()
                     with self.lock:
                         photo = self.photo
                         if photo is None or photo['id'] != photo_id or photo['status'] != 'pending':
@@ -183,9 +186,9 @@ class DockCamera:
                         if time.monotonic() >= photo['deadline']:
                             photo['status'] = 'failed'
                             photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
-                        elif ids is not None or not has_tags or not mode_ok:
+                        elif ids is not None or not has_tags or not mode_ok or read_start - exposure_started >= PHOTO_EXPOSURE_WAIT_S:
                             photo['status'] = 'complete'
-                            photo['result'] = dict(result, photo_id=photo_id)
+                            photo['result'] = dict(result, photo_id=photo_id, image_valid=has_tags and mode_ok)
                             photo['jpeg'] = jpeg
         except Exception as exc:
             with self.lock:
@@ -237,7 +240,9 @@ class DockCamera:
             result['reason'] = '标签水平法线无法确定'
             return result
         nx, ny = outward[0] / horizontal, outward[1] / horizontal
-        tag_position = camera_to_body @ tvec + np.array([-.20, 0., 0.])
+        tag_position = camera_to_body @ tvec + np.array([-CAMERA_REAR_OFFSET_M, 0., self.camera_height_m])
+        result.update(plane_x_m=float(tag_position[0]), plane_y_m=float(tag_position[1]),
+                      normal_x=float(nx), normal_y=float(ny))
         result['distance_m'] = float(rotation[:, 2] @ tvec)
         result['lateral_m'] = float(-(-ny * tag_position[0] + nx * tag_position[1]))
         result['yaw_deg'] = math.degrees(-math.atan2(ny, nx))

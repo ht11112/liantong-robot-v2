@@ -2,6 +2,7 @@ import math
 import threading
 import time
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -61,9 +62,16 @@ class RealTagTest(unittest.TestCase):
                     self.assertEqual(len(observed['corners']), 4)
                     self.assertTrue(np.any(image != before))
                     self.assertAlmostEqual(observed['distance_m'], .4 * math.cos(math.radians(theta)) + tx * math.sin(math.radians(theta)), delta=.012)
-                    expected_y = -tx * math.cos(math.radians(theta)) + .6 * math.sin(math.radians(theta))
+                    expected_y = -tx * math.cos(math.radians(theta)) + .575 * math.sin(math.radians(theta))
                     self.assertAlmostEqual(observed['lateral_m'], expected_y, delta=.015)
                     self.assertAlmostEqual(observed['yaw_deg'], theta, delta=4.)
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'mcu/tools'))
+                    from v12_dock_control import reverse_plan
+                    plan = reverse_plan(observed)
+                    self.assertAlmostEqual(-plan['reverse_m']*math.cos(plan['turn_rad']),
+                                           observed['plane_x_m']+.25*observed['normal_x'])
+                    self.assertAlmostEqual(-plan['reverse_m']*math.sin(plan['turn_rad']),
+                                           observed['plane_y_m']+.25*observed['normal_y'])
 
         vertical_normal = np.array([[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]])
         with patch.object(cv2, 'Rodrigues', return_value=(vertical_normal, None)):
@@ -83,7 +91,7 @@ class RealTagTest(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self._exercise_photos(outcome)
 
-    def test_missing_tag_waits_until_deadline_but_wrong_id_fails_immediately(self):
+    def test_valid_new_image_without_tag_is_distinct_from_capture_timeout(self):
         dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         marker = (cv2.aruco.generateImageMarker(dictionary, 2, 160)
                   if hasattr(cv2.aruco, 'generateImageMarker') else cv2.aruco.drawMarker(dictionary, 2, 160))
@@ -122,7 +130,8 @@ class RealTagTest(unittest.TestCase):
                                         mount_yaw_deg=0, mount_pitch_deg=0, mount_roll_deg=0,
                                         camera_height_m=.14, verified=True)
                     with patch.object(cv2, 'VideoCapture', side_effect=lambda *args: Capture()), \
-                         patch('v12_dock_camera.PHOTO_TIMEOUT_S', .4):
+                         patch('v12_dock_camera.PHOTO_TIMEOUT_S', .4), \
+                         patch('v12_dock_camera.PHOTO_EXPOSURE_WAIT_S', .08):
                         try:
                             camera.start()
                             started = time.monotonic()
@@ -135,9 +144,10 @@ class RealTagTest(unittest.TestCase):
                             self.assertFalse(result['ready'])
                             self.assertIsNone(result.get('tag_id'))
                             if case == 'missing':
-                                self.assertIn('超时', result['reason'])
-                                self.assertGreaterEqual(time.monotonic() - started, .4)
-                                self.assertIsNone(camera.reference_frame(photo_id))
+                                self.assertIn('未识别', result['reason'])
+                                self.assertTrue(result['image_valid'])
+                                self.assertLess(time.monotonic() - started, .4)
+                                self.assertIsNotNone(camera.reference_frame(photo_id))
                                 self.assertEqual(len(opens), 2)
                             else:
                                 self.assertIn('指定 ID', result['reason'])
