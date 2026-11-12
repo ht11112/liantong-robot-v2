@@ -136,8 +136,8 @@
           <p id="dock-task" class="message">视觉对准待命</p>
           <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。预览可能延迟；搜索时停稳拍照，识别后一次规划、连续倒车，末端仅确认停稳，不再复拍或微调。</small>
           <div class="actions"><button id="dock-start" type="button" class="primary" disabled>开始回桩</button></div>
-          <div class="actions"><button id="dock-reverse" type="button" disabled>拍摄 ID1 后倒车 3 厘米</button></div>
-          <small>调试单步：停稳拍摄一次，识别到 ID1 后只直退一次，途中不再要求标签可见，停稳后结束；距离由 MCU 轮式里程计控制，IMU/EKF用于融合显示，不做行驶中纠偏。</small>
+          <div class="actions"><button id="dock-reverse" type="button" disabled>拍摄 ID1 后倒退至镜头 10 厘米</button></div>
+          <small>调试倒车：按停稳时的一张ID1照片估算直退距离，不转向、不走地图等待点；途中不再要求标签可见，停稳后结束。距离由 MCU 轮式里程计控制，IMU/EKF用于融合显示，不做行驶中纠偏，实际10厘米仍需尺量。若拍到的距离已不足10厘米，不再倒车，也不自动前进。</small>
         </div>
       </section>
     </div>
@@ -521,7 +521,7 @@
     $('preview').onclick=()=>submit('preview',goal());$('start').onclick=()=>submit('start',{plan_id:prepared});
     $('stop').onclick=()=>submit('stop',{});
     $('dock-start').onclick=()=>submit('dock/start',{},'dock-start');
-    $('dock-reverse').onclick=()=>submit('dock/step',{kind:'move',value:-.03},'dock-reverse');
+    $('dock-reverse').onclick=()=>submit('dock/reverse',{},'dock-reverse');
     $('dock-save').onclick=()=>submit('dock/config',{map_id:state.map.map_id,x:$('dock-x').valueAsNumber,y:$('dock-y').valueAsNumber,yaw:angle($('dock-yaw').valueAsNumber*Math.PI/180)},'dock-save');
     $('ekf-turn-left').onclick=()=>submit('ekf-turn',{direction:1},'ekf-turn-left');
     $('ekf-turn-right').onclick=()=>submit('ekf-turn',{direction:-1},'ekf-turn-right');

@@ -47,6 +47,19 @@ def reverse_plan(observation):
                 reverse_m=distance, budget_s=max(30, math.ceil(1.25 * distance / REVERSE_SPEED_M_S + 5)))
 
 
+def camera_reverse_plan(observation, target_gap_m=.10):
+    distance, closing = observation['distance_m'], observation['camera_closing_per_m']
+    if not math.isfinite(distance) or not math.isfinite(closing) or closing <= 0:
+        raise ValueError('标签平面方向或相机距离无效')
+    if distance <= target_gap_m + .005:
+        raise ValueError('相机已在10厘米附近或更近，不能继续倒车')
+    reverse = (distance - target_gap_m) / closing
+    if reverse > 1.:
+        raise ValueError('本次估算倒车超过1米，请先重新摆位')
+    return dict(turn_rad=0., reverse_m=reverse, camera_target_m=target_gap_m,
+                budget_s=max(30, math.ceil(1.25 * reverse / REVERSE_SPEED_M_S + 5)))
+
+
 def dock_sites(config):
     c, s = math.cos(config['yaw']), math.sin(config['yaw'])
     return dict(station=dict(x=config['x'], y=config['y'], yaw=config['yaw']),

@@ -20,7 +20,7 @@ from v12_feedback_worker import FeedbackWorker
 from v11_ekf_worker import EkfWorker
 from v11_map_plan import CollisionError, PlanningError, TURN_TOLERANCE_RAD, load_map
 from v11_obstacles import DynamicObstacles
-from v12_dock_control import DockSettings, dock_sites, dock_segment, reverse_plan
+from v12_dock_control import DockSettings, dock_sites, dock_segment, reverse_plan, camera_reverse_plan
 
 
 PHASES = ('idle', 'loading', 'ready', 'arming', 'move', 'turn',
@@ -82,6 +82,7 @@ class Navigation:
         self.dock_settings = DockSettings(grid.metadata()['map_id'], dock_config_path)
         self.dock = dict(phase='idle', message='回桩待命', frame_seq=None, photo_id=None)
         self.dock_motion = None
+        self.dock_camera_gap = None
         self.dock_deadline = self.dock_solution = None
         self.dock_search_travel = self.dock_search_yaw = 0.
         self.dock_search_index = 0
@@ -448,6 +449,7 @@ class Navigation:
             raise ValueError('后视相机未启用')
 
     def _begin_dock(self, single=None):
+        self.dock_camera_gap = None
         self.dock_single_plan = single
         self.dock_plan = self.dock_capture = self.dock_solution = None
         self.dock_deadline = None
@@ -503,6 +505,18 @@ class Navigation:
                                  pose=pose_of(status), revision=self.stop_revision,
                                  deadline=self.clock() + DOCK_PHOTO_TIMEOUT_S)
         self.dock.update(phase='capturing', message='已停稳，正在拍摄新的标签照片')
+
+    def request_camera_reverse(self):
+        if not self.dock_single_step_test:
+            raise ValueError('未启用现场单步验收')
+        with self.lock:
+            self._dock_ready()
+            self._begin_dock()
+            self.dock_camera_gap = .10
+            self.plan = self.route = None
+            self.dock.update(phase='stopping', message='正在确认停稳，随后拍摄ID1并估算倒退至镜头10厘米')
+            self.dock_stop_outcome = 'continue'
+            self._queue_stop()
 
     def _queue_dock_motion(self, role, plan):
         self.dock_motion, self.dock_plan = role, plan
@@ -585,7 +599,7 @@ class Navigation:
                 if not observation['ready'] or observation.get('tag_id') != 1:
                     if not observation.get('image_valid') or observation.get('tag_id') == 1:
                         raise ValueError(observation.get('reason') or '照片无效')
-                    if self.dock_single_plan is not None:
+                    if self.dock_single_plan is not None or self.dock_camera_gap is not None:
                         raise ValueError('单步验收需要有效ID1')
                     if self.dock_search_index >= 12:
                         raise ValueError('一圈搜索未发现ID1，已停止；角度以实测累计值为准')
@@ -596,6 +610,12 @@ class Navigation:
                 self.dock.update(photo_id=self.dock_capture['id'], frame_seq=observation['frame_seq'])
                 if self.dock_single_plan is not None:
                     self._queue_dock_motion('step', self.dock_single_plan)
+                    return
+                if self.dock_camera_gap is not None:
+                    self.dock_solution = camera_reverse_plan(observation, self.dock_camera_gap)
+                    self.dock['plan'] = dict(self.dock_solution)
+                    self.dock['reverse_budget_s'] = self.dock_solution['budget_s']
+                    self._queue_dock_motion('reverse', dock_segment('move', -self.dock_solution['reverse_m']))
                     return
                 self.dock_solution = reverse_plan(observation)
                 self.dock['plan'] = dict(self.dock_solution)
@@ -1378,6 +1398,9 @@ def handler_for(nav):
                             or type(body['value']) not in (int, float) or not math.isfinite(body['value'])):
                         raise ValueError('单步验收参数不正确')
                     nav.request_dock_step(body['kind'], body['value'])
+                elif self.path == '/api/dock/reverse':
+                    checked_body(body, ())
+                    nav.request_camera_reverse()
                 elif self.path == '/api/stop':
                     checked_body(body, ())
                     nav.request_stop()

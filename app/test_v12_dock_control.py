@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import test_v11_map_runtime as base
 from mcu_v11 import EXECUTING, ODOM_INITIALIZED, ODOM_VALID, RX_FAULT, STOP_CONFIRMED, Rejected
 from v11_map_runtime import Navigation, handler_for
-from v12_dock_control import DockSettings, dock_segment, dock_sites, reverse_plan
+from v12_dock_control import DockSettings, dock_segment, dock_sites, reverse_plan, camera_reverse_plan
 
 
 class Camera:
@@ -39,12 +39,24 @@ class Camera:
     def finish(self, photo_id=None, **changes):
         photo_id = self.sequence if photo_id is None else photo_id
         result = dict(photo_id=photo_id, frame_seq=photo_id, ready=True, image_valid=True,
-                      reason=None, tag_id=1, plane_x_m=-.70, plane_y_m=0., normal_x=1., normal_y=0.)
+                      reason=None, tag_id=1, plane_x_m=-.70, plane_y_m=0., normal_x=1., normal_y=0.,
+                      distance_m=.50, camera_closing_per_m=1.)
         result.update(changes)
         self.results[photo_id] = result
 
 
 class GeometryTest(unittest.TestCase):
+    def test_camera_gap_plan_accounts_for_plane_angle_without_axle_offset(self):
+        for closing in (1., .8):
+            observed = dict(distance_m=.50, camera_closing_per_m=closing)
+            plan = camera_reverse_plan(observed)
+            self.assertAlmostEqual(.50-plan['reverse_m']*closing, .10)
+            self.assertEqual(plan['turn_rad'], 0.)
+            self.assertEqual(plan['camera_target_m'], .10)
+        for distance, closing in ((.09, 1.), (.105, 1.), (1.11, 1.), (.5, 0.), (.5, -1.)):
+            with self.assertRaises(ValueError):
+                camera_reverse_plan(dict(distance_m=distance, camera_closing_per_m=closing))
+
     def test_once_plan_reaches_axle_target_after_turn_and_reverse(self):
         for px, py, yaw in ((-.7, 0., 0.), (-.7, .15, .1), (-.7, -.15, -.1)):
             plan = reverse_plan(dict(plane_x_m=px, plane_y_m=py,
@@ -157,6 +169,35 @@ class DockTest(unittest.TestCase):
         self.nav.work = None
         self.complete_motion()
         self.assertEqual(self.nav.camera.sequence,1)
+
+    def test_camera_ten_cm_button_photos_once_and_reverses_without_turn(self):
+        self.enable()
+        self.nav.dock_single_step_test = True
+        self.nav.request_camera_reverse()
+        self.stop_proof()
+        plan = self.photo(plane_y_m=.15)
+        kind, distance = struct.unpack('<If', plan.segments[0])
+        self.assertEqual(kind, 3)
+        self.assertAlmostEqual(distance, -.4, places=6)
+        self.assertEqual(self.nav.dock_motion, 'reverse')
+        self.start_motion()
+        self.nav.camera.results.clear()
+        self.complete_motion()
+        self.assertEqual(self.nav.dock['phase'], 'complete')
+        self.assertEqual(self.nav.camera.sequence, 1)
+        self.assertIsNone(self.nav.pending)
+
+    def test_camera_ten_cm_near_target_or_missing_id_never_uploads_or_searches(self):
+        for changes in (dict(distance_m=.09), dict(tag_id=2),
+                        dict(ready=False, tag_id=None, reason='未识别到ID1')):
+            with self.subTest(changes=changes):
+                self.setUp(); self.enable()
+                self.nav.dock_single_step_test = True
+                self.nav.request_camera_reverse(); self.stop_proof()
+                self.photo(**changes)
+                self.assertIsNone(self.nav.pending)
+                self.assertTrue(self.nav.stop_requested)
+                self.assertIsNone(self.nav.dock_solution)
 
     def test_first_target_plans_one_reverse_and_no_final_photo(self):
         self.begin()

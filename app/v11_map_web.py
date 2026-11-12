@@ -19,7 +19,7 @@ from v11_map_plan import load_map
 HERE = Path(__file__).resolve().parent
 HOST, PC_PORT, RK_PORT = '127.0.0.1', 8766, 8767
 ACTION_PATHS = frozenset(('/api/localize', '/api/zero', '/api/preview', '/api/start', '/api/stop',
-                          '/api/ekf-turn', '/api/dock/start', '/api/dock/step', '/api/dock/config'))
+                          '/api/ekf-turn', '/api/dock/start', '/api/dock/step', '/api/dock/reverse', '/api/dock/config'))
 
 
 # PC 通过已校验主机密钥的 SSH 通道访问 RK 本机 API。

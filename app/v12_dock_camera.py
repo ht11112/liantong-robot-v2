@@ -246,7 +246,7 @@ class DockCamera:
         nx, ny = outward[0] / horizontal, outward[1] / horizontal
         tag_position = camera_to_body @ tvec + np.array([-CAMERA_REAR_OFFSET_M, 0., self.camera_height_m])
         result.update(plane_x_m=float(tag_position[0]), plane_y_m=float(tag_position[1]),
-                      normal_x=float(nx), normal_y=float(ny))
+                      normal_x=float(nx), normal_y=float(ny), camera_closing_per_m=float(outward[0]))
         result['distance_m'] = float(rotation[:, 2] @ tvec)
         result['lateral_m'] = float(-(-ny * tag_position[0] + nx * tag_position[1]))
         result['yaw_deg'] = math.degrees(-math.atan2(ny, nx))

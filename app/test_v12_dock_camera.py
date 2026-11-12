@@ -66,7 +66,10 @@ class RealTagTest(unittest.TestCase):
                     self.assertAlmostEqual(observed['lateral_m'], expected_y, delta=.015)
                     self.assertAlmostEqual(observed['yaw_deg'], theta, delta=4.)
                     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'mcu/tools'))
-                    from v12_dock_control import reverse_plan
+                    from v12_dock_control import reverse_plan, camera_reverse_plan
+                    straight = camera_reverse_plan(observed)
+                    self.assertAlmostEqual(observed['distance_m']
+                        - straight['reverse_m']*observed['camera_closing_per_m'], .10)
                     plan = reverse_plan(observed)
                     self.assertAlmostEqual(-plan['reverse_m']*math.cos(plan['turn_rad']),
                                            observed['plane_x_m']+.25*observed['normal_x'])
