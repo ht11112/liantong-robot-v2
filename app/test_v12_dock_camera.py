@@ -75,12 +75,77 @@ class RealTagTest(unittest.TestCase):
     def test_stationary_photo_reopens_camera_and_is_immutable(self):
         self._exercise_photos('success')
 
+    def test_unverified_stationary_photo_reports_target_without_enabling_motion(self):
+        self._exercise_photos('success', verified=False)
+
     def test_cancel_and_timeout_discard_late_camera_results(self):
-        for outcome in ('cancel', 'timeout'):
+        for outcome in ('cancel', 'timeout', 'cancel_retry', 'timeout_retry'):
             with self.subTest(outcome=outcome):
                 self._exercise_photos(outcome)
 
-    def _exercise_photos(self, outcome):
+    def test_missing_tag_waits_until_deadline_but_wrong_id_fails_immediately(self):
+        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+        marker = (cv2.aruco.generateImageMarker(dictionary, 2, 160)
+                  if hasattr(cv2.aruco, 'generateImageMarker') else cv2.aruco.drawMarker(dictionary, 2, 160))
+        with TemporaryDirectory() as folder:
+            for case in ('missing', 'wrong_id'):
+                with self.subTest(case=case):
+                    image = np.full((480, 640), 255, dtype=np.uint8)
+                    if case == 'wrong_id':
+                        image[160:320, 240:400] = marker
+                    video = str(Path(folder) / (case + '.avi'))
+                    writer = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*'MJPG'), 10., (640, 480))
+                    self.assertTrue(writer.isOpened())
+                    for _ in range(4):
+                        writer.write(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))
+                    writer.release()
+                    real_capture = cv2.VideoCapture
+                    opens = []
+
+                    class Capture:
+                        def __init__(self):
+                            opens.append(1)
+                            self.capture = real_capture(video)
+                        def isOpened(self): return self.capture.isOpened()
+                        def set(self, key, value): return True
+                        def get(self, key): return cv2.VideoWriter_fourcc(*'MJPG')
+                        def release(self): self.capture.release()
+                        def read(self):
+                            time.sleep(.01)
+                            ok, frame = self.capture.read()
+                            if not ok:
+                                self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                ok, frame = self.capture.read()
+                            return ok, frame
+
+                    camera = DockCamera('/dev/video0', target_id=1, tag_size_m=.08,
+                                        mount_yaw_deg=0, mount_pitch_deg=0, mount_roll_deg=0,
+                                        camera_height_m=.14, verified=True)
+                    with patch.object(cv2, 'VideoCapture', side_effect=lambda *args: Capture()), \
+                         patch('v12_dock_camera.PHOTO_TIMEOUT_S', .4):
+                        try:
+                            camera.start()
+                            started = time.monotonic()
+                            photo_id = camera.request_photo()
+                            result = None
+                            while time.monotonic() - started < 2 and result is None:
+                                result = camera.photo_result(photo_id)
+                                time.sleep(.005)
+                            self.assertIsNotNone(result)
+                            self.assertFalse(result['ready'])
+                            self.assertIsNone(result.get('tag_id'))
+                            if case == 'missing':
+                                self.assertIn('超时', result['reason'])
+                                self.assertGreaterEqual(time.monotonic() - started, .4)
+                                self.assertIsNone(camera.reference_frame(photo_id))
+                                self.assertEqual(len(opens), 2)
+                            else:
+                                self.assertIn('指定 ID', result['reason'])
+                                self.assertLess(time.monotonic() - started, .4)
+                        finally:
+                            camera.close()
+
+    def _exercise_photos(self, outcome, verified=True):
         dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         marker = (cv2.aruco.generateImageMarker(dictionary, 1, 160)
                   if hasattr(cv2.aruco, 'generateImageMarker') else cv2.aruco.drawMarker(dictionary, 1, 160))
@@ -102,6 +167,7 @@ class RealTagTest(unittest.TestCase):
                     self.index = index
                     self.capture = real_capture(video)
                     self.first = True
+                    self.read_count = 0
                     events.append(('open', index))
                 def isOpened(self): return self.capture.isOpened()
                 def set(self, key, value): return True
@@ -110,22 +176,29 @@ class RealTagTest(unittest.TestCase):
                     events.append(('release', self.index))
                     self.capture.release()
                 def read(self):
+                    self.read_count += 1
                     warmup = self.index == 2 and self.first
+                    late_retry = outcome in ('cancel_retry', 'timeout_retry')
                     if warmup:
                         self.first = False
-                        read_started.set()
                         if outcome == 'success':
+                            read_started.set()
                             time.sleep(.607)
-                        else:
+                        elif not late_retry:
+                            read_started.set()
                             release_read.wait(4)
+                    elif late_retry and self.index == 2 and self.read_count == 3:
+                        read_started.set()
+                        release_read.wait(4)
                     else:
                         time.sleep(.01)
                     ok, frame = self.capture.read()
                     if not ok:
                         self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ok, frame = self.capture.read()
-                    if warmup and ok:
+                    if self.index == 2 and self.read_count <= 2 and ok:
                         frame[:] = 255
+                    events.append(('read', self.index, self.read_count))
                     return ok, frame
 
             def open_capture(*args):
@@ -142,9 +215,9 @@ class RealTagTest(unittest.TestCase):
 
             camera = DockCamera('/dev/video0', target_id=1, tag_size_m=.08,
                                 mount_yaw_deg=0, mount_pitch_deg=0, mount_roll_deg=0,
-                                camera_height_m=.14, verified=True)
+                                camera_height_m=.14, verified=verified)
             with patch.object(cv2, 'VideoCapture', side_effect=open_capture), \
-                 patch('v12_dock_camera.PHOTO_TIMEOUT_S', .2 if outcome == 'timeout' else 3.):
+                 patch('v12_dock_camera.PHOTO_TIMEOUT_S', .2 if outcome.startswith('timeout') else 3.):
                 try:
                     camera.start()
                     wait_for(camera.frame)
@@ -153,9 +226,9 @@ class RealTagTest(unittest.TestCase):
                     self.assertEqual(first, 1)
                     self.assertTrue(read_started.wait(2))
                     self.assertIsNone(camera.photo_result(first))
-                    if outcome == 'cancel':
+                    if outcome.startswith('cancel'):
                         camera.cancel_photo(first)
-                    elif outcome == 'timeout':
+                    elif outcome.startswith('timeout'):
                         time.sleep(.22)
                         self.assertIn('超时', camera.photo_result(first)['reason'])
                     if outcome != 'success':
@@ -169,8 +242,13 @@ class RealTagTest(unittest.TestCase):
                         second = first
                         result = wait_for(lambda: camera.photo_result(first))
                     self.assertEqual(result['photo_id'], second)
-                    self.assertTrue(result['ready'], result['reason'])
+                    self.assertEqual(result['ready'], verified, result['reason'])
                     self.assertEqual(result['tag_id'], 1)
+                    if outcome == 'success':
+                        self.assertIn(('read', 2, 3), events)
+                    if outcome in ('cancel_retry', 'timeout_retry'):
+                        self.assertIn(('read', 2, 2), events)
+                        self.assertIn(('read', 2, 3), events)
                     reference = camera.reference_frame(second)
                     self.assertIsNotNone(reference)
                     self.assertEqual(reference[:2], b'\xff\xd8')

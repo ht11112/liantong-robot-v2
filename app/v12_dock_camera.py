@@ -131,14 +131,16 @@ class DockCamera:
             dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11) if has_tags else None
             detector = (cv2.aruco.ArucoDetector(dictionary) if has_tags and hasattr(cv2.aruco, 'ArucoDetector') else None)
             cap, mode_ok = self._open_camera(cv2)
+            capture_id = None
             while not self.stop.is_set():
                 with self.lock:
                     pending = self.photo
                     photo_id = pending['id'] if pending is not None and pending['status'] == 'pending' else None
-                if photo_id is not None:
+                if photo_id is not None and photo_id != capture_id:
                     cap.release()
                     cap = None
                     cap, mode_ok = self._open_camera(cv2)
+                    capture_id = photo_id
                     ok, _ = cap.read()
                     if not ok:
                         raise RuntimeError('后视相机预热读取失败')
@@ -181,7 +183,7 @@ class DockCamera:
                         if time.monotonic() >= photo['deadline']:
                             photo['status'] = 'failed'
                             photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
-                        else:
+                        elif ids is not None or not has_tags or not mode_ok:
                             photo['status'] = 'complete'
                             photo['result'] = dict(result, photo_id=photo_id)
                             photo['jpeg'] = jpeg
