@@ -6,7 +6,7 @@ from threading import Event, Thread
 from unittest.mock import Mock, patch
 
 import test_v11_map_runtime as base
-from mcu_v11 import STOP_CONFIRMED, Rejected
+from mcu_v11 import EXECUTING, STOP_CONFIRMED, Rejected
 from v12_dock_control import dock_segment, next_action
 
 
@@ -85,6 +85,63 @@ class DockTest(unittest.TestCase):
             self.nav._upload_dock(master, plan)
         master.start.assert_not_called()
 
+    def test_dock_stall_does_not_renew_original_lease(self):
+        for single_step, kind in ((False, 'move'), (False, 'turn'), (True, 'move'), (True, 'turn')):
+            with self.subTest(single_step=single_step, kind=kind):
+                self.setUp()
+                self.enable()
+                if single_step:
+                    self.nav.dock_single_step_test = True
+                    value = -.03 if kind == 'move' else math.radians(3)
+                    self.nav.request_dock_step(kind, value)
+                else:
+                    self.nav.camera.value['lateral_m'] = .04 if kind == 'turn' else 0.
+                    self.nav.request_dock()
+                self.nav.camera.value['frame_seq'] += 1
+                self.nav._dock_cycle()
+                plan, self.nav.pending = self.nav.pending, None
+                nav = self.nav
+
+                class Peer:
+                    def __init__(self):
+                        self.renewals = []
+
+                    def upload(self, document, *, on_ack):
+                        ready = replace(nav.latest, status=replace(nav.latest.status, task=7, state=2, count=1))
+                        on_ack(ready)
+                        return [ready]
+
+                    def start(self, task):
+                        started = replace(nav.latest, status=replace(nav.latest.status, state=4 if kind == 'move' else 5,
+                                          flags=nav.latest.status.flags | EXECUTING, lease_remaining_ms=30000))
+                        return started
+
+                    def renew(self, task):
+                        self.renewals.append(task)
+                        return nav.latest
+
+                peer = Peer()
+                nav._upload_dock(peer, plan)
+                nav.work = None
+                self.assertEqual(nav.dock['phase'], 'moving')
+                for index, (elapsed, remaining) in enumerate(((25., 5000), (26., 4000), (28., 2000), (29., 1000)), start=2):
+                    self.now = 5. + elapsed
+                    self.observe(task=7, state=4 if kind == 'move' else 5,
+                                 flags=self.sample.flags | EXECUTING, sample_sequence=index,
+                                 measurement_tick_ms=95 + index, lease_remaining_ms=remaining, progress=0.)
+                    nav.camera.value['frame_seq'] += 1
+                    nav._dock_cycle()
+                    nav._renew_if_due(peer, nav.latest)
+                    self.assertEqual(nav.dock['phase'], 'moving')
+                self.assertEqual(peer.renewals, [])
+                self.now = 35.
+                self.observe(task=7, state=7, flags=self.sample.flags & ~EXECUTING,
+                             sample_sequence=7, measurement_tick_ms=102, lease_remaining_ms=0, first_error=3)
+                nav._dock_cycle()
+                self.assertTrue(nav.stop_requested)
+                self.assertEqual(nav.dock_stop_outcome, 'failed')
+                self.assertIsNone(nav.lease_task)
+
     def test_loss_during_upload_fences_start(self):
         self.enable()
         plan = self.queue_step()
@@ -141,6 +198,9 @@ class DockTest(unittest.TestCase):
         self.assertEqual(master.stop_revision, 1)
         self.assertTrue(self.nav.stop_requested)
         self.assertEqual(self.nav.dock_stop_outcome, 'cancelled')
+        self.assertIsNone(self.nav.lease_task)
+        self.nav._renew_if_due(master, self.nav.latest)
+        master.renew.assert_not_called()
 
     def test_step_requires_stop_proof_then_later_frame(self):
         self.enable()
@@ -217,10 +277,14 @@ class DockTest(unittest.TestCase):
         self.nav.pending = None
         self.nav.work = None
         self.nav.dock['phase'] = 'moving'
+        self.nav.lease_task = (42, 1, self.sample.task)
         self.observe(state=8, flags=self.sample.flags | 8)
         self.nav._dock_cycle()
         self.assertEqual(self.nav.dock_stop_outcome, 'step_complete')
+        self.assertIsNone(self.nav.lease_task)
         master = Mock()
+        self.nav._renew_if_due(master, self.nav.latest)
+        master.renew.assert_not_called()
         master.stop.return_value = dict(stop_verified=True)
         self.nav._stop(master)
         self.nav.stop_requested = False

@@ -802,7 +802,7 @@ class Navigation:
 
     # 仅为当前会话、当前任务且反馈新鲜的有效租约续期。
     def _renew_if_due(self, master, reply):
-        if self._ekf_turn_active():
+        if self._ekf_turn_active() or self._dock_active():
             return
         if self.feedback is not None:
             self._consume_feedback()
