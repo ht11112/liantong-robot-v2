@@ -134,7 +134,7 @@
             <p id="dock-reference-status" class="message">等待参考照片</p>
           </div>
           <p id="dock-task" class="message">视觉对准待命</p>
-          <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。预览和最新观测可能有延迟；每步使用停稳后的参考照片，执行后再次停稳拍照。</small>
+          <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。预览可能延迟；搜索时停稳拍照，识别后一次规划、连续倒车，末端仅确认停稳，不再复拍或微调。</small>
           <div class="actions"><button id="dock-start" type="button" class="primary" disabled>开始回桩</button></div>
         </div>
       </section>
@@ -354,8 +354,12 @@
         `${preview?'预览':'已提交路线'} · ${route.segments.length} 段 · 预计 ${route.nominal_duration_s.toFixed(1)} s · CRC32 ${crc ?? '—'}`;
       const obstaclePause=['waiting','replanning','resuming'].includes(avoidance?.phase)
         && task.phase==='failed' && task.stop_verified===true && task.error==='MCU 错误 1 / 驱动 0';
-      const taskError=obstaclePause?'':task.error;
-      $('task-phase').textContent=obstaclePause?'遇障暂停':phaseNames[task.phase]||task.phase||'待命';
+      const dockFinished=['complete','step_complete'].includes(dock.phase) && task.arrival===true
+        && task.phase==='failed' && task.stop_verified===true && task.error==='MCU 错误 1 / 驱动 0';
+      const taskError=obstaclePause||dockFinished?'':task.error;
+      $('task-phase').textContent=dockFinished?(dock.phase==='step_complete'?'单步完成':'倒车计划完成'):
+        obstaclePause?'遇障暂停':phaseNames[task.phase]||task.phase||'待命';
+      if(dockFinished) $('dock-task').textContent=dock.message+'；MCU原始取消码1来自收尾STOP';
       $('task-id').textContent=task.id??'—';
       $('task-index').textContent=task.count?`${Math.min(task.index+1,task.count)} / ${task.count}`:'—';
       $('arrival').textContent=task.arrival?'已报告到点':'未报告';
