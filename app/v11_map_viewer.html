@@ -120,11 +120,17 @@
       </section>
       <section class="card dock" aria-labelledby="dock-title">
         <div class="cardhead"><h2 id="dock-title">倒车画面</h2><span id="dock-age" class="pill">等待画面</span></div>
-        <div class="body"><img id="dock-image" class="dock-image" alt="后视相机画面，未镜像" width="640" height="480">
+        <div class="body"><strong>后视预览（可能延迟）</strong><img id="dock-image" class="dock-image" alt="后视相机预览，未镜像" width="640" height="480">
           <p id="dock-camera-status" class="dock-status" role="status">等待相机</p>
           <p id="dock-observation" class="mono">标签及位姿：等待观测</p>
+          <p id="dock-phase" class="message">视觉对准待命</p>
+          <div id="dock-reference" hidden>
+            <strong id="dock-reference-label">本步参考照片</strong>
+            <img id="dock-reference-image" class="dock-image" alt="本步停稳拍摄的参考照片，非实时画面" width="640" height="480" hidden>
+            <p id="dock-reference-status" class="message">等待参考照片</p>
+          </div>
           <p id="dock-task" class="message">视觉对准待命</p>
-          <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。识别框与该图来自同一帧，数值为最新状态。画面年龄自读取后计算，相机缓冲延迟尚需现场核对。</small>
+          <small>后方近场不在雷达保护范围内，操作时须清空后方并人工看护。预览和最新观测可能有延迟；每步使用停稳后的参考照片，执行后再次停稳拍照。</small>
           <div class="actions"><button id="dock-start" type="button" class="primary" disabled>开始视觉对准</button></div>
         </div>
       </section>
@@ -289,10 +295,13 @@
       const avoidance=online ? state.avoidance : null;
       const camera=online?state.camera:null, dock=state.dock||{};
       const fresh=camera?.fresh===true && !frameFailed && frameReceived!==null && performance.now()-frameReceived<1000;
-      $('dock-age').textContent=!fresh?'画面过期或不可用':finite(camera?.age_ms)?`读取后 · ${camera.age_ms.toFixed(0)} ms`:'等待画面';
+      $('dock-age').textContent=!fresh?'预览过期或不可用':finite(camera?.age_ms)?`预览读取年龄 · ${camera.age_ms.toFixed(0)} ms`:'等待画面';
       $('dock-camera-status').textContent=online?(camera?.reason||'后视相机未接入'):'RK 连接断开，画面已过期';
       const metric=(v,unit)=>finite(v)?`${v.toFixed(3)} ${unit}`:'—';
       $('dock-observation').textContent=fresh?`ID ${camera.tag_id??'—'} · 距离 ${metric(camera.distance_m,'m')} · 轮轴左偏 ${metric(camera.lateral_m,'m')} · 朝向 ${metric(camera.yaw_deg,'°')}`:'标签及位姿：画面过期或不可用';
+      const dockPhases={capturing:'停车拍摄中',observing:'等待停稳拍摄',uploading:'本步参考照片已就绪，正在上传',starting:'本步参考照片已就绪，正在启动',moving:'执行本步中',stopping:'等待实测停稳',complete:'已用停稳后照片确认对准',step_complete:'单步完成，已确认停稳',failed:'对准已结束',cancelled:'对准已取消'};
+      $('dock-phase').textContent=online?(dockPhases[dock.phase]||'视觉对准待命'):'RK 连接断开';
+      updateReference(online ? dock.photo_id : null);
       $('dock-task').textContent=dock.message||'视觉对准待命';
       $('dock-start').disabled=!online||!state.csrf_token||state.can_dock!==true||Boolean(action)||stopping;
       $('map-radar-legend').hidden=!avoidance;
@@ -400,6 +409,35 @@
       }
     }
     let frameUrl=null, frameReceived=null, frameFailed=true;
+    let referenceId=null, referenceUrl=null, referenceLoading=null;
+    function updateReference(photoId) {
+      const id=Number.isSafeInteger(photoId) && photoId>0 ? photoId : null;
+      const box=$('dock-reference'), image=$('dock-reference-image');
+      box.hidden=id===null;
+      if(id===null) {
+        referenceId=null;
+        image.hidden=true;
+        if(referenceUrl) {URL.revokeObjectURL(referenceUrl);referenceUrl=null;}
+        return;
+      }
+      $('dock-reference-label').textContent=`本步参考照片 #${id}（停稳拍摄，非实时）`;
+      if(referenceId===id && referenceUrl) return;
+      image.hidden=true;
+      $('dock-reference-status').textContent='正在读取本步参考照片';
+      if(referenceLoading===id) return;
+      referenceLoading=id;
+      fetch('/api/dock/reference.jpg?photo_id='+id,{cache:'no-store'})
+        .then(response=>{if(!response.ok) throw new Error('reference unavailable');return response.blob();})
+        .then(blob=>{
+          if(!state.connected || state.dock?.photo_id!==id) return;
+          const next=URL.createObjectURL(blob);
+          if(referenceUrl) URL.revokeObjectURL(referenceUrl);
+          referenceUrl=next;referenceId=id;image.src=next;image.hidden=false;
+          $('dock-reference-status').textContent='该照片用于本步计算，执行中不会实时更新。';
+        })
+        .catch(()=>{if(state.connected && state.dock?.photo_id===id) $('dock-reference-status').textContent='参考照片暂不可用';})
+        .finally(()=>{if(referenceLoading===id) referenceLoading=null;});
+    }
     async function pollFrame() {
       const controller=new AbortController(), timeout=window.setTimeout(()=>controller.abort(),3000);
       try {

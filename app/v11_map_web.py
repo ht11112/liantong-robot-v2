@@ -6,6 +6,7 @@ import http.client
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 import secrets
 import threading
 from urllib.parse import urlsplit
@@ -142,9 +143,11 @@ class MapGateway:
                                                     and metadata.get('map_id') == self.costmap_id))
         return status, payload
 
-    def frame(self):
+    def frame(self, photo_id=None):
         try:
-            status, payload = self.remote.request('GET', '/api/dock/frame.jpg', binary=True)
+            path = ('/api/dock/frame.jpg' if photo_id is None else
+                    '/api/dock/reference.jpg?photo_id=' + str(photo_id))
+            status, payload = self.remote.request('GET', path, binary=True)
             if status == 200:
                 return status, payload, 'image/jpeg'
             return status, payload, 'application/json; charset=utf-8'
@@ -186,6 +189,8 @@ def handler_for(gateway):
                 return self.send(*gateway.request('GET', '/api/state'))
             if target.path == '/api/dock/frame.jpg' and not target.query:
                 return self.send(*gateway.frame())
+            if target.path == '/api/dock/reference.jpg' and re.fullmatch(r'photo_id=[1-9][0-9]*', target.query):
+                return self.send(*gateway.frame(int(target.query[9:])))
             if target.path == '/map.png' and target.query == 'v='+gateway.sha256:
                 return self.send(200, gateway.png, 'image/png')
             if (target.path == '/costmap.png' and gateway.costmap_id is not None

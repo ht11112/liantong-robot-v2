@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcu' / 'tools'))
@@ -35,6 +36,7 @@ MCU_CANCELLED = 1
 ARRIVAL_REACHED = 8
 POSE_DISTANCE_TOLERANCE_M = .02
 POSE_HEADING_TOLERANCE_RAD = math.radians(2.)
+DOCK_PHOTO_TIMEOUT_S = 3.
 
 
 def angle(value):
@@ -77,9 +79,11 @@ class Navigation:
         self.scanner = scanner
         self.ekf = ekf
         self.camera = camera
-        self.dock = dict(phase='idle', message='等待视觉对准', frame_seq=None)
+        self.dock = dict(phase='idle', message='等待视觉对准', frame_seq=None, photo_id=None)
         self.dock_plan = None
         self.dock_single_plan = None
+        self.dock_single_done = False
+        self.dock_capture = None
         self.dock_single_step_test = dock_single_step_test
         self.dock_stop_outcome = None
         self.ekf_turn = (dict(phase='idle', message='仅试验单次原地转向 90°，不会直行',
@@ -410,15 +414,25 @@ class Navigation:
             'uploading', 'starting', 'turning', 'stopping')
 
     def _dock_active(self):
-        return self.dock['phase'] in ('observing', 'uploading', 'starting', 'moving', 'stopping')
+        return self.dock['phase'] in ('capturing', 'uploading', 'starting', 'moving', 'stopping')
 
-    def _dock_observation(self):
-        if self.camera is None:
-            raise ValueError('后视相机未启用')
-        observation = self.camera.snapshot()
-        if not observation['fresh'] or not observation['ready']:
-            raise ValueError(observation.get('reason') or '标签观测无效或画面过期')
-        return observation
+    def _dock_anchor(self):
+        status = self._require_stationary()
+        capture = self.dock_capture
+        if (status.boot, status.epoch) != capture['session'] or self.stop_revision != capture['revision']:
+            raise ValueError('拍照后底盘会话变化或动作已取消')
+        if (status.position_left, status.position_right) != capture['positions']:
+            raise ValueError('拍照后轮式起点发生变化，请重新开始')
+        if status.first_error not in (0, MCU_CANCELLED):
+            raise ValueError('底盘故障，取消视觉对准')
+
+    def _start_dock_capture(self):
+        status = self._require_stationary()
+        photo_id = self.camera.request_photo()
+        self.dock_capture = dict(id=photo_id, session=(status.boot, status.epoch),
+                                 positions=(status.position_left, status.position_right),
+                                 revision=self.stop_revision, deadline=self.clock() + DOCK_PHOTO_TIMEOUT_S)
+        self.dock.update(phase='capturing', message='已停稳，正在拍摄对准照片', photo_id=None)
 
     def request_dock(self):
         with self.lock:
@@ -427,13 +441,15 @@ class Navigation:
             if self.work or self.stop_requested or self.detour is not None or self._ekf_turn_active() or self._dock_active():
                 raise ValueError('当前操作正在处理')
             self._require_stationary()
-            if not (self.stop_verified or self.latest.status.flags & STOP_CONFIRMED):
-                raise ValueError('视觉对准需要先确认实测停稳')
-            observation = self._dock_observation()
+            if self.camera is None:
+                raise ValueError('后视相机未启用')
             self.plan = self.route = None
-            self.dock.update(phase='observing', message='等待新鲜视觉观测', frame_seq=observation['frame_seq'])
+            self.dock.update(phase='stopping', message='正在停车并确认停稳', frame_seq=None, photo_id=None)
             self.dock_single_plan = None
-            self.dock_stop_outcome = None
+            self.dock_single_done = False
+            self.dock_capture = None
+            self.dock_stop_outcome = 'continue'
+            self._queue_stop()
 
     def request_dock_step(self, kind, value):
         if not self.dock_single_step_test:
@@ -444,10 +460,18 @@ class Navigation:
         with self.lock:
             self.request_dock()
             self.dock_single_plan = plan
-            self.dock['message'] = '等待新鲜视觉观测以执行单步验收'
+            self.dock['message'] = '正在停车并确认停稳，随后拍照单步验收'
 
     def _end_dock(self, outcome, message):
+        capturing = self.dock['phase'] == 'capturing'
+        if capturing and self.dock_capture is not None:
+            self.camera.cancel_photo(self.dock_capture['id'])
+        if outcome in ('failed', 'cancelled'):
+            self.dock['photo_id'] = None
         self.dock_stop_outcome = outcome
+        if capturing and self.stop_requested:
+            self.dock.update(phase=outcome, message=message)
+            return
         self.dock.update(phase='stopping' if self.connected else 'failed', message=message)
         if self.connected and not self.stop_requested:
             self._queue_stop()
@@ -457,38 +481,47 @@ class Navigation:
             if not self._dock_active():
                 return
             if self.dock['phase'] == 'stopping':
-                if self.dock_stop_outcome in ('continue', 'step_complete'):
-                    try:
-                        self._dock_observation()
-                    except ValueError as exc:
-                        self.dock_stop_outcome = 'failed'
-                        self.dock['message'] = str(exc)
+                status = self.latest.status if self.latest else None
+                if (not self._fresh() or status.flags & RX_FAULT or status.first_drive_error
+                        or status.first_error not in (0, MCU_CANCELLED)):
+                    self.dock_stop_outcome = 'failed'
+                    self.dock['message'] = '停车期间底盘反馈失效或故障'
                 return
             try:
-                observation = self._dock_observation()
                 if not self._fresh():
                     raise ValueError('底盘反馈已过期')
                 status = self.latest.status
-                if status.first_drive_error or status.first_error not in (0, MCU_CANCELLED):
+                if status.flags & RX_FAULT or status.first_drive_error or status.first_error not in (0, MCU_CANCELLED):
                     raise ValueError('底盘故障，取消视觉对准')
                 if self.dock['phase'] == 'moving':
                     if status.state in (7, 8) and status.flags & ARRIVAL_REACHED:
-                        outcome = 'step_complete' if self.dock_single_plan is not None else 'continue'
-                        self._end_dock(outcome, '单步完成，正在确认停稳')
+                        self.dock_single_done = self.dock_single_plan is not None
+                        self._end_dock('continue', '单步完成，正在确认停稳')
                     elif status.state not in LEASE_STATES or not status.flags & EXECUTING:
                         raise ValueError('底盘动作意外结束')
                     return
-                if self.dock['phase'] != 'observing' or self.work or self.stop_requested:
+                if self.dock['phase'] != 'capturing' or self.work or self.stop_requested:
                     return
-                self._require_stationary()
-                if observation['frame_seq'] == self.dock['frame_seq']:
+                self._dock_anchor()
+                if self.clock() >= self.dock_capture['deadline']:
+                    raise ValueError('拍摄对准照片超过 3 秒')
+                observation = self.camera.photo_result(self.dock_capture['id'])
+                if observation is None:
+                    return
+                if observation['photo_id'] != self.dock_capture['id']:
+                    raise ValueError('对准照片编号不匹配')
+                if not observation['ready']:
+                    raise ValueError(observation.get('reason') or '对准照片无效')
+                self.dock.update(photo_id=self.dock_capture['id'], frame_seq=observation['frame_seq'])
+                if self.dock_single_done:
+                    self.dock.update(phase='step_complete', message='单步验收结束，已停稳并重新拍照')
                     return
                 if self.dock_single_plan is not None:
                     self.dock_plan = self.dock_single_plan
                 else:
                     action = next_action(observation)
                     if action is None:
-                        self.dock.update(phase='complete', message='视觉对准完成', frame_seq=observation['frame_seq'])
+                        self.dock.update(phase='complete', message='视觉对准完成')
                         return
                     self.dock_plan = dock_segment(*action)
                 self.dock.update(phase='uploading', message='正在上传对接单步', frame_seq=observation['frame_seq'])
@@ -769,18 +802,16 @@ class Navigation:
 
     def _upload_dock(self, master, plan):
         with self.lock:
-            self._dock_observation()
-            self._require_stationary()
             if self.stop_requested:
                 return
+            self._dock_anchor()
             revision = self.feedback.stop_revision if self.feedback is not None else None
         reply = (master.upload(plan, on_ack=self._observe_upload, revision=revision) if self.feedback is not None
                  else master.upload(plan, on_ack=self._observe_upload))[-1]
         with self.lock:
             if self.stop_requested:
                 return
-            self._dock_observation()
-            self._require_stationary()
+            self._dock_anchor()
             self.work = 'starting'
             self.dock.update(phase='starting', message='正在启动对接单步')
             revision = self.feedback.stop_revision if self.feedback is not None else None
@@ -856,13 +887,12 @@ class Navigation:
             if self.dock['phase'] == 'stopping':
                 outcome = self.dock_stop_outcome if self.stop_verified else 'failed'
                 if outcome == 'continue':
-                    observation = self.camera.snapshot()
-                    self.dock.update(phase='observing', message='已停稳，等待新的视觉观测',
-                                     frame_seq=observation['frame_seq'])
+                    try:
+                        self._start_dock_capture()
+                    except Exception as exc:
+                        self.dock.update(phase='failed', message='无法开始拍照：' + str(exc), photo_id=None)
                 else:
                     message = self.dock['message'] + ('；实测停稳已确认' if self.stop_verified else '；停稳尚未确认')
-                    if outcome == 'step_complete':
-                        message += '；单步验收结束，未自动续行'
                     self.dock.update(phase=outcome, message=message)
 
             if self.ekf_turn is not None and self.ekf_turn['phase'] == 'stopping':
@@ -1148,9 +1178,7 @@ class Navigation:
                         can_stop=self.connected and self.mode == 'drive', error=self.error)
             result['camera'] = self.camera.snapshot() if self.camera is not None else None
             result['dock'] = dict(self.dock)
-            result['can_dock'] = bool(preparing and self.mode == 'drive' and result['camera']
-                                      and (self.stop_verified or status.flags & STOP_CONFIRMED)
-                                      and result['camera']['fresh'] and result['camera']['ready'])
+            result['can_dock'] = bool(preparing and self.mode == 'drive' and self.camera is not None)
             result['can_dock_step'] = bool(self.dock_single_step_test and result['can_dock'])
             if communication is not None:
                 communication = dict(communication, consumer_missed=self.feedback_missed,
@@ -1194,6 +1222,20 @@ def handler_for(nav):
         def do_GET(self):
             if self.path == '/api/state':
                 self.send(200, nav.snapshot())
+            elif urlsplit(self.path).path == '/api/dock/reference.jpg':
+                params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                values = params.get('photo_id', [])
+                if set(params) != {'photo_id'} or len(values) != 1 or not values[0].isascii() or not values[0].isdigit():
+                    self.send(404, dict(error='参考照片不存在'))
+                    return
+                photo_id = int(values[0])
+                with nav.lock:
+                    frame = (nav.camera.reference_frame(photo_id)
+                             if nav.camera is not None and photo_id == nav.dock['photo_id'] else None)
+                if frame is None:
+                    self.send(404, dict(error='参考照片不存在'))
+                else:
+                    self.send(200, frame, 'image/jpeg')
             elif self.path == '/api/dock/frame.jpg' and nav.camera is not None:
                 frame = nav.camera.frame()
                 if frame is None:

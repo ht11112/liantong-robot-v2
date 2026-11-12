@@ -6,6 +6,7 @@ import time
 
 
 MAX_AGE_S = 0.5
+PHOTO_TIMEOUT_S = 3.0
 
 
 class DockCamera:
@@ -30,10 +31,13 @@ class DockCamera:
         self.stop = threading.Event()
         self.thread = None
         self.jpeg = None
+        self.failed = False
         self.observation = dict(frame_seq=0, age_ms=None, fresh=False, ready=False,
                                 reason='相机尚未启动', tag_id=None, distance_m=None,
                                 lateral_m=None, yaw_deg=None, corners=[])
         self.stamp = None
+        self.photo_id = 0
+        self.photo = None
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name='dock-camera', daemon=True)
@@ -41,6 +45,8 @@ class DockCamera:
 
     def close(self):
         self.stop.set()
+        with self.lock:
+            self.photo = None
         if self.thread:
             self.thread.join(timeout=2)
 
@@ -48,18 +54,69 @@ class DockCamera:
         with self.lock:
             result = dict(self.observation)
             stamp = self.stamp
+            failed = self.failed
         age = None if stamp is None else max(0., time.monotonic() - stamp)
         result['age_ms'] = None if age is None else age * 1000
-        result['fresh'] = age is not None and age <= MAX_AGE_S
+        result['fresh'] = not failed and age is not None and age < MAX_AGE_S
         if not result['fresh']:
             result['ready'] = False
-            if stamp is not None:
+            if stamp is not None and not failed:
                 result['reason'] = '画面已过期'
+        result['ready'] = False
+        if result['fresh']:
+            result['reason'] = '参考预览，请以停稳后拍摄的照片为准'
         return result
 
     def frame(self):
         with self.lock:
             return self.jpeg
+
+    def request_photo(self):
+        with self.lock:
+            if self.failed or self.stop.is_set():
+                raise RuntimeError('后视相机不可用')
+            if self.photo is not None and self.photo['status'] == 'pending':
+                raise RuntimeError('拍照正在进行')
+            self.photo_id += 1
+            self.photo = dict(id=self.photo_id, status='pending',
+                              deadline=time.monotonic() + PHOTO_TIMEOUT_S,
+                              result=None, jpeg=None)
+            return self.photo_id
+
+    def photo_result(self, photo_id):
+        with self.lock:
+            photo = self.photo
+            if photo is None or photo['id'] != photo_id:
+                return None
+            if photo['status'] == 'pending' and time.monotonic() >= photo['deadline']:
+                photo['status'] = 'failed'
+                photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
+            return None if photo['result'] is None else dict(photo['result'])
+
+    def cancel_photo(self, photo_id):
+        with self.lock:
+            if self.photo is not None and self.photo['id'] == photo_id:
+                self.photo = None
+
+    def reference_frame(self, photo_id):
+        with self.lock:
+            photo = self.photo
+            return photo['jpeg'] if photo is not None and photo['id'] == photo_id else None
+
+    def _open_camera(self, cv2):
+        cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            if not cap.isOpened():
+                raise RuntimeError('无法打开后视相机')
+            mode_ok = int(cap.get(cv2.CAP_PROP_FOURCC)) == cv2.VideoWriter_fourcc(*'MJPG')
+            return cap, mode_ok
+        except Exception:
+            cap.release()
+            raise
 
     def _run(self):
         cap = None
@@ -73,17 +130,28 @@ class DockCamera:
             has_tags = hasattr(cv2, 'aruco') and hasattr(cv2.aruco, 'DICT_APRILTAG_36h11')
             dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11) if has_tags else None
             detector = (cv2.aruco.ArucoDetector(dictionary) if has_tags and hasattr(cv2.aruco, 'ArucoDetector') else None)
-            cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            if not cap.isOpened():
-                raise RuntimeError('无法打开后视相机')
-            mode_ok = int(cap.get(cv2.CAP_PROP_FOURCC)) == cv2.VideoWriter_fourcc(*'MJPG')
+            cap, mode_ok = self._open_camera(cv2)
             while not self.stop.is_set():
+                with self.lock:
+                    pending = self.photo
+                    photo_id = pending['id'] if pending is not None and pending['status'] == 'pending' else None
+                if photo_id is not None:
+                    cap.release()
+                    cap = None
+                    cap, mode_ok = self._open_camera(cv2)
+                    ok, _ = cap.read()
+                    if not ok:
+                        raise RuntimeError('后视相机预热读取失败')
+                    with self.lock:
+                        photo = self.photo
+                        if photo is None or photo['id'] != photo_id or photo['status'] != 'pending':
+                            continue
+                        if time.monotonic() >= photo['deadline']:
+                            photo['status'] = 'failed'
+                            photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
+                            continue
+                read_start = time.monotonic()
                 ok, image = cap.read()
-                stamp = time.monotonic()
                 if not ok:
                     raise RuntimeError('后视相机读取失败')
                 if image.shape[:2] != (480, 640):
@@ -104,12 +172,26 @@ class DockCamera:
                 ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if not ok:
                     raise RuntimeError('画面编码失败')
+                jpeg = encoded.tobytes()
                 with self.lock:
                     result['frame_seq'] = self.observation['frame_seq'] + 1
-                    self.observation, self.jpeg, self.stamp = result, encoded.tobytes(), stamp
+                    self.observation, self.jpeg, self.stamp = result, jpeg, read_start
+                    photo = self.photo
+                    if photo_id is not None and photo is not None and photo['id'] == photo_id and photo['status'] == 'pending':
+                        if time.monotonic() >= photo['deadline']:
+                            photo['status'] = 'failed'
+                            photo['result'] = dict(photo_id=photo_id, ready=False, reason='拍照超时')
+                        else:
+                            photo['status'] = 'complete'
+                            photo['result'] = dict(result, photo_id=photo_id)
+                            photo['jpeg'] = jpeg
         except Exception as exc:
             with self.lock:
-                self.observation = dict(self.observation, ready=False, reason=str(exc))
+                self.failed = True
+                self.observation = dict(self.observation, ready=False, reason=str(exc) + '；请重启相机')
+                if self.photo is not None and self.photo['status'] == 'pending':
+                    self.photo['status'] = 'failed'
+                    self.photo['result'] = dict(photo_id=self.photo['id'], ready=False, reason=str(exc))
         finally:
             if cap is not None:
                 cap.release()

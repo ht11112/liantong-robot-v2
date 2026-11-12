@@ -197,5 +197,47 @@ class CostmapRouteTests(unittest.TestCase):
                     thread.join()
 
 
+class DockPhotoRouteTests(unittest.TestCase):
+    def test_reference_photo_keeps_its_number_across_gateway(self):
+        jpeg = b'\xff\xd8\xff\xd9'
+
+        class Remote:
+            paths = []
+
+            def request(self, method, path, body=None, binary=False):
+                self.paths.append((method, path, binary))
+                if path == '/api/dock/reference.jpg?photo_id=7':
+                    return 200, jpeg
+                return 404, dict(error='照片编号不匹配')
+
+        with TemporaryDirectory() as directory:
+            pgm = Path(directory) / 'map.pgm'
+            raw = b'P5\n1 1\n255\n\xff'
+            pgm.write_bytes(raw)
+            import hashlib
+            remote = Remote()
+            gateway = MapGateway(remote, pgm, hashlib.sha256(raw).hexdigest())
+            with ThreadingHTTPServer(('127.0.0.1', 0), handler_for(gateway)) as server:
+                thread = Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+                thread.start()
+                try:
+                    def get(path):
+                        with closing(HTTPConnection('127.0.0.1', server.server_port, timeout=2)) as client:
+                            client.request('GET', path, headers={'Host': '127.0.0.1:8766'})
+                            with client.getresponse() as response:
+                                return response.status, response.getheader('Content-Type'), response.read()
+
+                    self.assertEqual(get('/api/dock/reference.jpg?photo_id=7'), (200, 'image/jpeg', jpeg))
+                    self.assertEqual(get('/api/dock/reference.jpg?photo_id=8')[0], 404)
+                    self.assertEqual(get('/api/dock/reference.jpg?photo_id=7&other=1')[0], 404)
+                    self.assertEqual(get('/api/dock/reference.jpg?photo_id=0')[0], 404)
+                    self.assertEqual(remote.paths, [
+                        ('GET', '/api/dock/reference.jpg?photo_id=7', True),
+                        ('GET', '/api/dock/reference.jpg?photo_id=8', True)])
+                finally:
+                    server.shutdown()
+                    thread.join()
+
+
 if __name__ == '__main__':
     unittest.main()
